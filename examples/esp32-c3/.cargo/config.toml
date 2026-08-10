@@ -1,0 +1,32 @@
+[build]
+# ESP32-C3 is RISC-V (RV32IMC). Do not use the Xtensa ESP targets here.
+target = "riscv32imc-unknown-none-elf"
+
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "force-frame-pointers",
+]
+
+[env]
+ESP_LOG = "debug,esp_rtos=warn,esp_radio=warn"
+
+# Placeholder Wi-Fi credentials. Replace locally; do not commit real credentials.
+SSID = "YOUR_WIFI_SSID"
+PASSWORD = "YOUR_WIFI_PASSWORD"
+
+# Compile-time microtun configuration.
+MICROTUN_PRIVATE_KEY = "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM="
+MICROTUN_TUNNEL_ADDR = "100.64.0.3/10"
+
+MICROTUN_API_SERVER = "console.microtun.dev:51820"
+MICROTUN_API_SERVER_PUBLIC_KEY = "e06Qm75//kTEZaIgA31gjuNYl9Me+XLwf3SJLLD3PxM="
+MICROTUN_API_SERVER_TUNNEL_ADDR = "100.64.0.1"
+
+# Optional; build.rs defaults to time.google.com:123.
+# MICROTUN_NTP_SERVER = "time.google.com"
+# MICROTUN_NTP_PORT = "123"
+
+[unstable]
+build-std = ["alloc", "core"]

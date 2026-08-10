@@ -1,0 +1,38 @@
+[package]
+name = "microtun-api"
+description = "Peers API codec and client for microtun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+microtun-core = { workspace = true }
+heapless = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde-json-core = { workspace = true }
+microtun-jsonrpc = { workspace = true, optional = true }
+embedded-io-async = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+
+[features]
+default = []
+# Typed client for `embedded-io-async` transports (Embassy and similar).
+embedded-client = [
+    "dep:microtun-jsonrpc",
+    "dep:embedded-io-async",
+    "dep:rand",
+    "microtun-jsonrpc/async",
+]
+# Native Tokio 1.x transport support for the typed client. This is additive
+# with `embedded-client` so Cargo feature unification remains valid.
+tokio-client = [
+    "dep:microtun-jsonrpc",
+    "dep:embedded-io-async",
+    "dep:rand",
+    "microtun-jsonrpc/tokio",
+]
+# Forwarded to `microtun-core`: decoded peer records use heap storage. The
+# owned wire shape stays inline either way, since it is bounded by
+# `MAX_PEER_ADDRESSES` regardless of backend.
+alloc = ["microtun-core/alloc"]

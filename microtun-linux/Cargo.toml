@@ -1,0 +1,24 @@
+[package]
+name = "microtun-linux"
+description = "Linux tunnel daemon for microtun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+microtun-std = { workspace = true }
+# `bind_device` (SO_BINDTODEVICE) is behind socket2's `all` feature. It is what
+# pins Peers API server lookups to the tunnel interface; see `TunTransport`.
+socket2 = { version = "0.5", features = ["all"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tun-rs = { version = "2.8", features = ["async_tokio"] }
+rand = { workspace = true, features = ["std", "std_rng", "getrandom"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zeroize = { workspace = true, features = ["alloc"] }
+
+[[bin]]
+name = "microtun"
+path = "src/main.rs"

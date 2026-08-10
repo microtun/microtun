@@ -1,0 +1,45 @@
+[package]
+name = "microtun-core"
+description = "Sans-IO WireGuard engine for microtun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+maybe-async = { workspace = true }
+heapless = { workspace = true }
+hashbrown = { workspace = true, optional = true }
+rand_core = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+blake2 = { workspace = true }
+hmac = { workspace = true }
+digest = { workspace = true }
+
+zerocopy = { workspace = true }
+cidr = { workspace = true }
+base64 = { workspace = true }
+
+defmt-or-log = { workspace = true }
+defmt = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand = { workspace = true, features = ["std", "std_rng", "getrandom"] }
+rand_chacha = "0.3"
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
+
+[features]
+default = []
+async = []
+# Constructors that only exist so downstream integration crates can exercise
+# resolver plumbing without standing up a whole engine. Never enable in a
+# production dependency.
+test-util = []
+alloc = ["zeroize/alloc", "dep:hashbrown"]
+defmt = ["dep:defmt", "defmt-or-log/defmt"]
+log = ["dep:log", "defmt-or-log/log"]

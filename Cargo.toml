@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "microtun-api",
+    "microtun-core",
+    "microtun-embassy",
+    "microtun-std",
+    "microtun-linux",
+    "microtun-apiserver",
+    "microtun-jsonrpc",
+]
+exclude = ["examples/nucleo-h753zi", "examples/esp32-c3"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "BUSL-1.1"
+
+[workspace.dependencies]
+microtun-core = { path = "microtun-core" }
+microtun-api = { path = "microtun-api" }
+microtun-std = { path = "microtun-std" }
+microtun-jsonrpc = { path = "microtun-jsonrpc", default-features = false }
+
+heapless = { version = "0.9.1", default-features = false }
+hashbrown = { version = "0.15", default-features = false, features = [
+    "default-hasher",
+    "inline-more",
+] }
+rand_core = { version = "0.6", default-features = false }
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+subtle = { version = "2.6", default-features = false }
+zeroize = { version = "1.9", default-features = false }
+
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+blake2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+digest = { version = "0.10", default-features = false }
+
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde-json-core = { version = "0.6", default-features = false }
+
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+cidr = { version = "0.3.2", default-features = false }
+base64 = { version = "0.22", default-features = false }
+
+embedded-io = { version = "0.6", default-features = false }
+embedded-io-async = { version = "0.7", default-features = false }
+
+defmt-or-log = { version = "0.2.3", default-features = false }
+defmt = { version = "1.0", default-features = false }
+log = { version = "0.4", default-features = false }
+
+maybe-async = "0.2.11"

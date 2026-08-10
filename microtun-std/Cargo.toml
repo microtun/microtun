@@ -1,0 +1,23 @@
+[package]
+name = "microtun-std"
+description = "Tokio runtime integration for microtun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+microtun-core = { workspace = true, features = ["async", "log", "alloc"] }
+microtun-api = { workspace = true, features = ["alloc", "tokio-client"] }
+microtun-jsonrpc = { workspace = true, features = ["tokio"] }
+
+rand_core = { workspace = true }
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "io-util"] }
+log = { workspace = true }
+
+[dev-dependencies]
+# The scripted Peers API server in the resolver tests answers with the same record
+# type a real client decodes.
+serde-json-core = { workspace = true }
+microtun-core = { workspace = true, features = ["test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "sync", "time"] }

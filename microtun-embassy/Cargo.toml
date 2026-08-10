@@ -1,0 +1,41 @@
+[package]
+name = "microtun-embassy"
+description = "Embassy runtime integration for microtun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+microtun-core = { workspace = true, features = ["async"] }
+microtun-api = { workspace = true, features = ["embedded-client"] }
+microtun-jsonrpc = { workspace = true, features = ["async"] }
+
+rand_core = { workspace = true }
+heapless = { workspace = true }
+embedded-io-async = { workspace = true }
+defmt-or-log = { workspace = true }
+defmt = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+
+embassy-net = { version = "0.9.1", features = [
+    "udp",
+    "tcp",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "auto-icmp-echo-reply",
+] }
+embassy-net-driver-channel = { version = "0.4", default-features = false }
+embassy-time = { version = "0.5", default-features = false }
+embassy-sync = { version = "0.8", default-features = false }
+embassy-futures = { version = "0.1", default-features = false }
+
+[features]
+default = []
+# Move microtun-core's large protocol state to the global allocator. This is
+# useful on heap-capable MCUs such as ESP32-C3 where task stacks are scarce.
+# The default remains fully allocator-free for bare-metal Embassy targets.
+alloc = ["microtun-core/alloc"]
+defmt = ["dep:defmt", "microtun-core/defmt", "defmt-or-log/defmt", "embassy-net/defmt", "embassy-time/defmt"]
+log = ["dep:log", "microtun-core/log", "defmt-or-log/log"]

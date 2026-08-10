@@ -1,0 +1,44 @@
+[package]
+name = "microtun-jsonrpc"
+description = "no_std JSON-RPC 2.0 transport for embedded I/O and Tokio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde-json-core = { workspace = true }
+heapless = { workspace = true }
+maybe-async = { workspace = true }
+
+embedded-io = { workspace = true, optional = true }
+embedded-io-async = { workspace = true, optional = true }
+tokio = { version = "1", default-features = false, features = ["io-util"], optional = true }
+
+[dev-dependencies]
+embedded-io = { workspace = true, features = ["std"] }
+embedded-io-async = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+
+[features]
+# Async I/O is the default API. Select `sync` explicitly for blocking I/O;
+# the crate enforces that the two modes are mutually exclusive.
+default = ["async"]
+
+# Blocking I/O via the `embedded-io` traits. Mutually exclusive with `async`.
+# Build with `--no-default-features --features sync`.
+sync = ["maybe-async/is_sync", "dep:embedded-io"]
+
+# Async I/O via the `embedded-io-async` traits.
+async = ["dep:embedded-io-async"]
+
+# Tokio 1.x transport compatibility. This is additive on top of the async API
+# and adds `Connection::from_tokio` / `Notifier::from_tokio` plus the crate-local
+# `TokioIo` bridge.
+tokio = ["async", "dep:tokio", "embedded-io-async/std"]
+
+# Use `alloc` for unbounded remote error messages and a growable receive
+# buffer. Fixed-buffer users should leave this disabled when they need
+# a hard upper bound on one incoming frame.
+alloc = ["serde/alloc"]

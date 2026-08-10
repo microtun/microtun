@@ -1,0 +1,48 @@
+[package]
+name = "microtun-nucleo-h753zi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+license = "BUSL-1.1"
+
+[dependencies]
+microtun-embassy = { path = "../../microtun-embassy", features = ["defmt"] }
+
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "udp", "dhcpv4", "dns", "medium-ethernet", "medium-ip", "proto-ipv4"] }
+embassy-net-driver-channel = { version = "0.4", default-features = false }
+embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32h753zi", "time-driver-tim2", "memory-x", "chrono"] }
+embassy-sync = { version = "0.8.0", default-features = false, features = ["defmt"] }
+embassy-time = { version = "0.5.1", default-features = false, features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+embedded-io-async = "0.7.0"
+chrono = { version = "0.4", default-features = false }
+heapless = { version = "0.9.1", default-features = false }
+static_cell = "2"
+
+sntpc = { version = "0.11", default-features = false }
+sntpc-net-embassy = { version = "0.11", default-features = false, features = ["ipv6"] }
+
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.0"
+
+[build-dependencies]
+base64 = "0.22"
+
+[profile.dev]
+debug = 2
+incremental = false
+codegen-units = 1
+opt-level = 's'
+lto = 'fat'
+
+[profile.release]
+debug = 2
+incremental = false
+codegen-units = 1
+opt-level = 's'
+lto = 'fat'

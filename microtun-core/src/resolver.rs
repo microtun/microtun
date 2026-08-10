@@ -1,0 +1,1778 @@
+//! Peer resolution and dynamic-peer lifecycle.
+//!
+//! This module owns the resolver-facing command/event API, in-flight query
+//! bookkeeping, answer validation, dynamic-peer installation, and watched
+//! updates.
+//!
+//! A resolver must not return a positive answer until its key is being watched.
+//! For the Peers API wire protocol that means the integration explicitly calls
+//! `v1.peer.watch` before completing the resolve. The core therefore never needs a
+//! separate subscribe command; it only asks the resolver to stop watching when
+//! a record leaves the peer table — including when an answer arrives that the
+//! core declines to install.
+
+use core::net::{IpAddr, SocketAddr};
+
+use defmt_or_log::{debug, info, warn};
+
+use crate::{
+    CoreInner, Error, EvictedPeerGhost, InboundPolicy, PeerAddresses, RelayPolicy, Sink, Slot,
+    peer::{PeerEntry, PeerKind},
+    pending::Wait,
+    push_peer_address,
+    routing::PeerIdx,
+    time::{Duration, Instant},
+    unmap_socket_addr,
+};
+
+// ---------------------------------------------------------------------------
+// Peer resolution interface
+// ---------------------------------------------------------------------------
+
+/// Opaque identifier for an in-flight peer-resolution operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolveId(pub(crate) u64);
+
+/// What the resolver is being asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveQuery {
+    /// An unknown static public key sent us a (cryptographically valid)
+    /// handshake initiation: who is this?
+    ByPublicKey([u8; 32]),
+    /// An inner packet wants to reach this destination address: whose is it?
+    ByDstAddress(IpAddr),
+}
+
+/// The result of a resolver query.
+#[derive(Debug)]
+pub enum ResolveOutcome {
+    /// A peer record returned by the embedding's trusted resolver.
+    Found(ResolvedPeer),
+    /// `404`: authoritatively unknown. Suppresses repeat lookups for the same
+    /// target until the configured negative TTL elapses (see [`ResolveKind::Negative`]).
+    NotFound,
+    /// Transient failure (timeout, `429`, `5xx`). Initial lookups are left
+    /// uncached so traffic can retry; watched peers retain their last known-good
+    /// record, while polling integrations schedule another check.
+    Failed,
+}
+
+/// A peer record from the embedding's trusted resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPeer {
+    pub public_key: [u8; 32],
+    /// Current outer endpoint. IPv4-mapped IPv6 is normalized to native IPv4
+    /// by the core when the answer is canonicalized.
+    pub endpoint: Option<SocketAddr>,
+    /// Relay protocol: static public key of the peer through which this
+    /// peer is reached, if it is not directly addressable.
+    pub relay: Option<[u8; 32]>,
+    pub addresses: PeerAddresses,
+    /// Ingress policy applied to authenticated inner packets from this peer.
+    pub inbound_policy: InboundPolicy,
+    /// WireGuard-style persistent keepalive interval. `None` disables it.
+    pub persistent_keepalive: Option<Duration>,
+}
+
+/// A typed resolution operation returned by [`crate::Core::next_resolve_request`].
+///
+/// The request owns its correlation identifier. Resolver implementations
+/// should retain the whole value and turn it into a [`ResolveResponse`] with
+/// [`ResolveRequest::complete`] when the asynchronous lookup finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolveRequest {
+    id: ResolveId,
+    query: ResolveQuery,
+}
+
+impl ResolveRequest {
+    /// The query to execute.
+    pub const fn query(&self) -> ResolveQuery {
+        self.query
+    }
+
+    /// The opaque operation identifier, useful for diagnostics only.
+    pub const fn id(&self) -> ResolveId {
+        self.id
+    }
+
+    /// Build a request that no core issued, for testing resolver plumbing.
+    ///
+    /// Its identifier belongs to no in-flight operation, so a completion built
+    /// from it is discarded as stale by any real core. That is the point: it
+    /// lets an integration crate drive a resolver end to end without standing
+    /// up an engine to mint requests for it.
+    #[cfg(feature = "test-util")]
+    pub const fn for_test(query: ResolveQuery) -> Self {
+        Self {
+            id: ResolveId(u64::MAX),
+            query,
+        }
+    }
+
+    /// Pair an outcome with this request for delivery through
+    /// [`crate::Core::resolve_completed`].
+    pub fn complete(self, outcome: ResolveOutcome) -> ResolveResponse {
+        ResolveResponse {
+            id: self.id,
+            outcome,
+        }
+    }
+}
+
+/// Completion of a previously emitted [`ResolveRequest`].
+#[derive(Debug)]
+pub struct ResolveResponse {
+    id: ResolveId,
+    outcome: ResolveOutcome,
+}
+
+/// Command stream from the core to a resolver integration.
+///
+/// There is no subscribe command at this boundary. Resolver integrations must
+/// establish their underlying subscription before returning a positive answer,
+/// so the only watch-set mutation the core has to express is dropping one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolverCommand {
+    /// Perform this lookup. A positive answer guarantees its key is watched.
+    Resolve(ResolveRequest),
+    /// Stop watching this key: the core no longer holds the record.
+    Unwatch([u8; 32]),
+}
+
+/// Authoritative state for a peer the core already holds.
+///
+/// A resolver integration produces one of these when it reconciles a held
+/// record — because the Peers API server named the key in a `v1.peer.changed`
+/// notification, or because a reconnect replayed the whole held set. Either
+/// way the state here came from resolver reconciliation (`v1.peer.by_key` after a
+/// stale notice, or `v1.peer.watch` during reconnect), so it is subject to the
+/// same validation as a first answer.
+#[derive(Debug)]
+pub struct PeerUpdate {
+    pub public_key: [u8; 32],
+    pub outcome: ResolveOutcome,
+}
+
+impl PeerUpdate {
+    /// Build an update for a watched peer.
+    pub fn new(public_key: [u8; 32], outcome: ResolveOutcome) -> Self {
+        Self {
+            public_key,
+            outcome,
+        }
+    }
+}
+
+/// Event stream from a resolver integration back into the core.
+#[derive(Debug)]
+pub enum ResolverEvent {
+    Resolved(ResolveResponse),
+    PeerUpdated(PeerUpdate),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallSource {
+    AuthenticatedInitiator,
+    Relay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerAdmission {
+    /// The remote has proved possession of the claimed WireGuard static key.
+    /// This is the only new-peer admission allowed to consume protected slots.
+    AuthenticatedInitiator,
+    /// A local outbound packet caused a by-address lazy lookup.
+    LazyOutbound,
+    /// An authenticated peer named a relay destination. Relay admissions are
+    /// intentionally non-evicting as well as subject to the protected reserve.
+    LazyRelay,
+    /// Apply a watched update to an already-installed dynamic peer; never
+    /// create a replacement.
+    WatchedUpdate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolveKind {
+    /// Answer unblocks pending outbound packets carrying this id.
+    Outbound,
+    /// Answer populates the peer table and route cache; nothing is parked
+    /// behind it. Used for both remotely-provoked `by-key` lookups — a
+    /// cryptographically valid initiation from an unknown static key, and a
+    /// relay envelope naming an unknown destination key. The provoking
+    /// message itself is dropped: the initiator retransmits within
+    /// `Rekey-Timeout` (and a relay submitter's own retries carry its
+    /// envelope again), and the retransmission finds a configured peer.
+    Install(InstallSource),
+    /// A spent entry: the resolver authoritatively answered "no such peer" for
+    /// `query`. It emits no request and parks nothing; its only job is to make
+    /// `Core` short-circuit repeated lookups for the same
+    /// target until `deadline` (`now + negative_ttl`), at which point the timer
+    /// sweep reclaims its slot. This replaces the former negative caches that
+    /// lived inside the route cache.
+    Negative,
+    /// A re-lookup of a record this device already holds, issued because an
+    /// earlier reconciliation of that record could not be completed. Its
+    /// answer goes down the watched-update path, so it can refresh or
+    /// authoritatively remove the peer but never create one.
+    Reconcile,
+}
+
+/// A reconciliation this device owes itself.
+///
+/// Created when a watched update cannot be applied and discharged when one
+/// finally is. The obligation is deliberately not the same thing as a queued
+/// lookup: it survives the failure of any number of lookups, and it holds a
+/// `due` time so a peer whose record simply does not fit cannot spin the
+/// resolver at round-trip speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PendingReconcile {
+    pub(super) public_key: [u8; 32],
+    /// Earliest time the next `by-key` lookup for this key may be issued.
+    pub(super) due: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct InflightResolve {
+    id: ResolveId,
+    query: ResolveQuery,
+    kind: ResolveKind,
+    pub(super) deadline: Instant,
+    emitted: bool,
+}
+
+#[cfg_attr(not(feature = "async"), maybe_async::must_be_sync)]
+impl<
+    RNG: rand_core::RngCore + rand_core::CryptoRng,
+    RP: RelayPolicy,
+    const P: usize,
+    const S: usize,
+    const REPLAY_WORDS: usize,
+    const RT: usize,
+> CoreInner<RNG, RP, P, S, REPLAY_WORDS, RT>
+{
+    /// Deliver an answer to a request previously returned by
+    /// [`crate::Core::next_resolve_request`].
+    pub async fn resolve_completed<E: Sink>(
+        &mut self,
+        now: Instant,
+        response: ResolveResponse,
+        sink: &mut E,
+    ) -> Result<(), Error> {
+        debug!("resolver completion received: id={}", response.id.0);
+        self.resolved(now, response, sink).await
+    }
+
+    /// Deliver either a lookup completion or an unsolicited watched-peer update.
+    pub async fn resolver_event_completed<E: Sink>(
+        &mut self,
+        now: Instant,
+        event: ResolverEvent,
+        sink: &mut E,
+    ) -> Result<(), Error> {
+        match event {
+            ResolverEvent::Resolved(response) => self.resolve_completed(now, response, sink).await,
+            ResolverEvent::PeerUpdated(update) => self.peer_updated(now, update),
+        }
+    }
+
+    /// Look at the next resolver command without consuming it, prioritizing
+    /// watch-set convergence over lookups.
+    ///
+    /// The command is not marked as emitted, so an embedding whose channel
+    /// turns out to be full simply drops the value and tries again on the next
+    /// pass. Commit it with [`Self::resolver_command_sent`] once the embedding
+    /// has actually accepted it.
+    ///
+    /// Constrained runtimes must not await a full command channel, because the
+    /// resolver's own TCP packets travel through the same tunnel loop. Peeking
+    /// before a non-blocking send lets them decline a command without the core
+    /// having to unwind state it already changed.
+    pub fn peek_resolver_command(&self) -> Option<ResolverCommand> {
+        if let Some(public_key) = self.pending_unwatches.last() {
+            return Some(ResolverCommand::Unwatch(*public_key));
+        }
+        let pending = self.resolves.iter().find(|resolve| !resolve.emitted)?;
+        Some(ResolverCommand::Resolve(ResolveRequest {
+            id: pending.id,
+            query: pending.query,
+        }))
+    }
+
+    /// Commit a command returned by [`Self::peek_resolver_command`] after the
+    /// embedding has accepted it.
+    ///
+    /// Committing a command the core no longer holds is a no-op, so a late or
+    /// duplicated commit cannot corrupt watch-set state.
+    pub fn resolver_command_sent(&mut self, command: &ResolverCommand) {
+        match command {
+            ResolverCommand::Resolve(request) => {
+                if let Some(resolve) = self
+                    .resolves
+                    .iter_mut()
+                    .find(|resolve| resolve.id == request.id())
+                {
+                    resolve.emitted = true;
+                    debug!("emitted resolver request: id={}", request.id().0);
+                }
+            }
+            ResolverCommand::Unwatch(public_key) => {
+                if let Some(index) = self
+                    .pending_unwatches
+                    .iter()
+                    .position(|queued| queued == public_key)
+                {
+                    self.pending_unwatches.swap_remove(index);
+                }
+            }
+        }
+    }
+
+    /// Take one pending watch-set removal.
+    pub fn next_unwatch(&mut self) -> Option<[u8; 32]> {
+        self.pending_unwatches.pop()
+    }
+
+    /// Take the next peer-resolution request produced by the core.
+    ///
+    /// Requests are owned values and are emitted separately from [`Sink`],
+    /// which is reserved for borrowed packet output. The caller
+    /// should retain the request and eventually return its completion through
+    /// [`crate::Core::resolve_completed`].
+    pub fn next_resolve_request(&mut self) -> Option<ResolveRequest> {
+        let pending = self.resolves.iter_mut().find(|resolve| !resolve.emitted)?;
+        pending.emitted = true;
+        debug!("emitting resolver request: id={}", pending.id.0);
+        Some(ResolveRequest {
+            id: pending.id,
+            query: pending.query,
+        })
+    }
+
+    /// Park an unrouted outbound packet behind a deduplicated address lookup.
+    pub(super) fn queue_outbound_resolution(
+        &mut self,
+        dst: IpAddr,
+        packet: &[u8],
+        now: Instant,
+    ) -> Result<(), Error> {
+        // A single scan of the resolve table decides between three cases,
+        // because there is at most one entry per query:
+        //   * an unexpired negative marker -> recently authoritative "no such
+        //     peer": drop without re-querying;
+        //   * an in-flight outbound resolve -> park behind it (dedup);
+        //   * nothing (or an expired marker) -> start a fresh lookup.
+        let query = ResolveQuery::ByDstAddress(dst);
+        let deadline = now + self.core_config.resolve_outbound_timeout;
+        let id = match self.resolves.iter().position(|r| r.query == query) {
+            Some(pos) => {
+                let existing = self.resolves[pos]; // InflightResolve: Copy
+                match existing.kind {
+                    ResolveKind::Negative if existing.deadline > now => {
+                        debug!("negative resolve marker hit; dropping inner packet");
+                        return Ok(());
+                    }
+                    ResolveKind::Negative => {
+                        // Expired but not yet swept: reuse its slot in place.
+                        let id = self.alloc_resolve_id();
+                        self.resolves[pos] = InflightResolve {
+                            id,
+                            query,
+                            kind: ResolveKind::Outbound,
+                            deadline,
+                            emitted: false,
+                        };
+                        info!("queued outbound peer resolution: id={}", id.0);
+                        id
+                    }
+                    _ => existing.id,
+                }
+            }
+            None => {
+                let id = self.alloc_resolve_id();
+                let entry = InflightResolve {
+                    id,
+                    query,
+                    kind: ResolveKind::Outbound,
+                    deadline,
+                    emitted: false,
+                };
+                if self.push_resolve(entry).is_err() {
+                    warn!("resolver inflight queue full");
+                    return Err(Error::ResolverBusy);
+                }
+                info!("queued outbound peer resolution: id={}", id.0);
+                id
+            }
+        };
+        debug!(
+            "parking outbound packet: resolve_id={} len={}",
+            id.0,
+            packet.len()
+        );
+        self.pending.park(packet, Wait::Resolve(id), deadline);
+        self.timers.arm(deadline);
+        Ok(())
+    }
+
+    /// Expire one resolver entry, unwinding any state parked behind it.
+    pub(super) fn expire_one_resolve(&mut self, now: Instant) -> bool {
+        let Some(pos) = self
+            .resolves
+            .iter()
+            .position(|resolve| resolve.deadline <= now)
+        else {
+            return false;
+        };
+
+        let entry = self.resolves.swap_remove(pos);
+        match entry.kind {
+            ResolveKind::Outbound => {
+                self.pending
+                    .drop_if(|packet| packet.wait == Wait::Resolve(entry.id));
+            }
+            // Install resolves park nothing; the query simply lapses and the
+            // next retransmission may retry.
+            ResolveKind::Install(_) => {}
+            // A reconciliation lookup parks nothing either, but it carries an
+            // obligation that must not lapse with it: the record it was going
+            // to reconcile is still held and still unreconciled.
+            ResolveKind::Reconcile => {
+                if let ResolveQuery::ByPublicKey(public_key) = entry.query
+                    && self.find_peer(&public_key).is_some()
+                {
+                    self.queue_reconcile(public_key, now);
+                }
+            }
+            // A spent negative marker: its deadline reaching `now` is the end
+            // of the suppression window. It was already removed above; nothing
+            // else references it, so there is nothing to unwind.
+            ResolveKind::Negative => {}
+        }
+        true
+    }
+
+    /// Ask the resolver to install an authenticated unknown initiator,
+    /// parking nothing.
+    ///
+    /// The initiation has proved possession of the claimed static private key,
+    /// but that key is not configured yet. The provoking packet is dropped;
+    /// WireGuard retransmission finds the installed peer after a successful
+    /// lookup. This path and relay-driven destination lookup share the global
+    /// unattributed remote-resolve budget, while relay requests additionally
+    /// pass a per-submitter gate and protected-reserve check.
+    pub(super) fn request_peer_install(&mut self, key: [u8; 32], now: Instant) {
+        if self.peer_is_ghosted(&key, now) {
+            debug!("unknown initiator suppressed by recently-evicted ghost");
+            return;
+        }
+        self.queue_peer_install(key, InstallSource::AuthenticatedInitiator, now);
+    }
+
+    /// Ask the resolver to install a relay destination, with a quota attached
+    /// to the authenticated submitter in addition to the global remote budget.
+    pub(super) fn request_relay_peer_install(
+        &mut self,
+        submitter: PeerIdx,
+        key: [u8; 32],
+        now: Instant,
+    ) {
+        if self.resolve_suppressed(ResolveQuery::ByPublicKey(key), now) {
+            return;
+        }
+        if self.peer_is_ghosted(&key, now) {
+            debug!("relay destination suppressed by recently-evicted ghost");
+            return;
+        }
+        let free = self.peers.iter().filter(|peer| peer.is_none()).count();
+        if free <= self.core_config.lazy_peer_reserve {
+            debug!("relay peer lookup denied by protected reserve");
+            return;
+        }
+        let interval = self.core_config.relay_resolve_min_interval;
+        if interval.as_millis() != 0 {
+            let Some(peer) = self
+                .peers
+                .get_mut(submitter as usize)
+                .and_then(Option::as_mut)
+            else {
+                return;
+            };
+            if peer
+                .last_relay_resolve
+                .is_some_and(|last| now.saturating_since(last) < interval)
+            {
+                debug!("relay submitter resolve quota exhausted; dropping lookup");
+                return;
+            }
+            peer.last_relay_resolve = Some(now);
+        }
+        self.queue_peer_install(key, InstallSource::Relay, now);
+    }
+
+    fn queue_peer_install(&mut self, key: [u8; 32], source: InstallSource, now: Instant) {
+        if self.resolve_suppressed(ResolveQuery::ByPublicKey(key), now) {
+            return;
+        }
+        if !self.remote_resolves.try_take(now) {
+            debug!("remote resolve budget exhausted; dropping by-key lookup");
+            return;
+        }
+        let id = self.alloc_resolve_id();
+        let query = ResolveQuery::ByPublicKey(key);
+        let entry = InflightResolve {
+            id,
+            query,
+            kind: ResolveKind::Install(source),
+            deadline: now + self.core_config.resolve_timeout,
+            emitted: false,
+        };
+        // Best effort: nothing is parked behind an install resolve, so a full
+        // resolver queue simply means this message is dropped and a
+        // retransmission may try again later.
+        let _ = self.push_resolve(entry);
+    }
+
+    // -----------------------------------------------------------------------
+    // Resolver answers
+    // -----------------------------------------------------------------------
+
+    /// Apply one asynchronous resolver completion. Unknown or stale request
+    /// identifiers are ignored.
+    async fn resolved<E: Sink>(
+        &mut self,
+        now: Instant,
+        response: ResolveResponse,
+        sink: &mut E,
+    ) -> Result<(), Error> {
+        let ResolveResponse { id, outcome } = response;
+        debug!("applying resolver result: id={}", id.0);
+        let Some(pos) = self.resolves.iter().position(|r| r.id == id) else {
+            warn!("ignoring stale resolver completion: id={}", id.0);
+            return Ok(());
+        };
+        let entry = self.resolves.swap_remove(pos);
+        match entry.kind {
+            ResolveKind::Outbound => self.resolved_outbound(now, entry, outcome, sink).await,
+            ResolveKind::Install(source) => self.resolved_install(now, entry, source, outcome),
+            // A reconciliation answer is an ordinary watched update: it may
+            // refresh or authoritatively remove the record, never create one.
+            ResolveKind::Reconcile => match entry.query {
+                ResolveQuery::ByPublicKey(public_key) => {
+                    self.apply_watched_answer(now, public_key, outcome)
+                }
+                ResolveQuery::ByDstAddress(_) => Ok(()),
+            },
+            // Negative markers are never emitted as requests, so no external
+            // completion can carry their id. Reaching here would mean an id
+            // collision or a spoofed completion; ignore it.
+            ResolveKind::Negative => {
+                warn!("ignoring resolver completion for a negative marker");
+                Ok(())
+            }
+        }
+    }
+
+    /// Apply an authoritative update to a currently installed dynamic peer.
+    /// Late updates for peers already removed are ignored.
+    fn peer_updated(&mut self, now: Instant, update: PeerUpdate) -> Result<(), Error> {
+        let PeerUpdate {
+            public_key,
+            outcome,
+        } = update;
+        self.apply_watched_answer(now, public_key, outcome)
+    }
+
+    /// The single reconciliation routine for a record this device already
+    /// holds, whatever prompted it: a `v1.peer.changed` relayed by the embedding, a
+    /// reconnect replay, or one of this core's own retries.
+    ///
+    /// Three properties matter here, and each is a rule the protocol states
+    /// explicitly:
+    ///
+    /// * a lookup result is a *complete replacement*, so the peer must end up
+    ///   describing the answer entirely or not at all — never new metadata
+    ///   stapled to old addresses;
+    /// * only a well-formed `not_found` removes anything, so a rejected or
+    ///   failed answer leaves the held record exactly as it was;
+    /// * a reconciliation that could not be completed is still owed, so it is
+    ///   recorded rather than dropped on the floor.
+    fn apply_watched_answer(
+        &mut self,
+        now: Instant,
+        public_key: [u8; 32],
+        outcome: ResolveOutcome,
+    ) -> Result<(), Error> {
+        let Some(pidx) = self.find_peer(&public_key) else {
+            // The record is gone, so there is nothing left to reconcile and a
+            // late answer must not resurrect it.
+            self.forget_reconcile(&public_key);
+            return Ok(());
+        };
+        let is_dynamic = self
+            .peers
+            .get(pidx as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|peer| !peer.is_pinned() && peer.public_key == public_key);
+        if !is_dynamic {
+            self.forget_reconcile(&public_key);
+            return Ok(());
+        }
+
+        let query = ResolveQuery::ByPublicKey(public_key);
+        match outcome {
+            ResolveOutcome::Found(info) => {
+                let info = match self.canonicalize_resolved_answer(query, info) {
+                    Ok(info) => info,
+                    Err(_) => {
+                        // A positive answer this device refuses is not an
+                        // authoritative miss: the peer keeps its record. But
+                        // the record is still unreconciled, so the obligation
+                        // has to survive the rejection.
+                        warn!("rejected an invalid watched update: peer={}", pidx);
+                        self.queue_reconcile(public_key, now);
+                        return Ok(());
+                    }
+                };
+                if let Err(error) = self.commit_watched_update(pidx, &info, now) {
+                    warn!(
+                        "keeping the last complete record for a peer whose watched update could not be installed: peer={} error={:?}",
+                        pidx, error
+                    );
+                    self.queue_reconcile(public_key, now);
+                    return Ok(());
+                }
+                self.forget_reconcile(&public_key);
+                self.clear_negative(query);
+            }
+            ResolveOutcome::NotFound => {
+                // The one outcome with the authority to remove state.
+                self.forget_reconcile(&public_key);
+                self.evict_peer(pidx)?;
+                self.mark_negative(query, now);
+            }
+            ResolveOutcome::Failed => {
+                // Transient: keep the record, keep the obligation. The
+                // embedding will usually reconnect and replay the whole held
+                // set, which discharges this; the entry is what covers the
+                // case where it does not.
+                self.queue_reconcile(public_key, now);
+            }
+        }
+        Ok(())
+    }
+
+    /// Install a watched answer as one complete record, or change nothing.
+    ///
+    /// Route replacement is the only step that can fail, and it is fully
+    /// preflighted — it plans every eviction and draws the whole eviction
+    /// budget before it mutates anything — so running it *first* is what makes
+    /// the update atomic. Peer metadata is applied only once the address set
+    /// is committed, and applying it cannot fail for a peer that is already
+    /// installed.
+    ///
+    /// Doing it the other way round is what produced records carrying a new
+    /// endpoint, relay, policy and keepalive alongside the addresses of the
+    /// previous answer, with nothing scheduled to ever reconcile them.
+    fn commit_watched_update(
+        &mut self,
+        pidx: PeerIdx,
+        info: &ResolvedPeer,
+        now: Instant,
+    ) -> Result<(), Error> {
+        self.commit_existing_resolved_peer(pidx, info, now, PeerAdmission::WatchedUpdate, true)
+    }
+
+    /// Record that `public_key` still needs reconciling, without issuing the
+    /// lookup yet.
+    ///
+    /// The delay is deliberate. A record that does not fit this device's route
+    /// cache will not fit on the next round trip either, so retrying
+    /// immediately would burn the resolve budget in a tight loop for as long
+    /// as the condition lasted. Waiting `negative_ttl` gives capacity a chance
+    /// to appear — which is the same interval this core already uses to decide
+    /// that an answer is worth asking for again.
+    fn queue_reconcile(&mut self, public_key: [u8; 32], now: Instant) {
+        let due = now + self.core_config.negative_ttl;
+        let armed = match self
+            .pending_reconciles
+            .iter_mut()
+            .find(|pending| pending.public_key == public_key)
+        {
+            Some(pending) => {
+                // An obligation already recorded must not be pushed further
+                // out by a later failure, or a peer failing repeatedly would
+                // be reconciled progressively less often.
+                if due < pending.due {
+                    pending.due = due;
+                }
+                pending.due
+            }
+            None => {
+                if self
+                    .push_reconcile(PendingReconcile { public_key, due })
+                    .is_err()
+                {
+                    warn!("reconciliation backlog full; dropping a watched-update retry");
+                    return;
+                }
+                due
+            }
+        };
+        self.timers.arm(armed);
+    }
+
+    fn push_reconcile(&mut self, pending: PendingReconcile) -> Result<(), Error> {
+        #[cfg(feature = "alloc")]
+        {
+            if self.pending_reconciles.len() >= P {
+                return Err(Error::ResolverBusy);
+            }
+            self.pending_reconciles.push(pending);
+            Ok(())
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            self.pending_reconciles
+                .push(pending)
+                .map_err(|_| Error::ResolverBusy)
+        }
+    }
+
+    /// Discharge the obligation for `public_key`, if there was one.
+    fn forget_reconcile(&mut self, public_key: &[u8; 32]) {
+        self.pending_reconciles
+            .retain(|pending| &pending.public_key != public_key);
+    }
+
+    /// Turn at most one due obligation into a real `by-key` lookup.
+    ///
+    /// The obligation is always held by exactly one of two places: this list,
+    /// or a live [`ResolveKind::Reconcile`] entry. It moves from here to there
+    /// when it comes due, and back again if that lookup lapses or its answer
+    /// cannot be installed.
+    ///
+    /// Returns whether any work was done, matching the rest of the incremental
+    /// timer step.
+    pub(super) fn promote_due_reconcile(&mut self, now: Instant) -> bool {
+        let Some(index) = self
+            .pending_reconciles
+            .iter()
+            .position(|pending| pending.due <= now)
+        else {
+            return false;
+        };
+        let pending = self.pending_reconciles[index];
+
+        // The peer may have been evicted while the obligation waited.
+        if self.find_peer(&pending.public_key).is_none() {
+            self.pending_reconciles.swap_remove(index);
+            return true;
+        }
+
+        let query = ResolveQuery::ByPublicKey(pending.public_key);
+        // Something is already asking this question; its answer discharges the
+        // obligation, so leave the entry for that answer to clear and re-arm
+        // rather than issuing a duplicate.
+        if self.resolve_suppressed(query, now) {
+            self.defer_reconcile(index, now);
+            return true;
+        }
+
+        let id = self.alloc_resolve_id();
+        let entry = InflightResolve {
+            id,
+            query,
+            kind: ResolveKind::Reconcile,
+            deadline: now + self.core_config.resolve_timeout,
+            emitted: false,
+        };
+        if self.push_resolve(entry).is_err() {
+            // No slot right now. The obligation stays here and tries again.
+            self.defer_reconcile(index, now);
+            return true;
+        }
+        debug!("issuing a watched-record reconciliation: id={}", id.0);
+        self.pending_reconciles.swap_remove(index);
+        true
+    }
+
+    fn defer_reconcile(&mut self, index: usize, now: Instant) {
+        let due = now + self.core_config.negative_ttl;
+        if let Some(pending) = self.pending_reconciles.get_mut(index) {
+            pending.due = due;
+        }
+        self.timers.arm(due);
+    }
+
+    /// A `by-key` answer for an unknown initiator or a relay-forwarding
+    /// destination: populate the peer table and route cache so the
+    /// retransmitted initiation (or envelope) finds a configured peer.
+    fn resolved_install(
+        &mut self,
+        now: Instant,
+        entry: InflightResolve,
+        source: InstallSource,
+        outcome: ResolveOutcome,
+    ) -> Result<(), Error> {
+        let ResolveQuery::ByPublicKey(_) = entry.query else {
+            return Ok(());
+        };
+        match outcome {
+            ResolveOutcome::Found(info) => {
+                // The resolver established a watch for this key before
+                // returning the answer. Every path below that does not leave
+                // the record installed must say so.
+                let info_key = info.public_key;
+                // The core is the sole resolver-policy boundary. A rejected
+                // answer installs nothing and is treated like a transient
+                // resolver failure so malformed policy cannot poison caches.
+                let info = match self.canonicalize_resolved_answer(entry.query, info) {
+                    Ok(info) => info,
+                    Err(_) => {
+                        self.discard_answer(&info_key);
+                        return Ok(());
+                    }
+                };
+                let admission = match source {
+                    InstallSource::AuthenticatedInitiator => PeerAdmission::AuthenticatedInitiator,
+                    InstallSource::Relay => PeerAdmission::LazyRelay,
+                };
+                if let Some(pidx) = self.find_peer(&info.public_key) {
+                    // Another resolve can install the peer while this lookup
+                    // is in flight. In that race this answer is a replacement,
+                    // not a new admission: commit routes first so a capacity
+                    // failure cannot leave new metadata attached to the old
+                    // address set.
+                    match self.commit_existing_resolved_peer(
+                        pidx,
+                        &info,
+                        now,
+                        admission,
+                        !matches!(source, InstallSource::Relay),
+                    ) {
+                        Ok(()) => (),
+                        Err(Error::RouteCacheFull) | Err(Error::PeerAdmissionLimited) => {
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    let (pidx, routes_changed, installed_new) =
+                        match self.upsert_peer_unchecked(&info, now, admission) {
+                            Ok(installed) => installed,
+                            Err(Error::PeerTableFull) | Err(Error::PeerAdmissionLimited) => {
+                                self.discard_answer(&info_key);
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error),
+                        };
+                    if routes_changed
+                        && self
+                            .replace_dynamic_routes(
+                                pidx,
+                                &info.addresses,
+                                now,
+                                !matches!(source, InstallSource::Relay),
+                            )
+                            .is_err()
+                    {
+                        // A freshly admitted peer has no usable old route set.
+                        // Remove it entirely rather than retaining a partial
+                        // record; eviction also queues the required unwatch.
+                        if installed_new {
+                            self.evict_peer(pidx)?;
+                        }
+                        return Ok(());
+                    }
+                }
+                self.clear_negative(entry.query);
+                Ok(())
+            }
+            ResolveOutcome::NotFound => {
+                self.mark_negative(entry.query, now);
+                Ok(())
+            }
+            ResolveOutcome::Failed => Ok(()),
+        }
+    }
+
+    async fn resolved_outbound<E: Sink>(
+        &mut self,
+        now: Instant,
+        entry: InflightResolve,
+        outcome: ResolveOutcome,
+        sink: &mut E,
+    ) -> Result<(), Error> {
+        let ResolveQuery::ByDstAddress(address) = entry.query else {
+            return Ok(());
+        };
+        match outcome {
+            ResolveOutcome::Found(info) => {
+                // A by-address answer must actually cover the address that
+                // was queried. This check belongs in the core rather than
+                // only in the optional Peers API client: other embeddings can
+                // feed resolver answers directly.
+                //
+                // A rejected positive answer is *not* an authoritative miss.
+                // The server said "found"; we declined the record. Only a
+                // well-formed `not_found` result carries the authority to
+                // negative-cache, so no marker is left here — otherwise one
+                // malformed or hostile answer would suppress every lookup for
+                // this address for the whole negative TTL, including the
+                // correct answer that might arrive immediately after.
+                //
+                // The parked packets are still dropped. Re-dispatching them
+                // would allocate a fresh resolve after this entry was removed,
+                // letting one packet drive an unbounded query loop; dropping
+                // them leaves the retry to the next packet, exactly as the
+                // transient-failure arm below does.
+                let info_key = info.public_key;
+                if !info.addresses.iter().any(|cidr| cidr.contains(&address)) {
+                    warn!("discarding a by-address answer that does not cover the query");
+                    // The resolver explicitly watched the key returned by the
+                    // address lookup before completing this answer. Every path
+                    // that does not leave it installed has to release the watch.
+                    self.discard_answer(&info_key);
+                    self.pending.drop_if(|p| p.wait == Wait::Resolve(entry.id));
+                    return Ok(());
+                }
+
+                let info = match self.canonicalize_resolved_answer(entry.query, info) {
+                    Ok(info) => info,
+                    Err(_) => {
+                        self.discard_answer(&info_key);
+                        self.pending.drop_if(|p| p.wait == Wait::Resolve(entry.id));
+                        return Ok(());
+                    }
+                };
+                let (pidx, installed_new) = if let Some(pidx) = self.find_peer(&info.public_key) {
+                    match self.commit_existing_resolved_peer(
+                        pidx,
+                        &info,
+                        now,
+                        PeerAdmission::LazyOutbound,
+                        true,
+                    ) {
+                        Ok(()) => (pidx, false),
+                        Err(Error::RouteCacheFull) | Err(Error::PeerAdmissionLimited) => {
+                            self.mark_negative(entry.query, now);
+                            self.pending.drop_if(|p| p.wait == Wait::Resolve(entry.id));
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    let (pidx, routes_changed, installed_new) =
+                        match self.upsert_peer_unchecked(&info, now, PeerAdmission::LazyOutbound) {
+                            Ok(installed) => installed,
+                            Err(Error::PeerTableFull) | Err(Error::PeerAdmissionLimited) => {
+                                self.discard_answer(&info_key);
+                                self.pending.drop_if(|p| p.wait == Wait::Resolve(entry.id));
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error),
+                        };
+                    if routes_changed
+                        && self
+                            .replace_dynamic_routes(pidx, &info.addresses, now, true)
+                            .is_err()
+                    {
+                        if installed_new {
+                            self.evict_peer(pidx)?;
+                        }
+                        self.mark_negative(entry.query, now);
+                        self.pending.drop_if(|p| p.wait == Wait::Resolve(entry.id));
+                        return Ok(());
+                    }
+                    (pidx, installed_new)
+                };
+
+                // Route installation can still fail (for example when the
+                // route cache is entirely pinned). Verify the postcondition
+                // before replaying packets so a valid-looking answer cannot
+                // recreate the same resolve forever.
+                if self.routes.lookup_readonly(&address).is_none() {
+                    if installed_new {
+                        self.evict_peer(pidx)?;
+                    }
+                    self.mark_negative(entry.query, now);
+                    self.pending.drop_if(|p| p.wait == Wait::Resolve(entry.id));
+                    return Ok(());
+                }
+
+                self.clear_negative(entry.query);
+                // Unblock parked packets: they re-enter the outbound path
+                // and now find a route (and park again on the handshake).
+                while let Some(p) = self.pending.take_if(|p| p.wait == Wait::Resolve(entry.id)) {
+                    let packet = p.packet();
+                    let _ = self.outbound(now, packet, sink).await;
+                }
+                Ok(())
+            }
+            ResolveOutcome::NotFound => {
+                self.mark_negative(entry.query, now);
+                self.pending.drop_if(|p| p.wait == Wait::Resolve(entry.id));
+                Ok(())
+            }
+            ResolveOutcome::Failed => {
+                // Transient: drop the parked packets but leave no cache
+                // entry, so the very next packet retries.
+                self.pending.drop_if(|p| p.wait == Wait::Resolve(entry.id));
+                Ok(())
+            }
+        }
+    }
+
+    /// Reinstall `pidx`'s routes as one complete address set.
+    ///
+    /// Capacity is reserved before insertion by preflighting whole-peer
+    /// evictions. Only idle, sessionless dynamic peers are candidates; pinned
+    /// and active peers are never selected. The complete victim set and global
+    /// eviction budget are checked before the first mutation, preventing a
+    /// failed multi-victim admission from causing partial churn. Returns
+    /// [`Error::RouteCacheFull`] when no safe plan can fit the full set.
+    ///
+    /// Sizing note: `RT` is exactly `P * MAX_PEER_ADDRESSES` in the host
+    /// runner, so eviction is normally unnecessary there. The embassy profile
+    /// is deliberately oversubscribed (`PEERS = 8`, `ROUTES = 16`).
+    fn replace_dynamic_routes(
+        &mut self,
+        pidx: PeerIdx,
+        addresses: &PeerAddresses,
+        now: Instant,
+        allow_peer_eviction: bool,
+    ) -> Result<(), Error> {
+        let current_slots = self.routes.peer_route_count(pidx);
+        let required_slots = Self::required_route_slots(addresses);
+
+        let available_after_replace = self.routes.available_slots().saturating_add(current_slots);
+        let shortage = required_slots.saturating_sub(available_after_replace);
+        if shortage != 0 {
+            if !allow_peer_eviction {
+                return Err(Error::RouteCacheFull);
+            }
+
+            // Plan the entire route-capacity mutation before evicting anyone.
+            // Without this preflight, an answer requiring multiple victims
+            // could evict one legitimate peer, exhaust the global budget on
+            // the next, and then fail to install at all.
+            let mut victims = [None; P];
+            let mut victim_count = 0usize;
+            let mut reclaimed_slots = 0usize;
+            while reclaimed_slots < shortage {
+                let Some(victim) =
+                    self.capacity_victim_excluding(now, Some(pidx), &victims, victim_count, 1)
+                else {
+                    return Err(Error::RouteCacheFull);
+                };
+                let freed = self.routes.peer_route_count(victim);
+                if freed == 0 || victim_count >= victims.len() {
+                    return Err(Error::RouteCacheFull);
+                }
+                victims[victim_count] = Some(victim);
+                victim_count += 1;
+                reclaimed_slots = reclaimed_slots.saturating_add(freed);
+            }
+
+            let eviction_count = u32::try_from(victim_count).unwrap_or(u32::MAX);
+            if !self.peer_evictions.try_take_many(eviction_count, now) {
+                debug!("route-capacity eviction denied by global cooldown");
+                return Err(Error::PeerAdmissionLimited);
+            }
+            for victim in victims[..victim_count].iter().flatten().copied() {
+                warn!(
+                    "evicting idle sessionless peer to make room in the route cache: peer={}",
+                    victim
+                );
+                self.evict_peer_and_remember(victim, now)?;
+            }
+        }
+
+        self.routes.remove_peer(pidx)?;
+        for cidr in addresses.iter() {
+            self.routes.insert(*cidr, pidx, false, now)?;
+        }
+        let Some(peer) = self.peers.get_mut(pidx as usize).and_then(Option::as_mut) else {
+            return Err(Error::InternalInvariant);
+        };
+        peer.addresses = addresses.clone();
+        Ok(())
+    }
+
+    /// Replace an already-installed dynamic peer as one atomic resolver
+    /// record.
+    ///
+    /// Route replacement is the only capacity-sensitive operation and is
+    /// fully preflighted, so it runs before metadata mutation. If it cannot
+    /// commit, the peer remains byte-for-byte on its prior accepted record.
+    /// Once routes succeed, refreshing metadata for an existing peer cannot
+    /// require peer-table or route capacity.
+    fn commit_existing_resolved_peer(
+        &mut self,
+        pidx: PeerIdx,
+        info: &ResolvedPeer,
+        now: Instant,
+        admission: PeerAdmission,
+        allow_peer_eviction: bool,
+    ) -> Result<(), Error> {
+        let routes_changed = {
+            let Some(peer) = self.peers.get(pidx as usize).and_then(Option::as_ref) else {
+                return Err(Error::InternalInvariant);
+            };
+            peer.addresses.len() != info.addresses.len()
+                || !peer
+                    .addresses
+                    .iter()
+                    .all(|cidr| info.addresses.contains(cidr))
+        };
+        if routes_changed {
+            self.replace_dynamic_routes(pidx, &info.addresses, now, allow_peer_eviction)?;
+        }
+
+        let (updated, _, installed_new) = self.upsert_peer_unchecked(info, now, admission)?;
+        if updated != pidx || installed_new {
+            return Err(Error::InternalInvariant);
+        }
+        Ok(())
+    }
+
+    /// Enforce every semantic invariant for a resolver answer.
+    ///
+    /// This is the single policy boundary for all resolver implementations.
+    /// HTTP/JSON codecs decode wire syntax only; they must not duplicate these
+    /// checks because a second policy can drift from the core's behavior.
+    ///
+    /// A by-key answer must name the key that was queried. Every answer must
+    /// also avoid this interface's own identity and pinned identities, avoid a
+    /// self-relay, carry at least one address, and avoid default routes.
+    ///
+    /// # The resolver is the routing trust root
+    ///
+    /// These checks are about *self-consistency*, not about defending against
+    /// the resolver. Cryptokey routing for dynamic peers is delegated to the
+    /// resolver in full: it decides which static key owns which tunnel
+    /// prefixes, and this device implements that decision. In particular, a
+    /// resolver answer **may** claim address space that overlaps a pinned
+    /// peer's, and **may** claim address space already assigned to another
+    /// dynamic peer. Resolution between overlapping claims is left to the
+    /// route cache's longest-prefix match, where a pinned route wins a tie
+    /// (it is installed first) but loses to a more specific dynamic one.
+    ///
+    /// The consequence is worth stating plainly: an answer can redirect
+    /// traffic for any tunnel address on this device, including the resolver's
+    /// own. A resolver that is compromised, or that is reached over a path
+    /// this device cannot authenticate, can therefore reroute everything and —
+    /// by claiming a prefix covering the Peers API server itself — make the
+    /// misdirection self-sustaining across watched updates. That is accepted
+    /// deliberately: the resolver is already the authority that names peers,
+    /// and layering partial address-space restrictions on top bought
+    /// consistency, not safety. What still protects the deployment is the
+    /// binding between the resolver and a pinned identity — see the transport
+    /// security notes on the embedding's resolver (for the Tokio host,
+    /// `microtun_std::PeersApiResolver`).
+    fn canonicalize_resolved_answer(
+        &self,
+        query: ResolveQuery,
+        mut info: ResolvedPeer,
+    ) -> Result<ResolvedPeer, Error> {
+        let mut addresses = PeerAddresses::new();
+        for cidr in info.addresses.iter().copied() {
+            push_peer_address(&mut addresses, cidr).map_err(|_| Error::InvalidResolverAnswer)?;
+        }
+        #[cfg(feature = "alloc")]
+        if addresses.len() > RT {
+            return Err(Error::InvalidResolverAnswer);
+        }
+        info.addresses = addresses;
+        // The single normalization point for a resolver answer. Every path
+        // that installs or updates a peer passes through here, so mapped
+        // IPv4-in-IPv6 endpoints are folded to native IPv4 exactly once
+        // rather than at each boundary type's constructor.
+        info.endpoint = info.endpoint.map(unmap_socket_addr);
+        self.check_resolved_answer(query, &info)?;
+        Ok(info)
+    }
+
+    fn check_resolved_answer(&self, query: ResolveQuery, info: &ResolvedPeer) -> Result<(), Error> {
+        if let ResolveQuery::ByPublicKey(expected) = query {
+            if info.public_key != expected {
+                return Err(Error::InvalidResolverAnswer);
+            }
+        }
+        // Our own static key. `Core::new` refuses this for pinned peers; a
+        // dynamic answer must not be able to install what configuration
+        // cannot. Accepting it would let us handshake with ourselves and
+        // spend session slots on a peer that is this very interface.
+        if info.public_key == self.s_pub {
+            return Err(Error::InvalidResolverAnswer);
+        }
+        if self
+            .find_peer(&info.public_key)
+            .and_then(|pidx| self.peers.get(pidx as usize))
+            .and_then(Option::as_ref)
+            .is_some_and(PeerEntry::is_pinned)
+        {
+            return Err(Error::InvalidResolverAnswer);
+        }
+        // A peer cannot be its own relay. `relay_path` would reject the
+        // resulting configuration anyway, but only after the peer had been
+        // installed — leaving an entry that is permanently unreachable
+        // rather than one that was never accepted.
+        if info.relay == Some(info.public_key) {
+            return Err(Error::InvalidResolverAnswer);
+        }
+        // A peer with no address space can never pass the inbound source
+        // check nor be selected outbound, so it would occupy a table entry
+        // while being deaf in both directions.
+        if info.addresses.is_empty() {
+            return Err(Error::InvalidResolverAnswer);
+        }
+        // A default route is still refused. Not to protect pinned space —
+        // overlap is allowed now — but because `/0` cannot be expressed as a
+        // resolvable assignment: it matches every `by-address` query, so it
+        // would suppress every future lookup and pin all routing to whichever
+        // peer happened to claim it first.
+        if info.addresses.iter().any(|cidr| cidr.network_length() == 0) {
+            return Err(Error::InvalidResolverAnswer);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn upsert_peer(
+        &mut self,
+        info: &ResolvedPeer,
+        now: Instant,
+    ) -> Result<(PeerIdx, bool), Error> {
+        let info = self.canonicalize_resolved_answer(
+            ResolveQuery::ByPublicKey(info.public_key),
+            info.clone(),
+        )?;
+        let (pidx, routes_changed, _) =
+            self.upsert_peer_unchecked(&info, now, PeerAdmission::AuthenticatedInitiator)?;
+        Ok((pidx, routes_changed))
+    }
+
+    #[cfg(test)]
+    pub(super) fn upsert_outbound_lazy_peer(
+        &mut self,
+        info: &ResolvedPeer,
+        now: Instant,
+    ) -> Result<(PeerIdx, bool), Error> {
+        let info = self.canonicalize_resolved_answer(
+            ResolveQuery::ByPublicKey(info.public_key),
+            info.clone(),
+        )?;
+        let (pidx, routes_changed, _) =
+            self.upsert_peer_unchecked(&info, now, PeerAdmission::LazyOutbound)?;
+        Ok((pidx, routes_changed))
+    }
+
+    /// Insert or refresh a dynamic peer after resolver policy was checked.
+    /// Returns `(peer, routes_changed, installed_new)`.
+    fn upsert_peer_unchecked(
+        &mut self,
+        info: &ResolvedPeer,
+        now: Instant,
+        admission: PeerAdmission,
+    ) -> Result<(PeerIdx, bool, bool), Error> {
+        if let Some(pidx) = self.find_peer(&info.public_key) {
+            let mut persistent_deadline = None;
+            let (policy_changed, routes_changed) = {
+                let Some(peer) = self.peers.get_mut(pidx as usize).and_then(Option::as_mut) else {
+                    return Err(Error::InvalidResolverAnswer);
+                };
+                // Resolver records are complete replacements. In particular,
+                // an omitted endpoint clears a previously held endpoint, and
+                // a newly accepted endpoint is not overridden by a locally
+                // roamed/confirmed value from the previous record. Liveness
+                // confirmation is local metadata, so it can survive only when
+                // it still refers to the exact endpoint the new record names.
+                if peer.endpoint != info.endpoint {
+                    peer.endpoint = info.endpoint;
+                    peer.endpoint_confirmed = None;
+                }
+                let policy_changed = peer.inbound_policy != info.inbound_policy;
+                let routes_changed = peer.addresses.len() != info.addresses.len()
+                    || !peer
+                        .addresses
+                        .iter()
+                        .all(|cidr| info.addresses.contains(cidr));
+                peer.relay = info.relay;
+                peer.inbound_policy = info.inbound_policy;
+                let persistent_keepalive = info
+                    .persistent_keepalive
+                    .filter(|interval| interval.as_millis() != 0);
+                if peer.persistent_keepalive != persistent_keepalive {
+                    peer.persistent_keepalive = persistent_keepalive;
+                    peer.sessions.persistent_keepalive_due =
+                        persistent_keepalive.map(|interval| now + interval);
+                    persistent_deadline = peer.sessions.persistent_keepalive_due;
+                }
+                // Address ownership is committed only after the route-cache
+                // replacement has been fully preflighted and installed.
+                (policy_changed, routes_changed)
+            };
+            if let Some(deadline) = persistent_deadline {
+                self.timers.arm(deadline);
+            }
+            if policy_changed {
+                // Policy changes invalidate conntrack, but cryptographic sessions remain valid.
+                self.firewall.remove_peer(pidx);
+            }
+            return Ok((pidx, routes_changed, false));
+        }
+        if self.peer_is_ghosted(&info.public_key, now) {
+            debug!("peer admission suppressed by recently-evicted ghost");
+            return Err(Error::PeerAdmissionLimited);
+        }
+
+        let free_index = self.peers.iter().position(|peer| peer.is_none());
+        let free = self.peers.iter().filter(|peer| peer.is_none()).count();
+        let authenticated = matches!(admission, PeerAdmission::AuthenticatedInitiator);
+        let lazy = matches!(
+            admission,
+            PeerAdmission::LazyOutbound | PeerAdmission::LazyRelay
+        );
+
+        // Lazy records are a cache, not an entitlement to all peer slots. They
+        // may use only capacity above the protected reserve. A cryptographically
+        // authenticated unknown initiator can consume a reserved free slot.
+        if authenticated || free > self.core_config.lazy_peer_reserve {
+            if let Some(i) = free_index {
+                let peer = PeerEntry::new(
+                    info.public_key,
+                    PeerKind::Dynamic,
+                    *crate::crypto::dh(&self.s_priv, &info.public_key)?,
+                    info.endpoint,
+                    info.relay,
+                    info.inbound_policy,
+                    info.persistent_keepalive,
+                    info.addresses.clone(),
+                    now,
+                );
+                self.install_peer(i as PeerIdx, peer)?;
+                return Ok((i as PeerIdx, true, true));
+            }
+        }
+
+        // A watched update is existing-only. A stale invalidation must never
+        // turn into a fresh admission after the original peer was removed.
+        if matches!(admission, PeerAdmission::WatchedUpdate) {
+            return Err(Error::InvalidResolverAnswer);
+        }
+
+        // Relay-triggered admissions are deliberately non-evicting. If there
+        // is no unreserved free slot, the submitter must retry after capacity
+        // becomes naturally available.
+        if matches!(admission, PeerAdmission::LazyRelay) {
+            debug!("relay peer admission denied by protected reserve or capacity");
+            return Err(Error::PeerAdmissionLimited);
+        }
+
+        // Authenticated initiators and local outbound lazy lookups may displace
+        // only an idle dynamic peer carrying no handshake or established-session
+        // generation. A lazy outbound lookup can swap one cache entry for
+        // another while leaving protected free slots untouched.
+        //
+        // Documented caveat: eviction forgets `greatest_ts`, leaving the same
+        // bounded replay window as a responder restart (§5.1); the TAI64N
+        // monotonicity of initiators bounds the damage.
+        let route_shortage = Self::required_route_slots(&info.addresses)
+            .saturating_sub(self.routes.available_slots());
+        let selected = [None; P];
+        let Some(i) = self
+            .capacity_victim_excluding(now, None, &selected, 0, route_shortage)
+            .map(|pidx| pidx as usize)
+        else {
+            // A table victim is accepted only when removing that same peer also
+            // makes the newcomer's complete route set fit. This keeps peer-table
+            // and route-cache admission one destructive transaction.
+            return Err(if lazy {
+                Error::PeerAdmissionLimited
+            } else {
+                Error::PeerTableFull
+            });
+        };
+        let peer = PeerEntry::new(
+            info.public_key,
+            PeerKind::Dynamic,
+            *crate::crypto::dh(&self.s_priv, &info.public_key)?,
+            info.endpoint,
+            info.relay,
+            info.inbound_policy,
+            info.persistent_keepalive,
+            info.addresses.clone(),
+            now,
+        );
+        self.evict_peer_for_capacity(i as PeerIdx, now)?;
+        self.install_peer(i as PeerIdx, peer)?;
+        Ok((i as PeerIdx, true, true))
+    }
+
+    fn required_route_slots(addresses: &PeerAddresses) -> usize {
+        let mut required = 0usize;
+        for (index, cidr) in addresses.iter().enumerate() {
+            if !addresses
+                .iter()
+                .take(index)
+                .any(|previous| previous == cidr)
+            {
+                required += 1;
+            }
+        }
+        required
+    }
+
+    fn capacity_victim_excluding(
+        &self,
+        now: Instant,
+        exclude: Option<PeerIdx>,
+        selected: &[Option<PeerIdx>; P],
+        selected_len: usize,
+        minimum_routes_to_free: usize,
+    ) -> Option<PeerIdx> {
+        let min_idle = self.core_config.dynamic_peer_min_idle;
+        self.peers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, peer)| peer.as_ref().map(|peer| (index as PeerIdx, peer)))
+            .filter(|(pidx, peer)| {
+                Some(*pidx) != exclude
+                    && !selected[..selected_len].contains(&Some(*pidx))
+                    && !peer.is_pinned()
+                    && peer.sessions.slots().into_iter().all(|slot| slot.is_none())
+                    && now.saturating_since(peer.last_activity) >= min_idle
+                    && self.routes.peer_route_count(*pidx) >= minimum_routes_to_free
+            })
+            .min_by_key(|(_, peer)| peer.last_activity)
+            .map(|(pidx, _)| pidx)
+    }
+
+    fn evict_peer_for_capacity(&mut self, pidx: PeerIdx, now: Instant) -> Result<(), Error> {
+        if !self.peer_evictions.try_take(now) {
+            debug!("peer capacity eviction denied by global cooldown");
+            return Err(Error::PeerAdmissionLimited);
+        }
+        self.evict_peer_and_remember(pidx, now)
+    }
+
+    fn evict_peer_and_remember(&mut self, pidx: PeerIdx, now: Instant) -> Result<(), Error> {
+        let Some(public_key) = self
+            .peers
+            .get(pidx as usize)
+            .and_then(Option::as_ref)
+            .map(|peer| peer.public_key)
+        else {
+            return Ok(());
+        };
+        self.evict_peer(pidx)?;
+        self.remember_evicted_peer(public_key, now);
+        Ok(())
+    }
+
+    fn peer_is_ghosted(&mut self, public_key: &[u8; 32], now: Instant) -> bool {
+        let limit = self
+            .core_config
+            .peer_eviction_ghost_entries
+            .min(self.evicted_peer_ghosts.len());
+        for index in 0..limit {
+            if matches!(
+                self.evicted_peer_ghosts[index],
+                Some(entry) if entry.expires <= now
+            ) {
+                self.evicted_peer_ghosts[index] = None;
+            }
+        }
+        self.evicted_peer_ghosts[..limit]
+            .iter()
+            .flatten()
+            .any(|entry| &entry.public_key == public_key)
+    }
+
+    fn remember_evicted_peer(&mut self, public_key: [u8; 32], now: Instant) {
+        let limit = self
+            .core_config
+            .peer_eviction_ghost_entries
+            .min(self.evicted_peer_ghosts.len());
+        let ttl = self.core_config.peer_eviction_ghost_ttl;
+        if limit == 0 || ttl.as_millis() == 0 {
+            return;
+        }
+        let expires = now + ttl;
+        for index in 0..limit {
+            if self.evicted_peer_ghosts[index].is_some_and(|entry| entry.public_key == public_key) {
+                self.evicted_peer_ghosts[index] = Some(EvictedPeerGhost {
+                    public_key,
+                    expires,
+                });
+                return;
+            }
+        }
+        for index in 0..limit {
+            if self.evicted_peer_ghosts[index].is_none_or(|entry| entry.expires <= now) {
+                self.evicted_peer_ghosts[index] = Some(EvictedPeerGhost {
+                    public_key,
+                    expires,
+                });
+                return;
+            }
+        }
+        let mut victim = 0usize;
+        for index in 1..limit {
+            let candidate = self.evicted_peer_ghosts[index]
+                .map(|entry| entry.expires)
+                .unwrap_or(now);
+            let current = self.evicted_peer_ghosts[victim]
+                .map(|entry| entry.expires)
+                .unwrap_or(now);
+            if candidate < current {
+                victim = index;
+            }
+        }
+        self.evicted_peer_ghosts[victim] = Some(EvictedPeerGhost {
+            public_key,
+            expires,
+        });
+    }
+
+    /// Remove a peer and cascade: free its slots, routes, and parked packets.
+    fn evict_peer(&mut self, pidx: PeerIdx) -> Result<(), Error> {
+        let slots = match self.peers.get(pidx as usize).and_then(Option::as_ref) {
+            Some(peer) => peer.sessions.slots(),
+            None => return Ok(()),
+        };
+
+        // Validate every reverse index before removing the peer so reverse-index
+        // divergence is detected before any peer or slot state is changed.
+        for sidx in slots.into_iter().flatten() {
+            let slot = self
+                .slots
+                .get(sidx as usize)
+                .ok_or(Error::InternalInvariant)?;
+            if self.slot_owner(sidx) != Some(pidx) {
+                return Err(Error::InternalInvariant);
+            }
+            if let Some(index) = slot.local_index()
+                && self.session_indices.slot_for(index) != Some(sidx)
+            {
+                return Err(Error::InternalInvariant);
+            }
+        }
+
+        let Some(peer) = self.take_peer(pidx)? else {
+            return Ok(());
+        };
+        for sidx in peer.sessions.slots().into_iter().flatten() {
+            let local_index = self
+                .slots
+                .get(sidx as usize)
+                .ok_or(Error::InternalInvariant)?
+                .local_index();
+            if let Some(index) = local_index {
+                self.session_indices.remove(index, sidx)?;
+            }
+            *self
+                .slots
+                .get_mut(sidx as usize)
+                .ok_or(Error::InternalInvariant)? = Slot::Free;
+        }
+        self.routes.remove_peer(pidx)?;
+        self.firewall.remove_peer(pidx);
+        self.pending.drop_if(|p| p.wait == Wait::Handshake(pidx));
+        if !peer.is_pinned() {
+            self.queue_unwatch(peer.public_key);
+        }
+        Ok(())
+    }
+
+    /// Release the subscription created by an answer the core did not keep.
+    ///
+    /// Resolver integrations establish the watch before returning a positive
+    /// answer to the core. When admission, policy, or capacity says no, that
+    /// subscription would otherwise outlive every local trace of the peer.
+    fn discard_answer(&mut self, public_key: &[u8; 32]) {
+        if self.find_peer(public_key).is_some() {
+            return;
+        }
+        self.queue_unwatch(*public_key);
+    }
+
+    fn queue_unwatch(&mut self, public_key: [u8; 32]) {
+        if self.pending_unwatches.contains(&public_key) {
+            return;
+        }
+        #[cfg(feature = "alloc")]
+        self.pending_unwatches.push(public_key);
+        #[cfg(not(feature = "alloc"))]
+        {
+            let _ = self.pending_unwatches.push(public_key);
+        }
+    }
+
+    fn alloc_resolve_id(&mut self) -> ResolveId {
+        loop {
+            let id = ResolveId(self.next_resolve_id);
+            self.next_resolve_id = self.next_resolve_id.wrapping_add(1);
+            if !self.resolves.iter().any(|entry| entry.id == id) {
+                return id;
+            }
+        }
+    }
+
+    /// Whether a fresh resolver lookup for `query` should be suppressed:
+    /// either a request is already in flight, or an authoritative "no such
+    /// peer" answer is still being honoured (an unexpired [`ResolveKind::Negative`]
+    /// entry). Expired negatives do not suppress; the timer sweep reclaims them.
+    ///
+    /// This is the single check that replaces both the former in-flight dedup
+    /// scan and the `RouteCache::is_negative_*` lookups.
+    pub(super) fn resolve_suppressed(&self, query: ResolveQuery, now: Instant) -> bool {
+        self.resolves.iter().any(|r| {
+            r.query == query
+                && match r.kind {
+                    ResolveKind::Negative => r.deadline > now,
+                    _ => true,
+                }
+        })
+    }
+
+    /// Record an authoritative "no such peer" for `query`, suppressing repeat
+    /// lookups until `now + negative_ttl`. Best effort: the marker is skipped
+    /// only when every slot holds a live (non-negative) resolve, which is
+    /// self-correcting since those complete or lapse quickly.
+    ///
+    /// At most one entry ever exists per query, and the live entry that
+    /// produced this answer was already removed when its completion was applied, so the
+    /// retain is a defensive no-op in the common path (and clears a stale
+    /// negative in the pathological one).
+    fn mark_negative(&mut self, query: ResolveQuery, now: Instant) {
+        self.resolves.retain(|r| r.query != query);
+        let id = self.alloc_resolve_id();
+        let _ = self.try_push_resolve(InflightResolve {
+            id,
+            query,
+            kind: ResolveKind::Negative,
+            deadline: now + self.core_config.negative_ttl,
+            emitted: true, // spent: never emitted as a request
+        });
+    }
+
+    /// Drop any negative marker for `query` (a target we previously could not
+    /// resolve just resolved positively). Live resolves are left untouched.
+    fn clear_negative(&mut self, query: ResolveQuery) {
+        self.resolves
+            .retain(|r| !(matches!(r.kind, ResolveKind::Negative) && r.query == query));
+    }
+
+    /// Push a *live* resolve, evicting the soonest-to-expire negative marker if
+    /// the table is otherwise full. Negatives are low value — a suppressed
+    /// junk lookup — and must never deny a real query a slot, which preserves
+    /// the isolation the separate negative caches used to provide.
+    fn push_resolve(&mut self, entry: InflightResolve) -> Result<(), Error> {
+        if self.try_push_resolve(entry).is_ok() {
+            return Ok(());
+        }
+        let victim = self
+            .resolves
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.kind, ResolveKind::Negative))
+            .min_by_key(|(_, r)| r.deadline)
+            .map(|(index, _)| index);
+        let Some(index) = victim else {
+            return Err(Error::ResolverBusy);
+        };
+        self.resolves.swap_remove(index);
+        self.try_push_resolve(entry)
+    }
+
+    /// Append to the resolve table, enforcing `MAX_INFLIGHT_RESOLVES` under
+    /// either storage backend.
+    fn try_push_resolve(&mut self, entry: InflightResolve) -> Result<(), Error> {
+        // The single funnel for every resolver entry — in-flight queries and
+        // negative markers alike — so one arm here covers them all.
+        let deadline = entry.deadline;
+        #[cfg(feature = "alloc")]
+        {
+            if self.resolves.len() >= self.core_config.max_inflight_resolves {
+                return Err(Error::ResolverBusy);
+            }
+            self.resolves.push(entry);
+            self.timers.arm(deadline);
+            Ok(())
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            if self.resolves.len() >= self.core_config.max_inflight_resolves {
+                return Err(Error::ResolverBusy);
+            }
+            self.resolves.push(entry).map_err(|_| Error::ResolverBusy)?;
+            self.timers.arm(deadline);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::net::Ipv4Addr;
+
+    use super::*;
+    use crate::{IpNet, push_peer_address};
+
+    fn net4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpNet {
+        // `IpNet` is canonical by construction, so build through `IpInet`
+        // (which tolerates host bits) and take its network. That keeps the
+        // host-bit cases these tests deliberately exercise expressible.
+        crate::IpInet::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), len)
+            .expect("valid prefix")
+            .network()
+    }
+
+    /// An outer (physical network) address.
+    #[test]
+    fn peer_address_lists_deduplicate_and_canonicalise() {
+        // Answers are canonicalised at the core boundary so that a resolver
+        // returning host bits, or the same prefix twice, cannot consume extra
+        // route-cache slots or per-peer capacity.
+        let mut addresses = PeerAddresses::new();
+        push_peer_address(&mut addresses, net4(10, 1, 2, 3, 24)).expect("push");
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0], net4(10, 1, 2, 0, 24));
+
+        push_peer_address(&mut addresses, net4(10, 1, 2, 200, 24)).expect("duplicate");
+        assert_eq!(
+            addresses.len(),
+            1,
+            "an equivalent prefix is not a second route"
+        );
+
+        push_peer_address(&mut addresses, net4(10, 1, 2, 0, 25)).expect("push");
+        assert_eq!(
+            addresses.len(),
+            2,
+            "a different prefix length is a different route"
+        );
+
+        // Without an allocator the per-peer list is bounded, and overflowing
+        // it is reported rather than silently truncating the peer's routes.
+        #[cfg(not(feature = "alloc"))]
+        {
+            use crate::MAX_PEER_ADDRESSES;
+
+            let mut full = PeerAddresses::new();
+            for index in 0..MAX_PEER_ADDRESSES {
+                push_peer_address(&mut full, net4(10, index as u8, 0, 0, 24)).expect("push");
+            }
+            assert_eq!(full.len(), MAX_PEER_ADDRESSES);
+            assert_eq!(
+                push_peer_address(&mut full, net4(10, 200, 0, 0, 24)),
+                Err(Error::TooManyAddresses)
+            );
+            // A duplicate still succeeds, because it stores nothing.
+            assert_eq!(push_peer_address(&mut full, net4(10, 0, 0, 0, 24)), Ok(()));
+        }
+    }
+}

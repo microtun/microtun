@@ -1,0 +1,51 @@
+[package]
+name = "microtun-apiserver"
+description = "Peers API server for microtun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+microtun-std = { workspace = true }
+microtun-core = { workspace = true }
+# The server answers with the same codec its clients decode with, so a wire
+# regression is a compile error or a failing contract test rather than a fleet
+# incident.
+microtun-api = { workspace = true }
+microtun-jsonrpc = { workspace = true, features = ["tokio"] }
+embedded-io = { workspace = true, features = ["std"] }
+embedded-io-async = { workspace = true }
+
+smoltcp = { version = "0.13.1", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "auto-icmp-echo-reply",
+    "iface-max-addr-count-4",
+] }
+rand = { workspace = true, features = ["std", "std_rng", "getrandom"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "time",
+    "sync",
+    "io-util",
+] }
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+# Used only to assert the exact bytes of a serialized record; the server itself
+# serializes through `microtun-jsonrpc`'s responder.
+serde_json = "1"
+
+[[bin]]
+name = "microtun-apiserver"
+path = "src/main.rs"
