@@ -6,11 +6,14 @@
 //! Linux TUN, userspace IP stacks, and test harnesses can all adapt to that
 //! contract.
 
-use std::{error::Error as StdError, fmt, future::Future, io, net::SocketAddr, time::Duration};
+use std::{
+    collections::VecDeque, error::Error as StdError, fmt, future::Future, io, net::SocketAddr,
+    time::Duration,
+};
 
 use microtun_core::{
-    Config, Core, Instant, MAX_PEER_ADDRESSES, ResolverCommand, ResolverEvent, Sink,
-    StaticRelayPolicy, unmap_socket_addr,
+    Config, Core, Event, Instant, MAX_PEER_ADDRESSES, ResolveRequest, ResolverCommand,
+    ResolverEvent, Sink, StaticRelayPolicy, ip::unmap_socket_addr,
 };
 use rand_core::{CryptoRng, RngCore};
 use tokio::{sync::mpsc, time::Instant as TokioInstant};
@@ -49,26 +52,28 @@ pub const MAX_IP_PACKET_SIZE: usize = u16::MAX as usize + 1;
 // so they are sized for a host rather than made unbounded.
 //
 // The index-addressed pools are allocated at their full length when the core
-// is built, so raising these trades a one-off heap allocation (roughly `PEERS`
-// × 200 B plus `SESSIONS` × roughly 1.2 KiB with `REPLAY_WORDS = 128`)
+// is built, so raising these trades a one-off heap allocation (roughly
+// `MAX_PEERS` × 200 B plus `MAX_SESSIONS` × roughly 1.2 KiB with
+// `REPLAY_WORDS = 128`)
 // for headroom, and costs nothing on the stack.
 
-/// Peer table capacity: pinned plus dynamically resolved peers.
-pub const PEERS: usize = 128;
-/// Session slot capacity, shared by in-flight handshakes and live sessions.
-pub const SESSIONS: usize = 256;
+/// Maximum number of peers, including pinned and dynamically resolved peers.
+pub const MAX_PEERS: usize = 128;
+/// Maximum number of session slots, shared by handshakes and live sessions.
+pub const MAX_SESSIONS: usize = 256;
 /// Replay bitmap words per established session. 128 matches the reference
 /// implementations' 8,128-counter trailing window.
 pub const REPLAY_WORDS: usize = 128;
 /// Default route-cache sizing for the host runner. Resolver answers may carry
 /// more than four unique prefixes, but the core still admits at most this many
 /// routes overall.
-pub const ROUTES: usize = PEERS * MAX_PEER_ADDRESSES;
+pub const MAX_ROUTES: usize = MAX_PEERS * MAX_PEER_ADDRESSES;
 /// Bounded request and response queue depth used by [`TunnelRunner::run`].
 pub const RESOLVER_QUEUE_DEPTH: usize = 8;
 
 /// The concrete core type driven by the standard-runtime runner.
-pub type TunnelCore<RNG> = Core<RNG, StaticRelayPolicy, PEERS, SESSIONS, REPLAY_WORDS, ROUTES>;
+pub type TunnelCore<RNG> =
+    Core<RNG, StaticRelayPolicy, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>;
 
 /// Plaintext packet device used by [`TunnelRunner`].
 ///
@@ -86,6 +91,18 @@ pub trait TunnelDevice {
         packet: &[u8],
     ) -> io::Result<usize>;
 }
+
+/// Synchronous runtime observations emitted by the tunnel engine.
+///
+/// Observers must return promptly: callbacks run inline with authenticated
+/// packet processing. Applications that need asynchronous work should update a
+/// shared latest-value store or use a non-blocking queue from the callback.
+pub trait TunnelObserver: Send + Sync {
+    /// Observe one runtime event from [`microtun_core::Core`].
+    fn event(&self, _event: Event) {}
+}
+
+impl TunnelObserver for () {}
 
 /// Errors produced while constructing or running a host tunnel.
 #[derive(Debug)]
@@ -132,11 +149,40 @@ impl From<io::Error> for Error {
 struct TunnelSink<'a, D> {
     device: &'a D,
     outer: &'a tokio::net::UdpSocket,
+    observer: &'a dyn TunnelObserver,
+    resolver_commands: &'a mpsc::Sender<ResolverCommand>,
+    pending_unwatches: &'a mut VecDeque<[u8; 32]>,
 }
 
 impl<'a, D> TunnelSink<'a, D> {
-    fn new(device: &'a D, outer: &'a tokio::net::UdpSocket) -> Self {
-        Self { device, outer }
+    fn new(
+        device: &'a D,
+        outer: &'a tokio::net::UdpSocket,
+        observer: &'a dyn TunnelObserver,
+        resolver_commands: &'a mpsc::Sender<ResolverCommand>,
+        pending_unwatches: &'a mut VecDeque<[u8; 32]>,
+    ) -> Self {
+        Self {
+            device,
+            outer,
+            observer,
+            resolver_commands,
+            pending_unwatches,
+        }
+    }
+
+    fn flush_unwatches(&mut self) -> bool {
+        while let Some(public_key) = self.pending_unwatches.front().copied() {
+            if self
+                .resolver_commands
+                .try_send(ResolverCommand::Unwatch(public_key))
+                .is_err()
+            {
+                return false;
+            }
+            self.pending_unwatches.pop_front();
+        }
+        true
     }
 }
 
@@ -182,6 +228,28 @@ impl<D: TunnelDevice> Sink for TunnelSink<'_, D> {
             Err(error) => log::warn!("inner packet delivery failed: {error}"),
         }
     }
+
+    fn resolve(&mut self, request: ResolveRequest) -> bool {
+        self.flush_unwatches()
+            && self
+                .resolver_commands
+                .try_send(ResolverCommand::Resolve(request))
+                .is_ok()
+    }
+
+    fn event(&mut self, event: Event) {
+        if let Event::PeerEvicted { public_key } = event {
+            if !self.flush_unwatches()
+                || self
+                    .resolver_commands
+                    .try_send(ResolverCommand::Unwatch(public_key))
+                    .is_err()
+            {
+                self.pending_unwatches.push_back(public_key);
+            }
+        }
+        self.observer.event(event);
+    }
 }
 
 /// Owns the protocol state machine and its Tokio transport plumbing.
@@ -190,6 +258,7 @@ pub struct TunnelRunner<D, RNG: RngCore + CryptoRng> {
     device: D,
     outer: tokio::net::UdpSocket,
     clock_base: TokioInstant,
+    observer: Box<dyn TunnelObserver>,
 }
 
 impl<D, RNG> fmt::Debug for TunnelRunner<D, RNG>
@@ -225,6 +294,7 @@ where
             device,
             outer,
             clock_base,
+            observer: Box::new(()),
         })
     }
 
@@ -251,6 +321,12 @@ where
         self.engine.public_key()
     }
 
+    /// Install a synchronous observer for authenticated runtime state changes.
+    pub fn with_observer(mut self, observer: impl TunnelObserver + 'static) -> Self {
+        self.observer = Box::new(observer);
+        self
+    }
+
     /// Supply wall-clock time for handshake timestamps.
     pub fn set_unix_time(&mut self, unix_secs: u64, nanos: u32) {
         log::debug!("updating core wall clock: unix_secs={unix_secs} nanos={nanos}");
@@ -262,9 +338,9 @@ where
     ///
     /// A resolver task is created automatically. One long-lived Peers API server
     /// connection carries ordinary lookups and dynamic-peer watch updates.
-    /// A command is committed only after bounded channel capacity has already
-    /// accepted it, so the packet path never blocks and no core state changes
-    /// unless the command was actually queued.
+    /// Resolve requests use the sink's non-blocking acceptance callback; peer
+    /// eviction events are translated into unwatch commands and retained by the
+    /// runner until the bounded resolver channel accepts them.
     pub async fn run<S, T>(self, resolver: PeersApiResolver<T>, shutdown: S) -> Result<(), Error>
     where
         S: Future<Output = io::Result<()>>,
@@ -297,9 +373,9 @@ where
     /// Run with caller-provided resolver channels and task.
     ///
     /// This mirrors the explicit task wiring exposed by `microtun-embassy` and
-    /// is useful for custom resolvers. The command sender must be bounded: the
-    /// runner reserves capacity without waiting and leaves commands in the core
-    /// when the channel is full.
+    /// is useful for custom resolvers. The command sender must be bounded:
+    /// resolve requests are accepted non-blockingly, while unwatch commands are
+    /// derived from peer-eviction events and retried by the runner if needed.
     pub async fn run_with_resolver_task<S>(
         mut self,
         resolve_tx: mpsc::Sender<ResolverCommand>,
@@ -312,10 +388,12 @@ where
     {
         let mut inner_packet = vec![0u8; MAX_IP_PACKET_SIZE];
         let mut outer_datagram = vec![0u8; OUTER_RECV_SIZE];
+        let mut pending_unwatches = VecDeque::new();
 
         let engine = &mut self.engine;
         let device = &self.device;
         let outer = &self.outer;
+        let observer = &*self.observer;
         let clock_base = self.clock_base;
         tokio::pin!(shutdown);
 
@@ -350,7 +428,13 @@ where
                                      more than {OUTER_SIZE} bytes"
                                 );
                             } else {
-                                let mut sink = TunnelSink::new(device, outer);
+                                let mut sink = TunnelSink::new(
+                                    device,
+                                    outer,
+                                    observer,
+                                    &resolve_tx,
+                                    &mut pending_unwatches,
+                                );
                                 if let Err(error) = engine
                                     .receive_outer(
                                         now(clock_base),
@@ -380,7 +464,13 @@ where
                             "tunnel device returned a packet length larger than its buffer",
                         ).into());
                     }
-                    let mut sink = TunnelSink::new(device, outer);
+                    let mut sink = TunnelSink::new(
+                        device,
+                        outer,
+                        observer,
+                        &resolve_tx,
+                        &mut pending_unwatches,
+                    );
                     if let Err(error) = engine
                         .send_inner(
                             now(clock_base),
@@ -393,7 +483,13 @@ where
                     }
                 }
                 Some(response) = resolve_rx.recv() => {
-                    let mut sink = TunnelSink::new(device, outer);
+                    let mut sink = TunnelSink::new(
+                        device,
+                        outer,
+                        observer,
+                        &resolve_tx,
+                        &mut pending_unwatches,
+                    );
                     if let Err(error) = engine
                         .resolver_event_completed(now(clock_base), response, &mut sink)
                         .await
@@ -404,7 +500,13 @@ where
                 _ = timer => {
                     let fired_at = now(clock_base);
                     log::trace!("core protocol timer fired");
-                    let mut sink = TunnelSink::new(device, outer);
+                    let mut sink = TunnelSink::new(
+                        device,
+                        outer,
+                        observer,
+                        &resolve_tx,
+                        &mut pending_unwatches,
+                    );
                     if !engine.handle_timeout(fired_at, &mut sink).await {
                         log::trace!("core protocol timer had no due work");
                     }
@@ -429,16 +531,14 @@ where
                 }
             }
 
-            loop {
-                let Ok(permit) = resolve_tx.try_reserve() else {
+            while let Some(public_key) = pending_unwatches.front().copied() {
+                if resolve_tx
+                    .try_send(ResolverCommand::Unwatch(public_key))
+                    .is_err()
+                {
                     break;
-                };
-                let Some(command) = engine.peek_resolver_command() else {
-                    drop(permit);
-                    break;
-                };
-                permit.send(command);
-                engine.resolver_command_sent(&command);
+                }
+                pending_unwatches.pop_front();
             }
         }
     }

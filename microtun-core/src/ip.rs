@@ -131,58 +131,54 @@ pub fn unmap_socket_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-/// Returned by [`parse_ip_net`] when the text is not a CIDR prefix.
+/// Returned by [`parse_ip_cidr`] when the text is not a CIDR prefix.
 ///
 /// Deliberately opaque: the underlying parser distinguishes several failure
 /// modes, none of which any caller here acts on differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidIpNet;
+pub struct InvalidIpCidr;
 
-impl core::fmt::Display for InvalidIpNet {
+impl core::fmt::Display for InvalidIpCidr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("not a valid IP network prefix")
     }
 }
 
-impl core::error::Error for InvalidIpNet {}
+impl core::error::Error for InvalidIpCidr {}
 
 /// Parse a CIDR prefix such as `10.1.2.0/24` or `2001:db8:1::/64`, truncating
 /// any host bits rather than rejecting them.
 ///
-/// [`crate::IpNet`] is canonical by construction, so its own `FromStr` refuses
+/// [`crate::IpCidr`] is canonical by construction, so its own `FromStr` refuses
 /// `10.1.2.3/8`. Every parse boundary in this project — the Peers API wire
 /// codec, server config files, host config files — reaches for *this* function
-/// instead, because all of them previously accepted a sloppy prefix and let the
-/// core canonicalize it downstream. Rejecting that input now would be a
-/// behaviour change visible to deployed peers and existing config files, so the
-/// leniency lives here, in exactly one place, rather than being reinvented per
-/// call site.
+/// so lenient input handling lives in exactly one place rather than being
+/// reinvented per call site.
 ///
 /// A bare address with no `/` is read as a host prefix — `10.0.0.1` means
-/// `10.0.0.1/32`, `2001:db8::1` means `2001:db8::1/128`. The previous
-/// `ipnet`-based parser demanded the `/`; this is a deliberate widening, not an
-/// oversight. Nothing is ambiguous about a bare address, and every prefix this
-/// project *writes* still carries its length (see the `{:#}` formatting in
+/// `10.0.0.1/32`, `2001:db8::1` means `2001:db8::1/128`. Nothing is ambiguous
+/// about a bare address, and every prefix this project *writes* still carries
+/// its length (see the `{:#}` formatting in
 /// `microtun-api`), so the short form is an input convenience that never
 /// reaches another implementation.
-pub fn parse_ip_net(text: &str) -> Result<crate::IpNet, InvalidIpNet> {
-    cidr::parsers::parse_cidr_ignore_hostbits::<crate::IpNet, _>(text, |value| {
+pub fn parse_ip_cidr(text: &str) -> Result<crate::IpCidr, InvalidIpCidr> {
+    cidr::parsers::parse_cidr_ignore_hostbits::<crate::IpCidr, _>(text, |value| {
         value.parse::<IpAddr>()
     })
-    .map_err(|_| InvalidIpNet)
+    .map_err(|_| InvalidIpCidr)
 }
 
 /// Parse an address *with* its prefix, keeping host bits: `10.0.0.2/24` stays
 /// `10.0.0.2/24` rather than collapsing to the `10.0.0.0/24` network.
 ///
-/// The counterpart to [`parse_ip_net`], for the two things that are genuinely
+/// The counterpart to [`parse_ip_cidr`], for the two things that are genuinely
 /// interface addresses rather than routes: a TUN device's own address, and the
 /// one moment a config parser still holds an operator's literal text and can
 /// tell them it is about to be rewritten. Bare addresses are accepted here too,
 /// so `10.0.0.2` configures a `/32` interface.
-pub fn parse_ip_inet(text: &str) -> Result<crate::IpInet, InvalidIpNet> {
+pub fn parse_ip_inet(text: &str) -> Result<crate::IpInet, InvalidIpCidr> {
     cidr::parsers::parse_inet::<crate::IpInet, _>(text, |value| value.parse::<IpAddr>())
-        .map_err(|_| InvalidIpNet)
+        .map_err(|_| InvalidIpCidr)
 }
 
 #[cfg(test)]
@@ -336,38 +332,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_ip_net_accepts_canonical_prefixes() {
-        let v4 = parse_ip_net("10.1.2.0/24").expect("valid IPv4 prefix");
+    fn parse_ip_cidr_accepts_canonical_prefixes() {
+        let v4 = parse_ip_cidr("10.1.2.0/24").expect("valid IPv4 prefix");
         assert_eq!(v4.first_address(), IpAddr::V4(Ipv4Addr::new(10, 1, 2, 0)));
         assert_eq!(v4.network_length(), 24);
 
-        let v6 = parse_ip_net("2001:db8:1::/64").expect("valid IPv6 prefix");
+        let v6 = parse_ip_cidr("2001:db8:1::/64").expect("valid IPv6 prefix");
         assert_eq!(v6.network_length(), 64);
     }
 
     #[test]
-    fn parse_ip_net_truncates_host_bits() {
-        // The behaviour the previous `ipnet`-based parser had by accident:
-        // sloppy input parsed, then got canonicalized further downstream.
-        // Now it is canonicalized here, and the result is identical.
+    fn parse_ip_cidr_truncates_host_bits() {
+        // Sloppy input is accepted and canonicalized at this parse boundary.
         assert_eq!(
-            parse_ip_net("10.1.2.3/8").expect("host bits are truncated"),
-            parse_ip_net("10.0.0.0/8").expect("valid IPv4 prefix")
+            parse_ip_cidr("10.1.2.3/8").expect("host bits are truncated"),
+            parse_ip_cidr("10.0.0.0/8").expect("valid IPv4 prefix")
         );
     }
 
-    /// A bare address is a host prefix. Deliberate, and wider than the parser
-    /// this replaced accepted.
+    /// A bare address is a host prefix.
     #[test]
-    fn parse_ip_net_reads_a_bare_address_as_a_host_prefix() {
-        let v4 = parse_ip_net("10.0.0.1").expect("bare IPv4 address");
-        assert_eq!(v4, parse_ip_net("10.0.0.1/32").expect("valid host prefix"));
+    fn parse_ip_cidr_reads_a_bare_address_as_a_host_prefix() {
+        let v4 = parse_ip_cidr("10.0.0.1").expect("bare IPv4 address");
+        assert_eq!(v4, parse_ip_cidr("10.0.0.1/32").expect("valid host prefix"));
         assert_eq!(v4.network_length(), 32);
 
-        let v6 = parse_ip_net("2001:db8::1").expect("bare IPv6 address");
+        let v6 = parse_ip_cidr("2001:db8::1").expect("bare IPv6 address");
         assert_eq!(
             v6,
-            parse_ip_net("2001:db8::1/128").expect("valid host prefix")
+            parse_ip_cidr("2001:db8::1/128").expect("valid host prefix")
         );
         assert_eq!(v6.network_length(), 128);
     }
@@ -377,10 +370,10 @@ mod tests {
         let inet = parse_ip_inet("10.0.0.2/24").expect("valid interface address");
         assert_eq!(inet.address(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         assert_eq!(inet.network_length(), 24);
-        // ...and its network is what `parse_ip_net` would have returned.
+        // ...and its network is what `parse_ip_cidr` would have returned.
         assert_eq!(
             inet.network(),
-            parse_ip_net("10.0.0.2/24").expect("valid prefix")
+            parse_ip_cidr("10.0.0.2/24").expect("valid prefix")
         );
         assert_eq!(
             parse_ip_inet("10.0.0.2").expect("bare address is a /32 interface"),
@@ -389,9 +382,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_ip_net_rejects_nonsense() {
-        assert_eq!(parse_ip_net(""), Err(InvalidIpNet));
-        assert_eq!(parse_ip_net("10.0.0.0/33"), Err(InvalidIpNet));
-        assert_eq!(parse_ip_net("not-an-address/24"), Err(InvalidIpNet));
+    fn parse_ip_cidr_rejects_nonsense() {
+        assert_eq!(parse_ip_cidr(""), Err(InvalidIpCidr));
+        assert_eq!(parse_ip_cidr("10.0.0.0/33"), Err(InvalidIpCidr));
+        assert_eq!(parse_ip_cidr("not-an-address/24"), Err(InvalidIpCidr));
     }
 }

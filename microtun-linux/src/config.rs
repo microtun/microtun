@@ -9,7 +9,9 @@
 use std::{fmt, fs::File, io::Read, net::SocketAddr, os::unix::fs::PermissionsExt, path::Path};
 
 use microtun_std::core::{
-    IpInet, IpNet, KEY_TEXT_LEN, decode_key, decode_key_into, parse_ip_inet, unmap_socket_addr,
+    IpCidr, IpInet,
+    ip::{parse_ip_inet, unmap_socket_addr},
+    key::{KEY_TEXT_LEN, decode_key, decode_key_into},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -33,7 +35,7 @@ pub struct Runtime {
     pub private_key: Zeroizing<[u8; 32]>,
     pub api_server_public_key: [u8; 32],
     pub api_server_endpoint: ApiServerEndpoint,
-    pub api_server_addresses: Vec<IpNet>,
+    pub api_server_addresses: Vec<IpCidr>,
     pub listen: SocketAddr,
     pub tun_name: String,
     pub tun_address: IpInet,
@@ -507,7 +509,7 @@ fn listen_socket(entry: &Entry<'_>, path: &Path) -> Result<SocketAddr, ConfigErr
 /// `Addresses` may repeat and each entry may contain comma- or whitespace-
 /// separated prefixes. As in the apiserver configuration, omitting a prefix
 /// length means a host prefix.
-fn api_server_addresses(section: &Section<'_>, path: &Path) -> Result<Vec<IpNet>, ConfigError> {
+fn api_server_addresses(section: &Section<'_>, path: &Path) -> Result<Vec<IpCidr>, ConfigError> {
     let mut addresses = Vec::new();
 
     for entry in section.all("Addresses") {

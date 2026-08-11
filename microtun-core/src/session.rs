@@ -14,8 +14,8 @@ use crate::{
 /// The companion of [`crate::routing::PeerIdx`], and wide for the same
 /// reason: slot handles are stored in the peer table, in the session-index
 /// map, and in resolver bookkeeping, and every one of those uses is cast to
-/// `usize` on the way to an array. [`crate::Core::new`] rejects any `S` this
-/// type cannot address.
+/// `usize` on the way to an array. [`crate::Core::new`] rejects any
+/// `MAX_SESSIONS` this type cannot address.
 pub type SlotIdx = u32;
 
 /// Which side of the handshake created this session — the initiator carries

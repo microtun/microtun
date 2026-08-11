@@ -1,8 +1,10 @@
 //! Peer records and the two indexes the API is defined over.
 //!
-//! Records contain only validated peer data. RPC results are serialized from
-//! that data for each request, straight into the peer's transmit buffer; no
-//! result is pre-rendered or cached in the registry.
+//! Configured records contain only validated peer data. The published registry
+//! also carries a small runtime overlay of direct endpoints learned from
+//! authenticated tunnel traffic. RPC and local-resolver projections combine the
+//! two on read, with learned endpoints taking precedence over configured
+//! `Endpoint` values. No result is pre-rendered or cached.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -12,7 +14,8 @@ use std::{
 
 use microtun_api::PeerInfo;
 use microtun_core::{
-    InboundPolicy, IpNet, PeerAddresses, ResolvedPeer, encode_key, push_peer_address,
+    IpCidr, PeerAddresses, ResolvedPeer, firewall::InboundPolicy, key::encode_key,
+    prefix_trie::PrefixTrie, push_peer_address,
 };
 
 /// Characters of a key's base64 form used to name a peer in a log line: wide
@@ -36,7 +39,7 @@ pub struct PeerRecord {
     pub persistent_keepalive: Option<u16>,
     /// Canonical (host-bits-cleared) tunnel prefixes, at least one, at most
     /// `microtun_core::MAX_PEER_ADDRESSES`.
-    pub addresses: Vec<IpNet>,
+    pub addresses: Vec<IpCidr>,
 }
 
 impl PeerRecord {
@@ -45,7 +48,7 @@ impl PeerRecord {
         public_key: [u8; 32],
         endpoint: Option<SocketAddr>,
         relay: Option<[u8; 32]>,
-        addresses: Vec<IpNet>,
+        addresses: Vec<IpCidr>,
         persistent_keepalive: Option<u16>,
     ) -> Self {
         let public_key_text = encode_key(&public_key).as_str().to_string();
@@ -61,10 +64,17 @@ impl PeerRecord {
     }
 
     /// Copy this record into the Peers API's single owned wire shape.
+    #[cfg(test)]
     pub fn info(&self) -> PeerInfo {
+        self.info_with_endpoint(self.endpoint)
+    }
+
+    /// Copy this record into the Peers API wire shape using an effective runtime
+    /// endpoint. The remaining fields always come from validated configuration.
+    pub fn info_with_endpoint(&self, endpoint: Option<SocketAddr>) -> PeerInfo {
         PeerInfo::from_fields(
             &self.public_key,
-            self.endpoint,
+            endpoint,
             self.relay.as_ref(),
             self.addresses.iter().copied(),
             self.persistent_keepalive,
@@ -73,7 +83,14 @@ impl PeerRecord {
     }
 
     /// Clone this configured record into the tunnel core's resolver shape.
+    #[cfg(test)]
     pub fn resolved(&self) -> ResolvedPeer {
+        self.resolved_with_endpoint(self.endpoint)
+    }
+
+    /// Clone this record into the tunnel resolver shape using an effective
+    /// runtime endpoint.
+    pub fn resolved_with_endpoint(&self, endpoint: Option<SocketAddr>) -> ResolvedPeer {
         let mut addresses = PeerAddresses::new();
         for address in self.addresses.iter().copied() {
             // Configuration validation already applies the same per-peer
@@ -84,7 +101,7 @@ impl PeerRecord {
 
         ResolvedPeer {
             public_key: self.public_key,
-            endpoint: self.endpoint,
+            endpoint,
             relay: self.relay,
             addresses,
             inbound_policy: InboundPolicy::AllowAll,
@@ -105,23 +122,26 @@ impl PeerRecord {
 /// Both indexes hold positions into `peers`, which owns the records. A
 /// registry value is immutable after construction; reload publishes a newly
 /// built value through [`SharedRegistry`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Registry {
     peers: Vec<PeerRecord>,
     by_key: HashMap<[u8; 32], usize>,
-    /// Prefixes sorted longest-first, so the first containing entry wins.
-    routes: Vec<(IpNet, usize)>,
+    /// Longest-prefix-match index from tunnel prefix to owning peer.
+    routes: PrefixTrie<usize, 0>,
+    route_count: usize,
 }
 
-/// Atomically replaceable registry shared by the Peers API and tunnel resolver.
-///
-/// Readers take an `Arc` snapshot and then release the lock immediately, so a
-/// reload never waits for response serialization or resolver work to finish.
+impl Default for Registry {
+    fn default() -> Self {
+        Self::build(Vec::new()).expect("empty registry is always valid")
+    }
+}
+
+/// One peer whose effective published state changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegistryChange {
-    /// The key whose record was added, modified, or removed. Subscribers read
-    /// the new state out of the published snapshot rather than carrying it
-    /// here, so a change is just a name.
+    /// Subscribers re-read the published state rather than carrying it here,
+    /// so a change is just a name.
     pub public_key: [u8; 32],
 }
 
@@ -132,8 +152,52 @@ pub struct RegistryChange {
 /// this type owes the Peers API is the explicit watch-creation atomicity in
 /// [`Self::read`].
 #[derive(Debug, Clone)]
+struct PublishedRegistry {
+    registry: Arc<Registry>,
+    /// Authenticated direct endpoints learned by the running tunnel. These are
+    /// runtime observations, not configuration: while present they override the
+    /// configured endpoint in Peers API and local-resolver projections.
+    observed_endpoints: HashMap<[u8; 32], SocketAddr>,
+}
+
+/// Borrowed view of one atomically published config/runtime state pair.
+///
+/// Callers intentionally cannot access the overlay representation. Endpoint
+/// precedence lives here so every projection observes the same rule.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublishedView<'a> {
+    registry: &'a Registry,
+    observed_endpoints: &'a HashMap<[u8; 32], SocketAddr>,
+}
+
+impl<'a> PublishedView<'a> {
+    pub(crate) fn config(self) -> &'a Registry {
+        self.registry
+    }
+
+    pub(crate) fn lookup_key(self, public_key: &[u8; 32]) -> Option<&'a PeerRecord> {
+        self.registry.lookup_key(public_key)
+    }
+
+    pub(crate) fn lookup_address(self, address: IpAddr) -> Option<&'a PeerRecord> {
+        self.registry.lookup_address(address)
+    }
+
+    pub(crate) fn effective_endpoint(self, record: &PeerRecord) -> Option<SocketAddr> {
+        self.observed_endpoints
+            .get(&record.public_key)
+            .copied()
+            .or(record.endpoint)
+    }
+
+    pub(crate) fn info(self, record: &PeerRecord) -> PeerInfo {
+        record.info_with_endpoint(self.effective_endpoint(record))
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SharedRegistry {
-    current: Arc<RwLock<Arc<Registry>>>,
+    current: Arc<RwLock<PublishedRegistry>>,
     changes: tokio::sync::broadcast::Sender<RegistryChange>,
 }
 
@@ -141,16 +205,21 @@ impl SharedRegistry {
     pub fn new(registry: Registry) -> Self {
         let (changes, _) = tokio::sync::broadcast::channel(256);
         Self {
-            current: Arc::new(RwLock::new(Arc::new(registry))),
+            current: Arc::new(RwLock::new(PublishedRegistry {
+                registry: Arc::new(registry),
+                observed_endpoints: HashMap::new(),
+            })),
             changes,
         }
     }
 
-    /// Obtain one internally consistent view of all peer and route indexes.
-    pub fn snapshot(&self) -> Arc<Registry> {
+    /// Obtain only the current validated configuration. Runtime endpoint
+    /// observations are intentionally projected only through [`Self::read`].
+    pub fn config_snapshot(&self) -> Arc<Registry> {
         self.current
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .registry
             .clone()
     }
 
@@ -159,23 +228,54 @@ impl SharedRegistry {
     /// This is the critical section the Peers API requires of `v1.peer.watch`:
     /// insert the requested key into the connection's watch set and read its
     /// current record inside `read`, and no change to that key can land after
-    /// the snapshot yet escape the new watch. [`Self::replace`] publishes and
-    /// dispatches under the matching write lock, so the two orderings are
-    /// mutually exclusive — either the watch ran first and precedes the
-    /// notification, or the reload ran first and the watch already answers
-    /// from the new registry.
+    /// the snapshot yet escape the new watch. Both [`Self::replace`] and
+    /// [`Self::observe_endpoint`] publish and dispatch under the matching write
+    /// lock, so the two orderings are mutually exclusive — either the watch ran
+    /// first and precedes the notification, or the state change ran first and
+    /// the watch already answers from the new published state.
     ///
     /// Nothing else is owed. The response may be serialized and written
     /// afterwards, from any task, in any order relative to notifications.
     ///
     /// `read` must not block or acquire the registry lock again; keep it to the
     /// watch-set insertion and one by-key lookup.
-    pub fn read<T>(&self, with: impl FnOnce(&Registry) -> T) -> T {
+    pub(crate) fn read<T>(&self, with: impl FnOnce(PublishedView<'_>) -> T) -> T {
         let current = self
             .current
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        with(&current)
+        with(PublishedView {
+            registry: current.registry.as_ref(),
+            observed_endpoints: &current.observed_endpoints,
+        })
+    }
+
+    /// Record a direct endpoint learned from authenticated tunnel traffic.
+    ///
+    /// The first observation is retained even when it equals configuration, so
+    /// a later config reload cannot displace an endpoint that was actually
+    /// authenticated. A notification is sent only when the *effective* served
+    /// endpoint changes. Unknown keys are ignored and cannot grow runtime state.
+    pub fn observe_endpoint(&self, public_key: [u8; 32], endpoint: SocketAddr) {
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = current.registry.lookup_key(&public_key) else {
+            return;
+        };
+        let before = current
+            .observed_endpoints
+            .get(&public_key)
+            .copied()
+            .or(record.endpoint);
+        if current.observed_endpoints.get(&public_key) == Some(&endpoint) {
+            return;
+        }
+        current.observed_endpoints.insert(public_key, endpoint);
+        if before != Some(endpoint) {
+            let _ = self.changes.send(RegistryChange { public_key });
+        }
     }
 
     /// Subscribe to peer-level registry changes.
@@ -183,17 +283,32 @@ impl SharedRegistry {
         self.changes.subscribe()
     }
 
-    /// Publish a completely validated replacement registry and notify only
-    /// keys whose record was added, removed, or modified.
+    /// Publish a completely validated replacement registry and notify keys
+    /// whose *effective* served record changed.
     ///
-    /// Both the swap and the dispatch happen under the write lock, which is
-    /// what makes [`Self::read`] a usable critical section for watch creation.
+    /// Learned endpoints survive configuration changes and continue to override
+    /// `Endpoint` for the same cryptographic identity. They are discarded only
+    /// when that public key disappears from the registry. A `Relay` change does
+    /// not erase the observation: relay remains the routing authority while set,
+    /// and the last authenticated direct endpoint is still the best fallback if
+    /// direct routing is enabled again later.
+    ///
+    /// Both config publication and endpoint-observation dispatch use this same
+    /// write lock, preserving the watch-creation ordering guaranteed by
+    /// [`Self::read`].
     pub fn replace(&self, registry: Registry) {
         let mut current = self
             .current
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let keys: HashSet<_> = current
+        let old_registry = Arc::clone(&current.registry);
+        let old_observed = current.observed_endpoints.clone();
+
+        current
+            .observed_endpoints
+            .retain(|public_key, _| registry.lookup_key(public_key).is_some());
+
+        let keys: HashSet<_> = old_registry
             .by_key
             .keys()
             .chain(registry.by_key.keys())
@@ -201,22 +316,35 @@ impl SharedRegistry {
             .collect();
         let mut changed = Vec::new();
         for public_key in keys {
-            let differs = match (
-                current.lookup_key(&public_key),
-                registry.lookup_key(&public_key),
-            ) {
+            let before = old_registry.lookup_key(&public_key);
+            let after = registry.lookup_key(&public_key);
+            let differs = match (before, after) {
                 (None, Some(_)) | (Some(_), None) => true,
-                (Some(before), Some(after)) => before != after,
+                (Some(before), Some(after)) => {
+                    let before_endpoint =
+                        old_observed.get(&public_key).copied().or(before.endpoint);
+                    let after_endpoint = current
+                        .observed_endpoints
+                        .get(&public_key)
+                        .copied()
+                        .or(after.endpoint);
+                    before.public_key != after.public_key
+                        || before_endpoint != after_endpoint
+                        || before.relay != after.relay
+                        || before.persistent_keepalive != after.persistent_keepalive
+                        || before.addresses != after.addresses
+                }
                 (None, None) => false,
             };
             if differs {
                 changed.push(public_key);
             }
         }
-        if changed.is_empty() {
-            return;
-        }
-        *current = Arc::new(registry);
+
+        // Publish even when learned state masks every externally visible config
+        // change. If the observation is later invalidated, fallback must use the
+        // newest configuration rather than the snapshot from when it was learned.
+        current.registry = Arc::new(registry);
         for public_key in changed {
             let _ = self.changes.send(RegistryChange { public_key });
         }
@@ -228,7 +356,11 @@ impl Registry {
     pub fn build(records: Vec<PeerRecord>) -> Result<Self, String> {
         let mut peers: Vec<PeerRecord> = Vec::with_capacity(records.len());
         let mut by_key: HashMap<[u8; 32], usize> = HashMap::new();
-        let mut routes: Vec<(IpNet, usize)> = Vec::new();
+        // The API server is allocator-backed through `microtun-std`, so the
+        // const capacity is unused and the Patricia pool grows on demand.
+        let mut routes: PrefixTrie<usize, 0> =
+            PrefixTrie::new().expect("allocator-backed prefix trie initializes");
+        let mut route_count = 0;
 
         for record in records {
             let index = peers.len();
@@ -242,25 +374,27 @@ impl Registry {
                 // Overlap is fine and is resolved by longest-prefix match, but
                 // an identical prefix on two peers has no tie-break: the
                 // by-address answer would depend on load order.
-                if let Some(&(_, owner)) = routes.iter().find(|(existing, _)| existing == cidr) {
+                if let Some(&owner) = routes.get(*cidr) {
                     return Err(format!(
                         "peers {} and {} both claim {cidr}",
                         peers[owner].key_prefix(),
                         record.key_prefix()
                     ));
                 }
-                routes.push((*cidr, index));
+                routes
+                    .insert(*cidr, index)
+                    .expect("allocator-backed prefix trie grows on demand");
+                route_count += 1;
             }
             by_key.insert(record.public_key, index);
             peers.push(record);
         }
 
-        routes.sort_by_key(|(cidr, _)| std::cmp::Reverse(cidr.network_length()));
-
         Ok(Self {
             peers,
             by_key,
             routes,
+            route_count,
         })
     }
 
@@ -273,10 +407,7 @@ impl Registry {
     ///
     /// Longest prefix wins, matching the route cache on the client side.
     pub fn lookup_address(&self, address: IpAddr) -> Option<&PeerRecord> {
-        self.routes
-            .iter()
-            .find(|(cidr, _)| cidr.contains(&address))
-            .map(|&(_, index)| &self.peers[index])
+        self.routes.lookup(address).map(|&index| &self.peers[index])
     }
 
     /// Number of configured peers.
@@ -286,7 +417,7 @@ impl Registry {
 
     /// Number of indexed tunnel prefixes.
     pub fn route_count(&self) -> usize {
-        self.routes.len()
+        self.route_count
     }
 }
 
@@ -431,6 +562,87 @@ pub(crate) mod tests {
             changes.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn learned_endpoint_overrides_config_and_survives_endpoint_reload() {
+        let key = [0x05; 32];
+        let configured: SocketAddr = "198.51.100.5:51820".parse().unwrap();
+        let reconfigured: SocketAddr = "198.51.100.50:51820".parse().unwrap();
+        let roamed: SocketAddr = "203.0.113.5:42424".parse().unwrap();
+        let make = |endpoint| {
+            PeerRecord::new(
+                key,
+                Some(endpoint),
+                None,
+                vec!["10.0.0.5/32".parse().unwrap()],
+                None,
+            )
+        };
+        let shared = SharedRegistry::new(Registry::build(vec![make(configured)]).unwrap());
+        let mut changes = shared.subscribe();
+
+        // The first authenticated observation matters even when its value is
+        // identical to configuration: it establishes provenance without
+        // changing the served record, so no watch notification is needed.
+        shared.observe_endpoint(key, configured);
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        // A config-only endpoint change cannot displace authenticated runtime
+        // knowledge, but the new config is still published as the fallback.
+        shared.replace(Registry::build(vec![make(reconfigured)]).unwrap());
+        let effective = shared.read(|published| {
+            let record = published.lookup_key(&key).unwrap();
+            published.effective_endpoint(record)
+        });
+        assert_eq!(effective, Some(configured));
+        assert_eq!(
+            shared.config_snapshot().lookup_key(&key).unwrap().endpoint,
+            Some(reconfigured)
+        );
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        // A genuinely new authenticated source replaces the learned value and
+        // does change the served record, so watched clients are invalidated.
+        shared.observe_endpoint(key, roamed);
+        let effective = shared.read(|published| {
+            let record = published.lookup_key(&key).unwrap();
+            published.effective_endpoint(record)
+        });
+        assert_eq!(effective, Some(roamed));
+        assert_eq!(changes.try_recv().unwrap().public_key, key);
+    }
+
+    #[test]
+    fn removing_peer_discards_learned_endpoint() {
+        let key = [0x06; 32];
+        let learned: SocketAddr = "203.0.113.6:60000".parse().unwrap();
+        let configured: SocketAddr = "198.51.100.6:51820".parse().unwrap();
+        let make = || {
+            PeerRecord::new(
+                key,
+                Some(configured),
+                None,
+                vec!["10.0.0.6/32".parse().unwrap()],
+                None,
+            )
+        };
+        let shared = SharedRegistry::new(Registry::build(vec![make()]).unwrap());
+        shared.observe_endpoint(key, learned);
+
+        shared.replace(Registry::default());
+        shared.replace(Registry::build(vec![make()]).unwrap());
+        let effective = shared.read(|published| {
+            let record = published.lookup_key(&key).unwrap();
+            published.effective_endpoint(record)
+        });
+        assert_eq!(effective, Some(configured));
     }
 
     #[test]

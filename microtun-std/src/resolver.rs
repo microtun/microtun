@@ -642,7 +642,10 @@ mod tests {
     };
 
     use microtun_api::{KeyParams, LookupResult, METHOD_CHANGED, METHOD_UNWATCH, METHOD_WATCH};
-    use microtun_core::{ResolveQuery, decode_key, encode_key};
+    use microtun_core::{
+        ResolveQuery,
+        key::{decode_key, encode_key},
+    };
     use microtun_jsonrpc::{Connection, Handler, Params, Reply, Responder, TokioIo};
     use tokio::{io::DuplexStream, sync::Mutex};
 

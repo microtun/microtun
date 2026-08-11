@@ -43,10 +43,11 @@
 //! Resolver responses arrive as ordinary inner packets, so they flow
 //! *through the tunnel loop* before reaching the resolver task. If the tunnel
 //! loop ever `await`ed on a full channel toward the resolver, it could block
-//! the very path the resolver's response needs — a deadlock. The tunnel loop
-//! therefore only ever `try_send`s resolver commands. A full channel returns
-//! the command to the core, preserving both lookups and watch mutations for a
-//! later iteration without blocking the packet path.
+//! the very path the resolver's response needs — a deadlock. Resolver output
+//! therefore arrives through [`microtun_core::Sink`] callbacks that only
+//! `try_send` into the command channel. A full channel makes the callback reject
+//! the operation, leaving it in the core for a later iteration without blocking
+//! the packet path.
 
 #![no_std]
 #![deny(unsafe_code)]

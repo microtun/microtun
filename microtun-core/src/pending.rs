@@ -60,30 +60,30 @@ impl Drop for PendingPacket {
     }
 }
 
-/// Fixed pool of `N` parked packets.
+/// Fixed pool of `MAX_PACKETS` parked packets.
 #[derive(Debug)]
-pub struct PendingPool<const N: usize> {
+pub struct PendingPool<const MAX_PACKETS: usize> {
     #[cfg(not(feature = "alloc"))]
-    slots: [Option<PendingPacket>; N],
+    slots: [Option<PendingPacket>; MAX_PACKETS],
     #[cfg(feature = "alloc")]
     slots: alloc::vec::Vec<Option<PendingPacket>>,
     #[cfg(feature = "alloc")]
-    _capacity: core::marker::PhantomData<[(); N]>,
+    _capacity: core::marker::PhantomData<[(); MAX_PACKETS]>,
 }
 
-impl<const N: usize> Default for PendingPool<N> {
+impl<const MAX_PACKETS: usize> Default for PendingPool<MAX_PACKETS> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> PendingPool<N> {
+impl<const MAX_PACKETS: usize> PendingPool<MAX_PACKETS> {
     pub fn new() -> Self {
         Self {
             #[cfg(not(feature = "alloc"))]
             slots: core::array::from_fn(|_| None),
             #[cfg(feature = "alloc")]
-            slots: (0..N).map(|_| None).collect(),
+            slots: (0..MAX_PACKETS).map(|_| None).collect(),
             #[cfg(feature = "alloc")]
             _capacity: core::marker::PhantomData,
         }

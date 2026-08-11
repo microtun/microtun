@@ -2,7 +2,9 @@
 //!
 //! The tunnel core starts with no pinned peers. Whenever it needs to identify
 //! an inbound public key or route an outbound tunnel address, this task answers
-//! from the same validated [`Registry`] snapshot used by the Peers API.
+//! from the same published state used by the Peers API: validated
+//! [`crate::registry::Registry`] data plus authenticated runtime endpoint
+//! observations.
 //!
 //! The file is polled by content rather than metadata. Config files are small,
 //! and comparing their text avoids missing an edit whose size and timestamp
@@ -18,13 +20,15 @@ use std::{
 };
 
 use microtun_core::{
-    IpNet, PeerUpdate, ResolveOutcome, ResolveQuery, ResolverCommand, ResolverEvent,
+    IpCidr, PeerUpdate, ResolveOutcome, ResolveQuery, ResolverCommand, ResolverEvent,
 };
 use tokio::sync::mpsc;
 
+#[cfg(test)]
+use crate::registry::Registry;
 use crate::{
     config::{self, Loaded},
-    registry::{Registry, SharedRegistry},
+    registry::SharedRegistry,
 };
 
 /// How quickly a changed file becomes visible to resolver and RPC requests.
@@ -36,7 +40,7 @@ pub struct FixedServer {
     public_key: [u8; 32],
     listen: SocketAddr,
     relay_forwarding: bool,
-    addresses: Vec<IpNet>,
+    addresses: Vec<IpCidr>,
 }
 
 impl FixedServer {
@@ -81,7 +85,7 @@ impl FixedServer {
     }
 }
 
-fn server_addresses(loaded: &Loaded) -> Result<Vec<IpNet>, String> {
+fn server_addresses(loaded: &Loaded) -> Result<Vec<IpCidr>, String> {
     loaded
         .registry
         .lookup_key(&loaded.options.public_key)
@@ -89,7 +93,7 @@ fn server_addresses(loaded: &Loaded) -> Result<Vec<IpNet>, String> {
         .ok_or_else(|| "Peers API server record is missing from its own registry".to_string())
 }
 
-/// Run the config-backed resolver until its request channel is closed.
+/// Run the published-state resolver until its request channel is closed.
 ///
 /// A successful reload replaces the registry used by both this task and the
 /// RPC handlers. Watched peers are refreshed immediately from the resulting
@@ -117,7 +121,7 @@ pub async fn task(
                 match command {
                     ResolverCommand::Resolve(request) => {
                         let query = request.query();
-                        let outcome = resolve(&registry.snapshot(), query, fixed.public_key);
+                        let outcome = resolve_shared(&registry, query, fixed.public_key);
                         // The core-facing resolver contract requires a positive
                         // answer to remain watched. This local resolver tracks
                         // that directly; remote clients use explicit v1.peer.watch.
@@ -186,11 +190,18 @@ async fn send_update(
     public_key: [u8; 32],
     local_public_key: [u8; 32],
 ) -> Result<(), ()> {
-    let outcome = registry
-        .snapshot()
-        .lookup_key(&public_key)
-        .map(|record| ResolveOutcome::Found(resolve_record(record, local_public_key)))
-        .unwrap_or(ResolveOutcome::NotFound);
+    let outcome = registry.read(|published| {
+        published
+            .lookup_key(&public_key)
+            .map(|record| {
+                ResolveOutcome::Found(resolve_record(
+                    record,
+                    published.effective_endpoint(record),
+                    local_public_key,
+                ))
+            })
+            .unwrap_or(ResolveOutcome::NotFound)
+    });
     events
         .send(ResolverEvent::PeerUpdated(PeerUpdate::new(
             public_key, outcome,
@@ -199,6 +210,30 @@ async fn send_update(
         .map_err(|_| ())
 }
 
+fn resolve_shared(
+    registry: &SharedRegistry,
+    query: ResolveQuery,
+    local_public_key: [u8; 32],
+) -> ResolveOutcome {
+    registry.read(|published| {
+        let record = match query {
+            ResolveQuery::ByPublicKey(public_key) => published.lookup_key(&public_key),
+            ResolveQuery::ByDstAddress(address) => published.lookup_address(address),
+        };
+
+        record
+            .map(|record| {
+                ResolveOutcome::Found(resolve_record(
+                    record,
+                    published.effective_endpoint(record),
+                    local_public_key,
+                ))
+            })
+            .unwrap_or(ResolveOutcome::NotFound)
+    })
+}
+
+#[cfg(test)]
 fn resolve(registry: &Registry, query: ResolveQuery, local_public_key: [u8; 32]) -> ResolveOutcome {
     let record = match query {
         ResolveQuery::ByPublicKey(public_key) => registry.lookup_key(&public_key),
@@ -206,7 +241,9 @@ fn resolve(registry: &Registry, query: ResolveQuery, local_public_key: [u8; 32])
     };
 
     record
-        .map(|record| ResolveOutcome::Found(resolve_record(record, local_public_key)))
+        .map(|record| {
+            ResolveOutcome::Found(resolve_record(record, record.endpoint, local_public_key))
+        })
         .unwrap_or(ResolveOutcome::NotFound)
 }
 
@@ -219,9 +256,10 @@ fn resolve(registry: &Registry, query: ResolveQuery, local_public_key: [u8; 32])
 /// forwarding path.
 fn resolve_record(
     record: &crate::registry::PeerRecord,
+    endpoint: Option<std::net::SocketAddr>,
     local_public_key: [u8; 32],
 ) -> microtun_core::ResolvedPeer {
-    let mut peer = record.resolved();
+    let mut peer = record.resolved_with_endpoint(endpoint);
     if peer.relay == Some(local_public_key) {
         peer.relay = None;
     }
@@ -290,13 +328,14 @@ fn reload_if_changed(
 mod tests {
     use std::{
         fs,
+        net::SocketAddr,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use microtun_core::{ResolveOutcome, ResolveQuery};
 
-    use super::{FixedServer, reload_if_changed, resolve};
+    use super::{FixedServer, reload_if_changed, resolve, resolve_shared};
     use crate::{
         config::{
             self, Loaded,
@@ -368,6 +407,33 @@ mod tests {
     }
 
     #[test]
+    fn published_resolver_prefers_learned_endpoint() {
+        let configured: SocketAddr = "198.51.100.10:51820".parse().unwrap();
+        let learned: SocketAddr = "203.0.113.10:42424".parse().unwrap();
+        let first = loaded(&config_text(PEER_A, &configured.to_string(), "10.0.0.2/32"));
+        let shared = SharedRegistry::new(first.registry);
+        shared.observe_endpoint([0xAA; 32], learned);
+
+        let ResolveOutcome::Found(by_key) = resolve_shared(
+            &shared,
+            ResolveQuery::ByPublicKey([0xAA; 32]),
+            server_public(),
+        ) else {
+            panic!("peer should resolve by key");
+        };
+        assert_eq!(by_key.endpoint, Some(learned));
+
+        let ResolveOutcome::Found(by_address) = resolve_shared(
+            &shared,
+            ResolveQuery::ByDstAddress("10.0.0.2".parse().unwrap()),
+            server_public(),
+        ) else {
+            panic!("peer should resolve by address");
+        };
+        assert_eq!(by_address.endpoint, Some(learned));
+    }
+
+    #[test]
     fn server_local_resolver_strips_self_relay() {
         let text = format!(
             "[Server]\nPrivateKey = {SERVER_PRIVATE}\nAddresses = 10.0.0.1/32\n\n\
@@ -411,7 +477,7 @@ mod tests {
         .unwrap();
 
         reload_if_changed(&path, &fixed, &shared, &mut observation);
-        let snapshot = shared.snapshot();
+        let snapshot = shared.config_snapshot();
         assert!(snapshot.lookup_key(&[0xAA; 32]).is_none());
         assert!(snapshot.lookup_key(&[0xBB; 32]).is_some());
         assert_eq!(
@@ -452,7 +518,7 @@ mod tests {
 
         fs::write(&path, "not a config").unwrap();
         reload_if_changed(&path, &fixed, &shared, &mut observation);
-        assert!(shared.snapshot().lookup_key(&[0xAA; 32]).is_some());
+        assert!(shared.config_snapshot().lookup_key(&[0xAA; 32]).is_some());
 
         let changed_server = format!(
             "[Server]\nPrivateKey = {SERVER_PRIVATE}\nAddresses = 10.9.9.9/32\n\n\
@@ -460,7 +526,7 @@ mod tests {
         );
         fs::write(&path, changed_server).unwrap();
         reload_if_changed(&path, &fixed, &shared, &mut observation);
-        let snapshot = shared.snapshot();
+        let snapshot = shared.config_snapshot();
         assert!(snapshot.lookup_key(&[0xAA; 32]).is_some());
         assert!(snapshot.lookup_key(&[0xBB; 32]).is_none());
         assert!(snapshot.lookup_key(&server_public()).is_some());

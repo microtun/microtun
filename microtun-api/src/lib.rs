@@ -116,8 +116,11 @@ use heapless::{String, Vec};
 #[cfg(any(feature = "embedded-client", feature = "tokio-client"))]
 pub use jitter::{Jitter, REFRESH_BURST_WINDOW_MS};
 use microtun_core::{
-    Duration, IpNet, KEY_TEXT_LEN, MAX_PEER_ADDRESSES, PeerAddresses, ResolveOutcome, ResolveQuery,
-    ResolvedPeer, decode_key, encode_key, parse_ip_net, push_peer_address, unmap_socket_addr,
+    Duration, IpCidr, MAX_PEER_ADDRESSES, PeerAddresses, ResolveOutcome, ResolveQuery,
+    ResolvedPeer,
+    ip::{parse_ip_cidr, unmap_socket_addr},
+    key::{KEY_TEXT_LEN, decode_key, encode_key},
+    push_peer_address,
 };
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
@@ -184,8 +187,9 @@ pub const MAX_CIDR_TEXT_LEN: usize = MAX_ADDRESS_TEXT_LEN + 4;
 ///
 /// A worst-case record — a 44-character key, a bracketed IPv6 endpoint, a
 /// relay key, and [`MAX_PEER_ADDRESSES`] IPv6 CIDRs — plus the surrounding
-/// lookup response fits below this bound. This is the client's `RX` and the
-/// server's `TX`, and with the `alloc` feature of
+/// lookup response fits below this bound. This is the client's
+/// `RX_BUFFER_SIZE` and the server's `TX_BUFFER_SIZE`, and with the `alloc`
+/// feature of
 /// `microtun-jsonrpc` left off (it must be) it is also the hard ceiling on a
 /// Peers API response: a longer frame fails the read rather than growing a
 /// buffer a hostile server controls.
@@ -367,13 +371,13 @@ impl PeerInfo {
         public_key: &[u8; 32],
         endpoint: Option<SocketAddr>,
         relay: Option<&[u8; 32]>,
-        addresses: impl IntoIterator<Item = IpNet>,
+        addresses: impl IntoIterator<Item = IpCidr>,
         persistent_keepalive: Option<u16>,
     ) -> Result<Self, Error> {
         let mut encoded_addresses = Vec::new();
         for address in addresses {
             let mut text = String::new();
-            // `{:#}` is load-bearing, not cosmetic. `IpNet`'s plain `Display`
+            // `{:#}` is load-bearing, not cosmetic. `IpCidr`'s plain `Display`
             // abbreviates a host prefix to a bare address, so `10.0.0.3/32`
             // would go on the wire as `10.0.0.3` — and §4.4 of the Peers API
             // spec defines this field as a CIDR string. The alternate form
@@ -504,11 +508,11 @@ fn decode_fields<'a>(
     // `MAX_PEER_ADDRESSES` either way.
     let mut peer_addresses = PeerAddresses::new();
     for value in addresses {
-        // `parse_ip_net`, not `IpNet::from_str`: §4.4 asks a receiver to accept
+        // `parse_ip_cidr`, not `IpCidr::from_str`: §4.4 asks a receiver to accept
         // both abbreviations a sender must not produce — a bare address for a
         // host prefix, and a prefix carrying host bits — and to normalize them
-        // here. `IpNet::from_str` rejects the second outright.
-        let cidr = parse_ip_net(value).map_err(|_| Error::InvalidSyntax)?;
+        // here. `IpCidr::from_str` rejects the second outright.
+        let cidr = parse_ip_cidr(value).map_err(|_| Error::InvalidSyntax)?;
         push_peer_address(&mut peer_addresses, cidr).map_err(|_| Error::InvalidSyntax)?;
     }
 
@@ -654,7 +658,7 @@ mod tests {
         assert_eq!(resolved.persistent_keepalive, Some(Duration::from_secs(25)));
         assert_eq!(
             resolved.inbound_policy,
-            microtun_core::InboundPolicy::AllowAll
+            microtun_core::firewall::InboundPolicy::AllowAll
         );
 
         // Parsing the peer wire type and decoding it agree with the direct
@@ -683,7 +687,7 @@ mod tests {
         assert!(resolved.persistent_keepalive.is_none());
         assert_eq!(
             resolved.inbound_policy,
-            microtun_core::InboundPolicy::AllowAll
+            microtun_core::firewall::InboundPolicy::AllowAll
         );
 
         let zero = format!(
@@ -864,7 +868,7 @@ mod tests {
     }
 
     /// §4.4 defines `Cidr` as a CIDR string, so the prefix length is always
-    /// written — including on host prefixes, where `IpNet`'s plain `Display`
+    /// written — including on host prefixes, where `IpCidr`'s plain `Display`
     /// would abbreviate `10.1.2.3/32` to `10.1.2.3` and quietly change the
     /// wire format.
     #[test]
@@ -896,16 +900,16 @@ mod tests {
         // Host bits cleared.
         assert_eq!(
             resolved.addresses[0],
-            "10.1.2.0/24".parse::<IpNet>().unwrap()
+            "10.1.2.0/24".parse::<IpCidr>().unwrap()
         );
         // Missing length read as a host prefix, per family.
         assert_eq!(
             resolved.addresses[1],
-            "10.0.0.9/32".parse::<IpNet>().unwrap()
+            "10.0.0.9/32".parse::<IpCidr>().unwrap()
         );
         assert_eq!(
             resolved.addresses[2],
-            "fd00::9/128".parse::<IpNet>().unwrap()
+            "fd00::9/128".parse::<IpCidr>().unwrap()
         );
     }
 

@@ -20,58 +20,63 @@
 
 use core::net::IpAddr;
 
-use crate::{Error, IpNet, prefix_trie::PrefixTrie, time::Instant};
+use crate::{Error, IpCidr, prefix_trie::PrefixTrie, time::Instant};
 
 /// Handle into the peer table.
 ///
-/// Wide enough that no plausible `P` can overflow it. The engine indexes its
+/// Wide enough that no plausible `MAX_PEERS` can overflow it. The engine
+/// indexes its
 /// fixed pools with these handles and casts them to `usize`, so a narrow
-/// handle would silently alias two peers onto one entry once `P` exceeded its
-/// range; [`crate::Core::new`] additionally rejects any `P` this type cannot
+/// handle would silently alias two peers onto one entry once `MAX_PEERS`
+/// exceeded its
+/// range; [`crate::Core::new`] additionally rejects any `MAX_PEERS` this
+/// type cannot
 /// address, returning [`Error::InvalidCapacity`] rather than allowing aliasing.
 pub type PeerIdx = u32;
 
 #[derive(Debug, Clone, Copy)]
 struct Entry {
-    cidr: IpNet,
+    cidr: IpCidr,
     peer: PeerIdx,
     pinned: bool,
     last_used: Instant,
     insertion_order: u64,
 }
 
-/// Route cache with `RT` positive slots.
+/// Route cache with `MAX_ROUTES` positive slots.
 ///
 /// Its path-compressed prefix trie is sized from the same route capacity. On
 /// allocation-free builds the trie reserves its two roots plus two nodes per
 /// route, the Patricia-trie worst case; allocator-backed builds grow on demand.
 #[derive(Debug)]
-pub struct RouteCache<const RT: usize> {
+pub struct RouteCache<const MAX_ROUTES: usize> {
     /// Stable slots. Trie values are indices into this array.
     ///
-    /// Under `alloc` this is a heap `Vec` filled with `RT` empty slots up
+    /// Under `alloc` this is a heap `Vec` filled with `MAX_ROUTES` empty
+    /// slots up
     /// front rather than an inline array, so slot indices stay stable and
     /// every access below is unchanged; only the storage moves.
     #[cfg(not(feature = "alloc"))]
-    entries: [Option<Entry>; RT],
+    entries: [Option<Entry>; MAX_ROUTES],
     #[cfg(feature = "alloc")]
     entries: alloc::vec::Vec<Option<Entry>>,
     len: usize,
-    trie: PrefixTrie<usize, RT>,
+    trie: PrefixTrie<usize, MAX_ROUTES>,
     next_insertion_order: u64,
-    /// `RT` is a slot count rather than an array length under `alloc`, but a
+    /// `MAX_ROUTES` is a slot count rather than an array length under
+    /// `alloc`, but a
     /// struct must still use every const parameter it declares.
     #[cfg(feature = "alloc")]
-    _capacity: core::marker::PhantomData<[(); RT]>,
+    _capacity: core::marker::PhantomData<[(); MAX_ROUTES]>,
 }
 
-impl<const RT: usize> RouteCache<RT> {
+impl<const MAX_ROUTES: usize> RouteCache<MAX_ROUTES> {
     pub fn new() -> Result<Self, Error> {
         Ok(Self {
             #[cfg(not(feature = "alloc"))]
-            entries: [None; RT],
+            entries: [None; MAX_ROUTES],
             #[cfg(feature = "alloc")]
-            entries: alloc::vec![None; RT],
+            entries: alloc::vec![None; MAX_ROUTES],
             len: 0,
             trie: PrefixTrie::new().map_err(|_| Error::InvalidCapacity)?,
             next_insertion_order: 0,
@@ -125,12 +130,12 @@ impl<const RT: usize> RouteCache<RT> {
     /// check in the transport receive path.
     pub fn insert(
         &mut self,
-        cidr: IpNet,
+        cidr: IpCidr,
         peer: PeerIdx,
         pinned: bool,
         now: Instant,
     ) -> Result<(), Error> {
-        // Keys are network prefixes, and `IpNet` cannot represent anything
+        // Keys are network prefixes, and `IpCidr` cannot represent anything
         // else — a sloppy input such as `10.1.2.3/8` was already folded to
         // `10.0.0.0/8` at the parse boundary. So there is nothing to
         // canonicalize here, and equal prefixes are guaranteed to share one
@@ -182,7 +187,7 @@ impl<const RT: usize> RouteCache<RT> {
 
     /// Number of unused positive-route slots.
     pub fn available_slots(&self) -> usize {
-        RT.saturating_sub(self.len)
+        MAX_ROUTES.saturating_sub(self.len)
     }
 
     /// Number of positive-route slots currently owned by `peer`.
@@ -207,7 +212,7 @@ impl<const RT: usize> RouteCache<RT> {
 
     /// Drop every route belonging to `peer` (peer eviction cascade).
     pub fn remove_peer(&mut self, peer: PeerIdx) -> Result<(), Error> {
-        for index in 0..RT {
+        for index in 0..MAX_ROUTES {
             let Some(entry) = self.entries[index] else {
                 continue;
             };
@@ -279,10 +284,10 @@ impl<const RT: usize> RouteCache<RT> {
 ///
 /// Two prefixes of the same family are either disjoint or nested, so it is
 /// enough to test whether either one contains the other's network address.
-/// Prefixes of different families never intersect (`IpNet::contains` is
-/// false across families). `first_address` *is* the network address: `IpNet`
+/// Prefixes of different families never intersect (`IpCidr::contains` is
+/// false across families). `first_address` *is* the network address: `IpCidr`
 /// stores prefixes canonically.
-pub(crate) fn ipnets_overlap(a: &IpNet, b: &IpNet) -> bool {
+pub(crate) fn cidrs_overlap(a: &IpCidr, b: &IpCidr) -> bool {
     a.contains(&b.first_address()) || b.contains(&a.first_address())
 }
 
@@ -297,8 +302,8 @@ mod tests {
     /// can never be mistaken for a correct one.
     const T0: Instant = Instant::from_millis(1_000_000);
 
-    fn net4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpNet {
-        // `IpNet` is canonical by construction, so build through `IpInet`
+    fn net4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpCidr {
+        // `IpCidr` is canonical by construction, so build through `IpInet`
         // (which tolerates host bits) and take its network. That keeps the
         // host-bit cases these tests deliberately exercise expressible.
         crate::IpInet::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), len)
@@ -306,7 +311,7 @@ mod tests {
             .network()
     }
 
-    fn net6(addr: Ipv6Addr, len: u8) -> IpNet {
+    fn net6(addr: Ipv6Addr, len: u8) -> IpCidr {
         crate::IpInet::new(IpAddr::V6(addr), len)
             .expect("valid prefix")
             .network()

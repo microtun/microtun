@@ -16,7 +16,11 @@ use embassy_net::{
 };
 use embassy_net_driver_channel::Runner as ChannelRunner;
 use embassy_time::{Instant as EmbassyInstant, Timer};
-use microtun_core::{Config, Core, Instant, Sink, StaticRelayPolicy, unmap_socket_addr};
+use heapless::Deque;
+use microtun_core::{
+    Config, Core, Event, Instant, ResolveRequest, ResolverCommand, Sink, StaticRelayPolicy,
+    ip::unmap_socket_addr,
+};
 use rand_core::{CryptoRng, RngCore};
 
 use crate::resolver::{CommandSender, EventReceiver};
@@ -29,11 +33,11 @@ pub const MTU: usize = 1280;
 pub const OUTER_SIZE: usize = microtun_core::MAX_UDP_SIZE;
 
 /// Embedded peer/session/replay/route capacities.
-pub const PEERS: usize = 8;
-pub const SESSIONS: usize = 8;
+pub const MAX_PEERS: usize = 8;
+pub const MAX_SESSIONS: usize = 8;
 /// Replay bitmap words per established session.
 pub const REPLAY_WORDS: usize = 128;
-pub const ROUTES: usize = 16;
+pub const MAX_ROUTES: usize = 16;
 
 /// Embedded post-cookie handshake rate limit. The core defaults match
 /// wireguard-go; constrained embassy targets retain the project's tighter
@@ -50,21 +54,48 @@ const FIREWALL_FLOW_ENTRIES: usize = 16;
 const FIREWALL_FLOWS_PER_PEER: usize = 8;
 
 /// The concrete core type this runner drives.
-pub type TunnelCore<RNG> = Core<RNG, StaticRelayPolicy, PEERS, SESSIONS, REPLAY_WORDS, ROUTES>;
+pub type TunnelCore<RNG> =
+    Core<RNG, StaticRelayPolicy, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>;
 
 /// Direct async destination for the core's borrowed packet outputs.
-struct TunnelSink<'s, 'd, 'o> {
+struct TunnelSink<'s, 'd, 'o, 'r> {
     device: &'s mut ChannelRunner<'d, MTU>,
     outer: &'s UdpSocket<'o>,
+    resolver_commands: &'s CommandSender<'r>,
+    pending_unwatches: &'s mut Deque<[u8; 32], MAX_PEERS>,
 }
 
-impl<'s, 'd, 'o> TunnelSink<'s, 'd, 'o> {
-    fn new(device: &'s mut ChannelRunner<'d, MTU>, outer: &'s UdpSocket<'o>) -> Self {
-        Self { device, outer }
+impl<'s, 'd, 'o, 'r> TunnelSink<'s, 'd, 'o, 'r> {
+    fn new(
+        device: &'s mut ChannelRunner<'d, MTU>,
+        outer: &'s UdpSocket<'o>,
+        resolver_commands: &'s CommandSender<'r>,
+        pending_unwatches: &'s mut Deque<[u8; 32], MAX_PEERS>,
+    ) -> Self {
+        Self {
+            device,
+            outer,
+            resolver_commands,
+            pending_unwatches,
+        }
+    }
+
+    fn flush_unwatches(&mut self) -> bool {
+        while let Some(public_key) = self.pending_unwatches.front().copied() {
+            if self
+                .resolver_commands
+                .try_send(ResolverCommand::Unwatch(public_key))
+                .is_err()
+            {
+                return false;
+            }
+            self.pending_unwatches.pop_front();
+        }
+        true
     }
 }
 
-impl Sink for TunnelSink<'_, '_, '_> {
+impl Sink for TunnelSink<'_, '_, '_, '_> {
     async fn outer_datagram(&mut self, destination: SocketAddr, datagram: &[u8]) {
         let destination = unmap_socket_addr(destination);
         match self
@@ -115,6 +146,28 @@ impl Sink for TunnelSink<'_, '_, '_> {
         }
         self.device.rx_done(packet.len());
         trace!("delivered inner packet: len={}", packet.len());
+    }
+
+    fn resolve(&mut self, request: ResolveRequest) -> bool {
+        self.flush_unwatches()
+            && self
+                .resolver_commands
+                .try_send(ResolverCommand::Resolve(request))
+                .is_ok()
+    }
+
+    fn event(&mut self, event: Event) {
+        if let Event::PeerEvicted { public_key } = event {
+            if (!self.flush_unwatches()
+                || self
+                    .resolver_commands
+                    .try_send(ResolverCommand::Unwatch(public_key))
+                    .is_err())
+                && self.pending_unwatches.push_back(public_key).is_err()
+            {
+                warn!("pending unwatch queue full; dropping peer eviction");
+            }
+        }
     }
 }
 
@@ -193,6 +246,7 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
             .set_link_state(embassy_net_driver_channel::driver::LinkState::Up);
 
         let mut outer_datagram = [0u8; OUTER_SIZE];
+        let mut pending_unwatches = Deque::<[u8; 32], MAX_PEERS>::new();
         // Split the borrow once: the device is both an awaited event source
         // and a sink destination, so it cannot live inside a long-lived sink.
         let forwarding = self.forwarding;
@@ -223,7 +277,8 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
                 // A protocol deadline came due.
                 Either4::First(()) => {
                     let fired_at = now();
-                    let mut sink = TunnelSink::new(&mut *device, &outer);
+                    let mut sink =
+                        TunnelSink::new(&mut *device, &outer, &resolve_tx, &mut pending_unwatches);
                     trace!("protocol timer fired");
                     if !engine.handle_timeout(fired_at, &mut sink).await {
                         trace!("protocol timer had no due work");
@@ -231,7 +286,8 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
                 }
                 // The resolver task produced a lookup completion or watched-peer update.
                 Either4::Second(response) => {
-                    let mut sink = TunnelSink::new(&mut *device, &outer);
+                    let mut sink =
+                        TunnelSink::new(&mut *device, &outer, &resolve_tx, &mut pending_unwatches);
                     if engine
                         .resolver_event_completed(now(), response, &mut sink)
                         .await
@@ -245,7 +301,12 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
                     if let Ok((n, meta)) = res {
                         trace!("outer UDP datagram received: len={}", n);
                         let source = endpoint_to_socketaddr(meta.endpoint);
-                        let mut sink = TunnelSink::new(&mut *device, &outer);
+                        let mut sink = TunnelSink::new(
+                            &mut *device,
+                            &outer,
+                            &resolve_tx,
+                            &mut pending_unwatches,
+                        );
                         if engine
                             .receive_outer(now(), source, &mut outer_datagram[..n], &mut sink)
                             .await
@@ -261,7 +322,8 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
                     trace!("inner packet queued by stack: len={}", n);
                     outer_datagram[..n].copy_from_slice(&tx[..n]);
                     device.tx_done();
-                    let mut sink = TunnelSink::new(&mut *device, &outer);
+                    let mut sink =
+                        TunnelSink::new(&mut *device, &outer, &resolve_tx, &mut pending_unwatches);
                     if engine
                         .send_inner(now(), &outer_datagram[..n], &mut sink)
                         .await
@@ -272,16 +334,14 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
                 }
             }
 
-            // Never await this channel: resolver TCP packets travel through
-            // this same loop. A command is committed only once the channel has
-            // taken it, so a full channel costs nothing but another pass.
-            while let Some(command) = engine.peek_resolver_command() {
-                if resolve_tx.try_send(command).is_err() {
-                    warn!("resolver command channel full; retrying later");
+            while let Some(public_key) = pending_unwatches.front().copied() {
+                if resolve_tx
+                    .try_send(ResolverCommand::Unwatch(public_key))
+                    .is_err()
+                {
                     break;
                 }
-                engine.resolver_command_sent(&command);
-                debug!("queued resolver command");
+                pending_unwatches.pop_front();
             }
         }
     }

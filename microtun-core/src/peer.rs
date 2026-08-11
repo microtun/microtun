@@ -206,6 +206,24 @@ impl PeerEntry {
         }
     }
 
+    /// Apply an endpoint learned from authenticated inbound traffic.
+    ///
+    /// Returns `true` exactly when this observation is externally meaningful:
+    /// the endpoint became authenticated for the first time, or it changed. A
+    /// configured/resolved endpoint starts unconfirmed, so observing that exact
+    /// same address still returns `true` once. Repeated authenticated traffic
+    /// from an already-confirmed address is coalesced.
+    pub(crate) fn observe_direct_endpoint(&mut self, endpoint: SocketAddr, now: Instant) -> bool {
+        if self.relay.is_some() {
+            return false;
+        }
+
+        let newly_observed = self.endpoint_confirmed.is_none() || self.endpoint != Some(endpoint);
+        self.endpoint = Some(endpoint);
+        self.endpoint_confirmed = Some(now);
+        newly_observed
+    }
+
     pub(crate) const fn is_pinned(&self) -> bool {
         matches!(self.kind, PeerKind::Pinned)
     }

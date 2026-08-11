@@ -18,10 +18,13 @@
 //!
 //! This crate enables `microtun-core/async`, and packet outputs are awaited
 //! directly on the UDP socket and tunnel device without an intermediate output
-//! queue. Resolver commands are transferred to a separate task only after the
-//! runner reserves bounded-channel capacity without waiting. A full queue
-//! leaves the command in the core, so the tunnel loop cannot deadlock the
-//! resolver's response path or lose watch-set mutations.
+//! queue. Resolver requests arrive through [`microtun_core::Sink::resolve`] and
+//! are forwarded to the resolver task with a non-blocking bounded-channel send.
+//! Dynamic peer releases arrive as [`microtun_core::Event::PeerEvicted`] sink
+//! events; the runner translates those observations into `v1.peer.unwatch`
+//! commands, retaining them locally if the resolver channel is temporarily
+//! full. The tunnel loop therefore never awaits resolver-channel capacity on
+//! the packet path.
 //!
 //! Lookups, watch mutations, and pushed peer updates share one continuously
 //! serviced JSON-RPC stream to the Peers API server's inner address. After reconnect
@@ -41,8 +44,8 @@ pub use microtun_api as peers_api;
 pub use microtun_core as core;
 pub use resolver::{PeersApiResolver, PeersApiTransport, resolver_task};
 pub use runner::{
-    Error, MAX_IP_PACKET_SIZE, OUTER_SIZE, PEERS, RESOLVER_QUEUE_DEPTH, ROUTES, SESSIONS,
-    TunnelCore, TunnelDevice, TunnelRunner,
+    Error, MAX_IP_PACKET_SIZE, MAX_PEERS, MAX_ROUTES, MAX_SESSIONS, OUTER_SIZE,
+    RESOLVER_QUEUE_DEPTH, TunnelCore, TunnelDevice, TunnelObserver, TunnelRunner,
 };
 
 #[cfg(test)]

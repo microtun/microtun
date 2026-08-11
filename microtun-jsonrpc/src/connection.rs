@@ -17,17 +17,17 @@ use crate::{
 /// [`Connection::poll`] while another task must push notifications. The caller is
 /// responsible for serializing access when the writer is shared with a
 /// [`Connection`].
-pub struct Notifier<W, const TX: usize = 1024> {
+pub struct Notifier<W, const TX_BUFFER_SIZE: usize = 1024> {
     writer: W,
-    tx: [u8; TX],
+    tx: [u8; TX_BUFFER_SIZE],
 }
 
-impl<W, const TX: usize> Notifier<W, TX> {
+impl<W, const TX_BUFFER_SIZE: usize> Notifier<W, TX_BUFFER_SIZE> {
     /// Create a notification sender around a writer.
     pub fn new(writer: W) -> Self {
         Self {
             writer,
-            tx: [0; TX],
+            tx: [0; TX_BUFFER_SIZE],
         }
     }
 
@@ -38,7 +38,7 @@ impl<W, const TX: usize> Notifier<W, TX> {
 }
 
 #[maybe_async::maybe_async]
-impl<W, const TX: usize> Notifier<W, TX>
+impl<W, const TX_BUFFER_SIZE: usize> Notifier<W, TX_BUFFER_SIZE>
 where
     W: Write,
 {
@@ -64,23 +64,31 @@ where
 ///   `embedded-io-async` with the `async` feature). With `tokio`, use
 ///   [`Connection::from_tokio`] to construct the same connection from raw Tokio halves.
 /// * `H`: your [`Handler`] for incoming requests/notifications.
-/// * `RX`: receive buffer size in bytes — must hold one complete incoming
-///   frame (growable instead when the `alloc` feature is enabled).
-/// * `TX`: transmit buffer size in bytes — must hold one complete outgoing
-///   frame.
+/// * `RX_BUFFER_SIZE`: receive buffer size in bytes — must hold one complete
+///   incoming frame (growable instead when the `alloc` feature is enabled).
+/// * `TX_BUFFER_SIZE`: transmit buffer size in bytes — must hold one complete
+///   outgoing frame.
 ///
 /// Messages are newline-delimited JSON. All methods take `&mut self`; wrap
 /// the connection in your platform's mutex if it is shared between contexts.
-pub struct Connection<R, W, H, const RX: usize = 1024, const TX: usize = 1024> {
+pub struct Connection<
+    R,
+    W,
+    H,
+    const RX_BUFFER_SIZE: usize = 1024,
+    const TX_BUFFER_SIZE: usize = 1024,
+> {
     reader: R,
     writer: W,
     handler: H,
-    rx: FrameBuf<RX>,
-    tx: [u8; TX],
+    rx: FrameBuf<RX_BUFFER_SIZE>,
+    tx: [u8; TX_BUFFER_SIZE],
     next_id: i64,
 }
 
-impl<R, W, H, const RX: usize, const TX: usize> Connection<R, W, H, RX, TX> {
+impl<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>
+    Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>
+{
     /// Create a connection from a transport pair and a handler.
     ///
     /// For client-only use pass [`crate::NoHandler`].
@@ -90,7 +98,7 @@ impl<R, W, H, const RX: usize, const TX: usize> Connection<R, W, H, RX, TX> {
             writer,
             handler,
             rx: FrameBuf::new(),
-            tx: [0; TX],
+            tx: [0; TX_BUFFER_SIZE],
             next_id: 1,
         }
     }
@@ -112,7 +120,8 @@ impl<R, W, H, const RX: usize, const TX: usize> Connection<R, W, H, RX, TX> {
 }
 
 #[maybe_async::maybe_async]
-impl<R, W, H, const RX: usize, const TX: usize> Connection<R, W, H, RX, TX>
+impl<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>
+    Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>
 where
     R: Read,
     W: Write,
@@ -364,9 +373,9 @@ fn envelope_error(error: &Error) -> (i32, &'static str) {
 /// Overflow is reported only when the buffer is genuinely full with no
 /// newline in it, which is the real oversized-frame condition.
 #[maybe_async::maybe_async]
-async fn read_frame<R: Read, const N: usize>(
+async fn read_frame<R: Read, const BUFFER_SIZE: usize>(
     reader: &mut R,
-    buf: &mut FrameBuf<N>,
+    buf: &mut FrameBuf<BUFFER_SIZE>,
 ) -> Result<usize, Error> {
     buf.advance();
     loop {
@@ -376,7 +385,7 @@ async fn read_frame<R: Read, const N: usize>(
         let mut chunk = [0u8; 64];
         let room = buf.remaining_capacity().min(chunk.len());
         if room == 0 {
-            // The buffer holds N bytes and none of them is a newline.
+            // The buffer is full and none of its bytes is a newline.
             return Err(Error::Overflow);
         }
         let n = reader
@@ -439,7 +448,7 @@ async fn dispatch_inbound<W: Write, H: Handler>(
             let reply = handler.handle_request(method, params, responder);
             let len = match reply.res {
                 Ok(len) => len,
-                // The handler's reply did not fit into the TX buffer:
+                // The handler's reply did not fit into the TX_BUFFER_SIZE buffer:
                 // fall back to a (small) internal error response.
                 Err(_) => write_error(tx, Some(&id), codes::INTERNAL_ERROR, "internal error")?,
             };

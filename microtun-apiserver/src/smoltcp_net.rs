@@ -39,7 +39,7 @@ use std::{
 
 use microtun_std::{
     TunnelDevice,
-    core::{IpNet, MAX_INNER_SIZE},
+    core::{IpCidr, MAX_INNER_SIZE},
 };
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
@@ -47,8 +47,8 @@ use smoltcp::{
     socket::tcp::{Socket, SocketBuffer, State as TcpState},
     time::{Duration as SmolDuration, Instant as SmolInstant},
     wire::{
-        HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, IpProtocol, Ipv4Packet, Ipv6Packet,
-        TcpPacket,
+        HardwareAddress, IpAddress, IpCidr as SmolIpCidr, IpListenEndpoint, IpProtocol, Ipv4Packet,
+        Ipv6Packet, TcpPacket,
     },
 };
 use tokio::{
@@ -81,7 +81,7 @@ pub struct SmolTcpNic {
 }
 
 impl SmolTcpNic {
-    pub fn new(local_addresses: impl IntoIterator<Item = IpNet>) -> (Self, SmolTcpStack) {
+    pub fn new(local_addresses: impl IntoIterator<Item = IpCidr>) -> (Self, SmolTcpStack) {
         let (inbound_tx, inbound_rx) = mpsc::channel(STACK_QUEUE_DEPTH);
         let (outbound_tx, outbound_rx) = mpsc::channel(STACK_QUEUE_DEPTH);
         let notify = Arc::new(Notify::new());
@@ -230,7 +230,7 @@ struct Inner {
 
 impl SmolTcpStack {
     fn new(
-        local_addresses: impl IntoIterator<Item = IpNet>,
+        local_addresses: impl IntoIterator<Item = IpCidr>,
         inbound_rx: mpsc::Receiver<Vec<u8>>,
         outbound_tx: mpsc::Sender<Vec<u8>>,
         pending: Arc<Mutex<PendingKeys>>,
@@ -243,16 +243,16 @@ impl SmolTcpStack {
         let mut iface = Interface::new(config, &mut device, smol_instant());
         iface.update_ip_addrs(|addrs| {
             for address in local_addresses {
-                // `IpCidr` here is smoltcp's, not the one `IpNet` aliases.
+                // Convert the core `cidr::IpCidr` into smoltcp's `IpCidr`.
                 // `first_address` is the network address, which for the /32
                 // and /128 host prefixes a Peers API server is configured with
                 // is simply the server's own address.
                 let cidr = match address {
-                    IpNet::V4(net) => {
-                        IpCidr::new(IpAddress::Ipv4(net.first_address()), net.network_length())
+                    IpCidr::V4(net) => {
+                        SmolIpCidr::new(IpAddress::Ipv4(net.first_address()), net.network_length())
                     }
-                    IpNet::V6(net) => {
-                        IpCidr::new(IpAddress::Ipv6(net.first_address()), net.network_length())
+                    IpCidr::V6(net) => {
+                        SmolIpCidr::new(IpAddress::Ipv6(net.first_address()), net.network_length())
                     }
                 };
                 addrs
@@ -706,7 +706,7 @@ mod tests {
     const SERVER_V4_ALT: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 4);
     const RPC_PORT: u16 = 80;
 
-    fn server_addresses() -> [IpNet; 1] {
+    fn server_addresses() -> [IpCidr; 1] {
         ["10.0.0.1/32".parse().unwrap()]
     }
 

@@ -48,25 +48,26 @@ impl Hasher for SessionIndexHasher {
 ///
 /// Inline and allocation-free by default; an ordered map on the heap under
 /// `alloc`, which also lifts the power-of-two constraint `IndexMap` imposes
-/// on `S` (see [`crate::Core::new`]). Either way the table can never hold
-/// more than `S` entries: [`SessionIndexMap::insert`] rejects out-of-range
+/// on `MAX_SESSIONS` (see [`crate::Core::new`]). Either way the table can
+/// never hold more than `MAX_SESSIONS` entries:
+/// [`SessionIndexMap::insert`] rejects out-of-range
 /// slots and each slot owns at most one live receiver index.
 #[cfg(not(feature = "alloc"))]
-type SessionIndexTable<const S: usize> =
-    IndexMap<u32, SlotIdx, BuildHasherDefault<SessionIndexHasher>, S>;
+type SessionIndexTable<const MAX_SESSIONS: usize> =
+    IndexMap<u32, SlotIdx, BuildHasherDefault<SessionIndexHasher>, MAX_SESSIONS>;
 
 /// Fixed-capacity reverse session-index map.
 #[derive(Debug)]
-pub(crate) struct SessionIndexMap<const S: usize> {
+pub(crate) struct SessionIndexMap<const MAX_SESSIONS: usize> {
     #[cfg(not(feature = "alloc"))]
-    by_index: SessionIndexTable<S>,
+    by_index: SessionIndexTable<MAX_SESSIONS>,
     #[cfg(feature = "alloc")]
     by_index: hashbrown::HashMap<u32, SlotIdx>,
     #[cfg(feature = "alloc")]
-    _capacity: core::marker::PhantomData<[(); S]>,
+    _capacity: core::marker::PhantomData<[(); MAX_SESSIONS]>,
 }
 
-impl<const S: usize> SessionIndexMap<S> {
+impl<const MAX_SESSIONS: usize> SessionIndexMap<MAX_SESSIONS> {
     /// Receiver-index collisions are vanishingly unlikely with a healthy
     /// CSPRNG. Keep the random path bounded anyway so a broken implementation
     /// cannot wedge the device forever.
@@ -103,7 +104,7 @@ impl<const S: usize> SessionIndexMap<S> {
 
     /// Assign a previously checked unique receiver index to `slot`.
     pub(crate) fn insert(&mut self, index: u32, slot: SlotIdx) -> Result<(), Error> {
-        if slot as usize >= S {
+        if slot as usize >= MAX_SESSIONS {
             return Err(Error::SessionIndexGenerationFailed);
         }
         #[cfg(feature = "alloc")]
@@ -133,7 +134,7 @@ impl<const S: usize> SessionIndexMap<S> {
     /// The old mapping is restored if insertion unexpectedly fails, keeping
     /// the operation transactional even if an internal invariant is broken.
     pub(crate) fn replace(&mut self, old: u32, new: u32, slot: SlotIdx) -> Result<(), Error> {
-        if slot as usize >= S {
+        if slot as usize >= MAX_SESSIONS {
             return Err(Error::SessionIndexGenerationFailed);
         }
         if self.by_index.get(&old).copied() != Some(slot) {
@@ -183,8 +184,8 @@ mod tests {
     use super::*;
 
     /// Capacity must be a power of two greater than one under the
-    /// allocation-free backend, which `Core::new` enforces for `S`.
-    const S: usize = 4;
+    /// allocation-free backend, which `Core::new` enforces for `MAX_SESSIONS`.
+    const MAX_SESSIONS: usize = 4;
 
     /// An RNG that always returns the same word. Sampling a receiver index is
     /// the one place the engine trusts the embedding's randomness, so the
@@ -211,7 +212,7 @@ mod tests {
 
     #[test]
     fn insertion_refuses_duplicates_and_out_of_range_slots() {
-        let mut map = SessionIndexMap::<S>::new();
+        let mut map = SessionIndexMap::<MAX_SESSIONS>::new();
         map.insert(7, 0).expect("insert");
 
         // Two slots claiming one wire index would make inbound packets
@@ -221,16 +222,16 @@ mod tests {
 
         // A slot handle outside the pool would index out of bounds later.
         assert_eq!(
-            map.insert(8, S as SlotIdx),
+            map.insert(8, MAX_SESSIONS as SlotIdx),
             Err(Error::SessionIndexGenerationFailed)
         );
         assert_eq!(map.slot_for(8), None);
 
-        // The table holds exactly `S` entries, one per slot.
-        for slot in 1..S as SlotIdx {
+        // The table holds exactly `MAX_SESSIONS` entries, one per slot.
+        for slot in 1..MAX_SESSIONS as SlotIdx {
             map.insert(100 + slot, slot).expect("insert");
         }
-        for slot in 0..S as SlotIdx {
+        for slot in 0..MAX_SESSIONS as SlotIdx {
             let index = if slot == 0 { 7 } else { 100 + slot };
             assert_eq!(map.slot_for(index), Some(slot));
         }
@@ -238,7 +239,7 @@ mod tests {
 
     #[test]
     fn replacement_is_transactional() {
-        let mut map = SessionIndexMap::<S>::new();
+        let mut map = SessionIndexMap::<MAX_SESSIONS>::new();
         map.insert(10, 0).expect("insert");
         map.insert(20, 1).expect("insert");
 
@@ -270,14 +271,14 @@ mod tests {
         assert_eq!(map.slot_for(11), Some(0));
 
         assert_eq!(
-            map.replace(11, 12, S as SlotIdx),
+            map.replace(11, 12, MAX_SESSIONS as SlotIdx),
             Err(Error::SessionIndexGenerationFailed)
         );
     }
 
     #[test]
     fn sampling_avoids_live_indices_and_gives_up_rather_than_becoming_predictable() {
-        let mut map = SessionIndexMap::<S>::new();
+        let mut map = SessionIndexMap::<MAX_SESSIONS>::new();
         let mut rng = <rand_chacha::ChaCha20Rng as rand_core::SeedableRng>::from_seed([3; 32]);
 
         // Sampling does not assign, so callers can finish their fallible
@@ -287,7 +288,7 @@ mod tests {
         map.insert(candidate, 0).expect("insert");
 
         // With a healthy CSPRNG, further draws avoid what is already live.
-        for slot in 1..S as SlotIdx {
+        for slot in 1..MAX_SESSIONS as SlotIdx {
             let next = map.random_unused(&mut rng).expect("sampled");
             assert_eq!(map.slot_for(next), None);
             map.insert(next, slot).expect("insert");
@@ -297,7 +298,7 @@ mod tests {
         // such after a bounded number of retries. Falling back to a
         // predictable index instead would hand an attacker the receiver index
         // of every new session.
-        let mut fresh = SessionIndexMap::<S>::new();
+        let mut fresh = SessionIndexMap::<MAX_SESSIONS>::new();
         fresh.insert(42, 0).expect("insert");
         assert_eq!(
             fresh.random_unused(&mut StuckRng(42)),

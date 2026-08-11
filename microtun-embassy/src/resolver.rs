@@ -47,7 +47,7 @@ const TCP_IDLE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_se
 const RECONNECT_DELAY_MS: u32 = 1_000;
 /// The embassy runner currently supports eight peers total, so this covers
 /// every possible dynamic peer and one queued invalidation per peer.
-const WATCH_CAPACITY: usize = 8;
+const MAX_WATCHES: usize = 8;
 const CHANNEL_DEPTH: usize = 16;
 
 /// Commands from the tunnel loop to the resolver task.
@@ -98,9 +98,9 @@ pub struct ResolverConfig {
     pub jitter_seed: u64,
 }
 
-type ChangeHandler = ApiChangeHandler<WATCH_CAPACITY>;
+type ChangeHandler = ApiChangeHandler<MAX_WATCHES>;
 
-type WatchSet = Vec<[u8; 32], WATCH_CAPACITY>;
+type WatchSet = Vec<[u8; 32], MAX_WATCHES>;
 
 /// Run the multiplexed Peers API resolver forever.
 pub async fn resolver_task<'stack, 'channels, 'buffers>(

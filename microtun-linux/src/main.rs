@@ -12,7 +12,10 @@ use std::{io, net::SocketAddr, time::Duration as StdDuration};
 
 use microtun_std::{
     PeersApiResolver, PeersApiTransport, TunnelDevice, TunnelRunner,
-    core::{Config, Duration, InboundPolicy, IpInet, PinnedPeer, encode_key, unmap_socket_addr},
+    core::{
+        Config, Duration, IpInet, PinnedPeer, firewall::InboundPolicy, ip::unmap_socket_addr,
+        key::encode_key,
+    },
 };
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::{TcpSocket, TcpStream, lookup_host};

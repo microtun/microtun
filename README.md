@@ -50,9 +50,9 @@ in a `static`.
 just about this crate's own code. A `#![no_std]` dependency that links `alloc`
 unconditionally still forces a `#[global_allocator]` into every binary that
 uses it, and the failure only appears when someone links firmware for a target
-that has no allocator. CIDR prefixes therefore come from `cidr` rather than the
-more common `ipnet`, which is `#![no_std]` but does exactly that. The bare-metal
-build in `examples/nucleo-h753zi` is what keeps this property honest — see
+that has no allocator. CIDR prefixes use `cidr`, which fits that constraint.
+The bare-metal build in `examples/nucleo-h753zi` is what keeps this property
+honest — see
 "Testing the no-alloc build" below.
 
 ## How a node fits together

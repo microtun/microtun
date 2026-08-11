@@ -1,16 +1,16 @@
 //! Newline-delimited frame accumulation buffer.
 //!
-//! Backed by `heapless::Vec<u8, N>` by default, or a growable
-//! `alloc::vec::Vec<u8>` (with initial capacity `N`) when the `alloc`
+//! Backed by `heapless::Vec<u8, BUFFER_SIZE>` by default, or a growable
+//! `alloc::vec::Vec<u8>` (with initial capacity `BUFFER_SIZE`) when the `alloc`
 //! feature is enabled.
 
 use crate::error::Error;
 
-pub(crate) struct FrameBuf<const N: usize> {
+pub(crate) struct FrameBuf<const BUFFER_SIZE: usize> {
     #[cfg(feature = "alloc")]
     data: alloc::vec::Vec<u8>,
     #[cfg(not(feature = "alloc"))]
-    data: heapless::Vec<u8, N>,
+    data: heapless::Vec<u8, BUFFER_SIZE>,
     /// Index up to which we have already scanned for a newline.
     scan: usize,
     /// Number of leading bytes belonging to the previously yielded frame
@@ -18,11 +18,11 @@ pub(crate) struct FrameBuf<const N: usize> {
     pending: usize,
 }
 
-impl<const N: usize> FrameBuf<N> {
+impl<const BUFFER_SIZE: usize> FrameBuf<BUFFER_SIZE> {
     pub fn new() -> Self {
         FrameBuf {
             #[cfg(feature = "alloc")]
-            data: alloc::vec::Vec::with_capacity(N),
+            data: alloc::vec::Vec::with_capacity(BUFFER_SIZE),
             #[cfg(not(feature = "alloc"))]
             data: heapless::Vec::new(),
             scan: 0,
@@ -81,7 +81,7 @@ impl<const N: usize> FrameBuf<N> {
         }
         #[cfg(not(feature = "alloc"))]
         {
-            N.saturating_sub(self.data.len())
+            BUFFER_SIZE.saturating_sub(self.data.len())
         }
     }
 

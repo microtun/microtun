@@ -8,7 +8,12 @@ use core::net::SocketAddr;
 
 use zeroize::Zeroizing;
 
-use crate::{IpNet, constants::*, firewall::InboundPolicy, time::Duration};
+use crate::{
+    IpCidr,
+    constants::*,
+    firewall::{DEFAULT_FIREWALL_FLOWS, DEFAULT_FIREWALL_FLOWS_PER_PEER, InboundPolicy},
+    time::Duration,
+};
 
 /// A configured, non-evictable bootstrap peer.
 #[derive(Debug, Clone, Copy)]
@@ -28,7 +33,7 @@ pub struct PinnedPeer<'a> {
     pub relay: Option<[u8; 32]>,
     /// Tunnel address prefixes assigned to this peer, pre-seeded into the
     /// route cache without expiry.
-    pub addresses: &'a [IpNet],
+    pub addresses: &'a [IpCidr],
     /// Ingress policy applied to authenticated inner packets from this peer.
     pub inbound_policy: InboundPolicy,
     /// WireGuard-style persistent keepalive interval. When set, the core
@@ -86,7 +91,7 @@ pub struct CoreConfig {
     /// Stateful firewall lifetime for closing TCP flows.
     pub firewall_tcp_closing_timeout: Duration,
     /// Active firewall flow-table limit. Must be no greater than
-    /// [`crate::MAX_FIREWALL_FLOWS`].
+    /// [`crate::firewall::MAX_FIREWALL_FLOWS`].
     pub firewall_flow_entries: usize,
     /// Maximum live firewall flows owned by one peer. A peer at this limit
     /// can only recycle its own entries, preventing cross-peer state eviction.
@@ -133,8 +138,8 @@ impl Default for CoreConfig {
             firewall_icmp_timeout: FIREWALL_ICMP_TIMEOUT,
             firewall_tcp_timeout: FIREWALL_TCP_TIMEOUT,
             firewall_tcp_closing_timeout: FIREWALL_TCP_CLOSING_TIMEOUT,
-            firewall_flow_entries: crate::DEFAULT_FIREWALL_FLOWS,
-            firewall_flows_per_peer: crate::DEFAULT_FIREWALL_FLOWS_PER_PEER,
+            firewall_flow_entries: DEFAULT_FIREWALL_FLOWS,
+            firewall_flows_per_peer: DEFAULT_FIREWALL_FLOWS_PER_PEER,
             under_load_handshakes_per_sec: UNDER_LOAD_HANDSHAKES_PER_SEC,
             under_load_free_slots: UNDER_LOAD_FREE_SLOTS,
             rate_limit_per_sec: RATE_LIMIT_PER_SEC,
@@ -216,8 +221,8 @@ mod tests {
                 firewall_icmp_timeout: FIREWALL_ICMP_TIMEOUT,
                 firewall_tcp_timeout: FIREWALL_TCP_TIMEOUT,
                 firewall_tcp_closing_timeout: FIREWALL_TCP_CLOSING_TIMEOUT,
-                firewall_flow_entries: crate::DEFAULT_FIREWALL_FLOWS,
-                firewall_flows_per_peer: crate::DEFAULT_FIREWALL_FLOWS_PER_PEER,
+                firewall_flow_entries: DEFAULT_FIREWALL_FLOWS,
+                firewall_flows_per_peer: DEFAULT_FIREWALL_FLOWS_PER_PEER,
                 under_load_handshakes_per_sec: UNDER_LOAD_HANDSHAKES_PER_SEC,
                 under_load_free_slots: UNDER_LOAD_FREE_SLOTS,
                 rate_limit_per_sec: RATE_LIMIT_PER_SEC,
@@ -240,7 +245,7 @@ mod tests {
         assert_eq!(config.firewall_flow_entries, 4_096);
         assert_eq!(config.firewall_flows_per_peer, 128);
         assert!(config.rate_limit_entries <= MAX_RATE_LIMIT_ENTRIES);
-        assert!(config.firewall_flow_entries <= crate::MAX_FIREWALL_FLOWS);
+        assert!(config.firewall_flow_entries <= crate::firewall::MAX_FIREWALL_FLOWS);
     }
 
     #[test]

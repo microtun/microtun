@@ -21,11 +21,14 @@
 //! # Peer records reload while the process is running
 //!
 //! The tunnel starts with no pinned peers. Unknown tunnel identities and
-//! destinations are resolved from the same validated configuration snapshot
-//! used by the Peers API. The file is checked for changes once a second; a
-//! successful reload updates future answers without tearing down existing
-//! peers or sessions. Server identity, UDP listen address, tunnel addresses,
-//! and relay-forwarding policy still require a restart.
+//! destinations are resolved from the same published peer state used by the
+//! Peers API: validated configuration plus authenticated direct-endpoint
+//! observations learned by the running tunnel. Learned endpoints override
+//! configured `Endpoint` values for the same key. The file is checked for
+//! changes once a second; a successful reload updates future answers without
+//! tearing down existing peers or sessions. Server identity, UDP listen
+//! address, tunnel addresses, and relay-forwarding policy still require a
+//! restart.
 
 mod config;
 mod registry;
@@ -36,11 +39,12 @@ mod smoltcp_net;
 use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::Parser;
-use microtun_core::{Config as TunnelConfig, encode_key};
-use microtun_std::{RESOLVER_QUEUE_DEPTH, TunnelRunner};
+use microtun_core::{Config as TunnelConfig, key::encode_key};
+use microtun_std::{RESOLVER_QUEUE_DEPTH, TunnelObserver, TunnelRunner, core::Event};
 use tokio::sync::{Notify, mpsc};
 
 use crate::{
+    registry::SharedRegistry,
     rpc::{AppState, Connection, serve_connection},
     smoltcp_net::{SmolTcpListener, SmolTcpNic},
 };
@@ -53,6 +57,28 @@ const ACCEPT_BACKLOG: usize = 64;
 /// clients, and repurposing it costs nothing because nothing but this protocol
 /// has ever been served on it.
 const RPC_PORT: u16 = 80;
+
+#[derive(Debug, Clone)]
+struct LearnedEndpointObserver {
+    registry: SharedRegistry,
+}
+
+impl TunnelObserver for LearnedEndpointObserver {
+    fn event(&self, event: Event) {
+        if let Event::PeerEndpointUpdate {
+            public_key,
+            endpoint,
+        } = event
+        {
+            self.registry.observe_endpoint(public_key, endpoint);
+            tracing::debug!(
+                peer = %encode_key(&public_key),
+                %endpoint,
+                "authenticated peer endpoint observed"
+            );
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -103,6 +129,9 @@ async fn serve(config_path: &std::path::Path, loaded: config::Loaded) -> Result<
         .addresses
         .clone();
 
+    let state = AppState::new(registry);
+    let shared_registry = state.registry();
+
     let (nic, stack) = SmolTcpNic::new(server_addresses.iter().copied());
     let listener = stack
         .listen(RPC_PORT, ACCEPT_BACKLOG)
@@ -114,16 +143,18 @@ async fn serve(config_path: &std::path::Path, loaded: config::Loaded) -> Result<
         options.listen,
     )
     .await
-    .map_err(|error| format!("cannot bind tunnel on {}: {error}", options.listen))?;
+    .map_err(|error| format!("cannot bind tunnel on {}: {error}", options.listen))?
+    .with_observer(LearnedEndpointObserver {
+        registry: shared_registry.clone(),
+    });
     runner.enable_forwarding(options.relay_forwarding);
     if options.relay_forwarding {
         tracing::warn!("relay forwarding enabled");
     }
 
-    let peers = registry.peer_count();
-    let routes = registry.route_count();
-    let state = AppState::new(registry);
-    let shared_registry = state.registry();
+    let config_snapshot = shared_registry.config_snapshot();
+    let peers = config_snapshot.peer_count();
+    let routes = config_snapshot.route_count();
 
     tracing::info!(
         "serving {} as {} on virtual port {} at {} via UDP {}: {peers} peers, {routes} routes",

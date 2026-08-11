@@ -366,14 +366,14 @@ fn incoming_traffic_served_while_waiting_for_response() {
 #[cfg(not(feature = "alloc"))]
 #[test]
 fn oversized_frame_is_overflow() {
-    let mut input = vec![b'{'; 600]; // > RX = 512, no newline in first 512
+    let mut input = vec![b'{'; 600]; // > RX_BUFFER_SIZE = 512, no newline in first 512
     input.push(b'\n');
     let mut p: Connection<&[u8], Sink, NoHandler, 512, 512> =
         Connection::new(&input[..], Sink::default(), NoHandler);
     assert_eq!(p.poll().unwrap_err(), Error::Overflow);
 }
 
-/// With `alloc` the receive buffer grows past `RX` instead of overflowing.
+/// With `alloc` the receive buffer grows past `RX_BUFFER_SIZE` instead of overflowing.
 #[cfg(feature = "alloc")]
 #[test]
 fn oversized_frame_grows_with_alloc() {
@@ -399,7 +399,7 @@ fn oversized_frame_grows_with_alloc() {
 /// not.
 ///
 /// The sizes here are chosen to land exactly in that window — every frame is
-/// comfortably under `RX`, and the third one only exists so the reads stay
+/// comfortably under `RX_BUFFER_SIZE`, and the third one only exists so the reads stay
 /// full-size rather than being cut short by end-of-stream.
 #[cfg(not(feature = "alloc"))]
 #[test]
@@ -440,7 +440,7 @@ fn conforming_frames_pipelined_near_the_buffer_limit_are_accepted() {
 
 #[test]
 fn oversized_reply_becomes_internal_error() {
-    // Handler result does not fit into TX=96: connection must degrade to the
+    // Handler result does not fit into TX_BUFFER_SIZE=96: connection must degrade to the
     // internal error response instead.
     struct Big;
     impl Handler for Big {

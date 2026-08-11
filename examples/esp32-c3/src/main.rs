@@ -33,8 +33,11 @@ use log::{info, warn};
 use microtun_embassy::{
     ResolverBuffers, ResolverChannels, ResolverConfig, TunnelRunner, TunnelState,
     core::{
-        Config as TunnelConfig, Duration, InboundPolicy, Instant, IpNet, PinnedPeer,
-        ResolverCommand, ResolverEvent, decode_key, decode_key_into, encode_key, parse_ip_net,
+        Config as TunnelConfig, Duration, Instant, IpCidr, PinnedPeer, ResolverCommand,
+        ResolverEvent,
+        firewall::InboundPolicy,
+        ip::parse_ip_cidr,
+        key::{decode_key, decode_key_into, encode_key},
     },
     new_tunnel, resolver_task,
 };
@@ -279,8 +282,8 @@ async fn main(spawner: Spawner) -> ! {
     );
     spawner.spawn(inner_net_task(inner_runner).unwrap());
 
-    let api_inner: IpNet =
-        parse_ip_net(config::API_SERVER_TUNNEL_CIDR).expect("valid API server tunnel host CIDR");
+    let api_inner: IpCidr =
+        parse_ip_cidr(config::API_SERVER_TUNNEL_CIDR).expect("valid API server tunnel host CIDR");
     let api_server_public_key =
         decode_key(config::API_SERVER_PUBLIC_KEY).expect("valid API server public key");
     let api_routes = [api_inner];

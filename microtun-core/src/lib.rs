@@ -11,15 +11,16 @@
 //! Unlike a classic WireGuard device, `microtun` does not require all peers to
 //! be configured up front. Unknown peers — both inbound (unknown static key in
 //! a handshake initiation) and outbound (destination address not in the route
-//! cache) — cause the engine to expose a [`ResolveRequest`] through
-//! [`Core::next_resolve_request`]. The embedding answers later with
-//! [`Core::resolve_completed`]. Resolver integrations establish a watch before
-//! returning a positive answer (the Peers API server integration does this with an
-//! explicit `v1.peer.watch` request), then feed unsolicited authoritative snapshots
-//! back through [`Core::resolver_event_completed`]; the core asks only to *stop*
-//! watching, through [`Core::next_unwatch`], whenever a record leaves the peer
-//! table. Consuming that stream is mandatory: there is no
-//! polling fallback. Authoritative misses use a
+//! cache) — cause the engine to emit a [`ResolveRequest`] through [`Sink::resolve`].
+//! The embedding answers later through [`Core::resolver_event_completed`]. Resolver
+//! integrations establish a watch before returning a positive answer (the Peers
+//! API server integration does this with an explicit `v1.peer.watch` request),
+//! then feed unsolicited authoritative snapshots back through
+//! [`Core::resolver_event_completed`]. When the core releases a watched dynamic
+//! peer record it reports [`Event::PeerEvicted`] through [`Sink::event`]; resolver
+//! integrations use that observation to send their corresponding unwatch RPC.
+//! Consuming that event is mandatory for integrations that establish watches:
+//! there is no polling fallback. Authoritative misses use a
 //! short local negative TTL. The Peers API server wire integration — JSON-RPC methods, parameters, and
 //! record decoding — lives in the separate `microtun-api` crate; nothing in
 //! this one knows how an answer arrived.
@@ -43,18 +44,25 @@
 //! outputs go) to one named method per stimulus:
 //!
 //! ```text
-//!   plaintext IP packet out ─► Core::send_inner        ─┐   ┌─► Sink::outer_datagram
-//!   encrypted datagram in   ─► Core::receive_outer     ─┤   ├─► Sink::inner_packet
-//!   resolver event in       ─► Core::resolver_event_completed ─┤   └─► Core::peek_resolver_command
-//!   deadline fired          ─► Core::handle_timeout          ─┘
+//!   plaintext IP packet out ─► Core::send_inner              ─┐   ┌─► Sink::outer_datagram
+//!   encrypted datagram in   ─► Core::receive_outer           ─┤   ├─► Sink::inner_packet
+//!   resolver event in       ─► Core::resolver_event_completed ─┤   ├─► Sink::event
+//!   deadline fired          ─► Core::handle_timeout           ─┘   └─► Sink::resolve
 //!                                      Core::poll_at ─────► next deadline
 //! ```
 //!
-//! All output is delivered through the sink before the event call completes,
-//! borrowing the engine's own buffers — there is no output queue and nothing
-//! to allocate. By default the sink and event methods are synchronous. Enabling
-//! the `async` feature changes those same methods in place to native async trait
-//! methods and async functions; it does not create a parallel API.
+//! Borrowed packet output is delivered through the sink before the stimulus
+//! call completes, with no packet-output queue or allocation. Resolver requests
+//! are also offered through the sink; when the non-blocking resolver callback
+//! returns `false`, the core retains that request and retries it on a later
+//! sink-bearing call. Dynamic peer removals are reported as non-blocking events;
+//! the embedding owns any retry/backpressure policy needed to turn those events
+//! into resolver-side unwatch operations. By default the sink packet methods and
+//! core stimulus methods are synchronous. Enabling the `async` feature changes
+//! the packet sink methods and core stimulus methods in place to native async
+//! trait methods and async functions; [`Sink::resolve`] and [`Sink::event`]
+//! remain synchronous, non-blocking hooks. It does not create a
+//! parallel API.
 //! [`Core::handle_timeout`] processes at most one due
 //! timer action; whenever it processed one, [`Core::poll_at`] stays at or
 //! before the current instant, so an embedding dispatches that call's output
@@ -72,15 +80,15 @@
 //!
 //! ## Const parameters
 //!
-//! * `P` — peer table capacity (pinned + dynamic)
-//! * `S` — session slot pool capacity (shared by in-flight handshakes and live
-//!   sessions)
+//! * `MAX_PEERS` — maximum peers (pinned + dynamic)
+//! * `MAX_SESSIONS` — maximum session slots (shared by in-flight
+//!   handshakes and live sessions)
 //! * `REPLAY_WORDS` — 64-bit replay bitmap words retained per live session
-//! * `RT` — route cache capacity; on no-alloc builds the prefix trie derives
-//!   its fixed storage directly from this value
+//! * `MAX_ROUTES` — maximum cached routes; on no-alloc builds the prefix trie
+//!   derives its fixed storage directly from this value
 //!
-//! A sensible ESP32-C3 starting point is
-//! `P = 8, S = 8, REPLAY_WORDS = 128, RT = 16`.
+//! A sensible ESP32-C3 starting point is `MAX_PEERS = 8`,
+//! `MAX_SESSIONS = 8`, `REPLAY_WORDS = 128`, and `MAX_ROUTES = 16`.
 //!
 //! ## Session indices
 //!
@@ -128,18 +136,18 @@ mod constants;
 mod cookie;
 mod crypto;
 mod error;
-mod firewall;
-mod ip;
+pub mod firewall;
+pub mod ip;
 pub mod key;
 mod messages;
 mod noise;
 mod peer;
 mod pending;
-mod prefix_trie;
+pub mod prefix_trie;
 mod rate;
 pub mod relay;
 mod replay;
-mod resolver;
+pub mod resolver;
 mod routing;
 mod session;
 mod session_index;
@@ -147,27 +155,7 @@ pub mod time;
 
 use core::net::SocketAddr;
 
-/// A canonical IP network prefix: an address with all host bits zero, plus a
-/// prefix length.
-///
-/// This is [`cidr::IpCidr`], re-exported so embedders need not take their own
-/// dependency. Unlike the `ipnet::IpNet` this used to alias, the type
-/// *guarantees* canonicality — `10.1.2.3/8` is not representable, only
-/// `10.0.0.0/8` is. Every prefix the core stores was already canonicalized, so
-/// this turns an invariant the code maintained by hand into one the compiler
-/// maintains. Use [`parse_ip_net`] to accept text that may carry host bits.
-///
-/// The swap away from `ipnet` was forced: that crate is `#![no_std]` but links
-/// `alloc` unconditionally, which makes a `#[global_allocator]` mandatory in
-/// every binary that depends on it — including allocator-free firmware.
-pub use cidr::IpCidr as IpNet;
-/// An IP address *together with* the prefix of the network it sits in, host
-/// bits preserved — the shape an interface address has (`10.0.0.2/24`).
-///
-/// Distinct from [`IpNet`], which is a network and cannot carry host bits. A
-/// host configuring a TUN device wants this; a peer's owned routes want
-/// [`IpNet`]. `ipnet::IpNet` conflated the two.
-pub use cidr::IpInet;
+pub use cidr::{IpCidr, IpInet};
 pub use config::{Config, CoreConfig, PinnedPeer};
 /// Derive the static public key for a private key.
 ///
@@ -179,12 +167,6 @@ pub use crypto::public_key;
 // backends selected, which the crate's own `defmt` / `log` features do.
 use defmt_or_log::{debug, error, info, trace, warn};
 pub use error::Error;
-pub use firewall::InboundPolicy;
-pub use ip::{InvalidIpNet, parse_ip_inet, parse_ip_net, unmap_socket_addr};
-pub use key::{
-    InvalidKey, KEY_TEXT_LEN, KeyBase64, KeyText, decode_key, decode_key_into, encode_key,
-};
-pub use relay::{MAX_RELAY_INNER_IP_SIZE, MAX_RELAY_INNER_SIZE};
 pub use resolver::{
     PeerUpdate, ResolveId, ResolveOutcome, ResolveQuery, ResolveRequest, ResolveResponse,
     ResolvedPeer, ResolverCommand, ResolverEvent,
@@ -196,7 +178,8 @@ use crate::{
     constants::*,
     cookie::CookieSecret,
     crypto::{TIMESTAMP_LEN, aead_open, aead_seal, dh, tai64n},
-    firewall::Firewall,
+    firewall::{Firewall, InboundPolicy, MAX_FIREWALL_FLOWS},
+    ip::unmap_socket_addr,
     messages::{COOKIE_REPLY_LEN, INITIATION_LEN, Message, RESPONSE_LEN},
     noise::InitiatorState,
     peer::{PeerEntry, PeerKind},
@@ -247,23 +230,23 @@ pub const MAX_PEER_ADDRESSES: usize = 4;
 /// A `heapless::Vec` inline in the peer entry by default; a heap `Vec` under
 /// `alloc`. Build one with [`push_peer_address`] to stay backend-agnostic.
 #[cfg(feature = "alloc")]
-pub type PeerAddresses = alloc::vec::Vec<IpNet>;
+pub type PeerAddresses = alloc::vec::Vec<IpCidr>;
 
 /// The tunnel address list carried by a peer record.
 ///
 /// A `heapless::Vec` inline in the peer entry by default; a heap `Vec` under
 /// `alloc`. Build one with [`push_peer_address`] to stay backend-agnostic.
 #[cfg(not(feature = "alloc"))]
-pub type PeerAddresses = heapless::Vec<IpNet, MAX_PEER_ADDRESSES>;
+pub type PeerAddresses = heapless::Vec<IpCidr, MAX_PEER_ADDRESSES>;
 
 /// Append one canonical prefix to a [`PeerAddresses`]. Duplicate prefixes are
 /// ignored. Without `alloc`, the unique set is bounded by
 /// [`MAX_PEER_ADDRESSES`].
-pub fn push_peer_address(addresses: &mut PeerAddresses, cidr: IpNet) -> Result<(), Error> {
-    // No canonicalization step here any more: `IpNet` cannot represent a
+pub fn push_peer_address(addresses: &mut PeerAddresses, cidr: IpCidr) -> Result<(), Error> {
+    // No canonicalization step here any more: `IpCidr` cannot represent a
     // prefix with host bits set, so the value arrived canonical and equal
     // prefixes compare equal. Text that may carry host bits is normalized once,
-    // at the parse boundary, by `parse_ip_net`.
+    // at the parse boundary, by `ip::parse_ip_cidr`.
     if addresses.contains(&cidr) {
         return Ok(());
     }
@@ -278,40 +261,53 @@ pub fn push_peer_address(addresses: &mut PeerAddresses, cidr: IpNet) -> Result<(
     }
 }
 
-/// Compile-time ceiling for TCP/UDP flows remembered by the optional
-/// ingress firewall.
-///
-/// Allocation-free builds retain the embedded 16-entry table. Host builds
-/// keep entries on the heap and permit a substantially larger bounded table.
-#[cfg(feature = "alloc")]
-pub const MAX_FIREWALL_FLOWS: usize = 16_384;
-#[cfg(not(feature = "alloc"))]
-pub const MAX_FIREWALL_FLOWS: usize = 16;
-
-/// Backend-appropriate active firewall table default.
-#[cfg(feature = "alloc")]
-pub const DEFAULT_FIREWALL_FLOWS: usize = 4_096;
-#[cfg(not(feature = "alloc"))]
-pub const DEFAULT_FIREWALL_FLOWS: usize = MAX_FIREWALL_FLOWS;
-
-/// Backend-appropriate maximum number of live tracked flows owned by one peer.
-/// This quota prevents one authenticated peer from evicting every other
-/// protected peer's return-flow state.
-#[cfg(feature = "alloc")]
-pub const DEFAULT_FIREWALL_FLOWS_PER_PEER: usize = 128;
-#[cfg(not(feature = "alloc"))]
-pub const DEFAULT_FIREWALL_FLOWS_PER_PEER: usize = 8;
-
 // ---------------------------------------------------------------------------
 // Embedding interface
 // ---------------------------------------------------------------------------
 
+/// Runtime observations emitted by the protocol engine.
+///
+/// Events describe authenticated protocol state and lifecycle transitions
+/// observed while processing a stimulus. They are observations only: delivering
+/// an event does not mutate resolver or configuration state. The enum is
+/// non-exhaustive so the core can add new observations without growing [`Sink`]
+/// with one callback per event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Event {
+    /// Authenticated direct traffic established or changed a peer's endpoint.
+    ///
+    /// The first authenticated endpoint is reported even when it equals the
+    /// configured value. Repeated traffic from an already-confirmed endpoint is
+    /// coalesced. Relayed peers do not produce this event because their outer
+    /// source belongs to the relay.
+    PeerEndpointUpdate {
+        /// Static public key identifying the peer.
+        public_key: [u8; 32],
+        /// Authenticated outer UDP source for the peer.
+        endpoint: SocketAddr,
+    },
+    /// The core released a resolver-backed dynamic peer record.
+    ///
+    /// Resolver integrations that establish a watch before returning a positive
+    /// answer should translate this event into their unwatch operation. It is
+    /// also emitted when such an answer is rejected before admission, because
+    /// the resolver-side watch must still be released even though no peer-table
+    /// entry survived.
+    PeerEvicted {
+        /// Static public key identifying the released peer record.
+        public_key: [u8; 32],
+    },
+}
+
 /// Where the engine sends its immediate output.
 ///
 /// The slices borrow the engine's internal buffers and are valid only for the
-/// duration of the callback. In the default build callbacks are synchronous and
-/// must not block. With the `async` feature, these same methods are native async
-/// trait methods and the core awaits each callback before reusing its buffers.
+/// duration of the callback. In the default build packet callbacks are
+/// synchronous and must not block. With the `async` feature, the packet methods
+/// are native async trait methods and the core awaits each callback before
+/// reusing its buffers. Resolver and observation callbacks remain synchronous
+/// in both modes so they can be implemented as non-blocking queue operations.
 ///
 /// The two packet methods are named for the layer they carry rather than for
 /// a direction: an *outer datagram* is encrypted WireGuard traffic on the
@@ -336,6 +332,22 @@ pub trait Sink {
         src_endpoint: Option<SocketAddr>,
         packet: &[u8],
     );
+
+    /// Submit one peer-resolution lookup requested by the core.
+    ///
+    /// This callback is synchronous deliberately. Resolver traffic may itself
+    /// traverse the tunnel, so awaiting resolver-channel capacity here can
+    /// deadlock the packet path. Return `true` only after the embedding has
+    /// accepted the request for eventual execution. Returning `false` keeps it
+    /// pending in the core and retries it through a later sink call.
+    fn resolve(&mut self, request: ResolveRequest) -> bool;
+
+    /// Observe protocol state or lifecycle changes produced by a stimulus.
+    ///
+    /// Event delivery is synchronous deliberately: observing protocol state must
+    /// not add backpressure to packet processing. Embeddings that need async
+    /// delivery should record the latest value or enqueue it without waiting.
+    fn event(&mut self, _event: Event) {}
 }
 
 /// Decides which relay envelopes this device is willing to forward.
@@ -435,20 +447,27 @@ struct EvictedPeerGhost {
 ///
 /// `REPLAY_WORDS` is the number of 64-bit bitmap words retained per established
 /// session; one word is reserved for recycling, so 128 words accepts packets up
-/// to 8,128 counters behind the high-water mark. `RT` sizes both the route slots
-/// and, on allocation-free builds, the prefix-trie storage needed to index them.
-pub type Core<RNG, RP, const P: usize, const S: usize, const REPLAY_WORDS: usize, const RT: usize> =
-    CoreInner<RNG, RP, P, S, REPLAY_WORDS, RT>;
+/// to 8,128 counters behind the high-water mark. `MAX_ROUTES` sizes both
+/// the route slots and, on allocation-free builds, the prefix-trie storage
+/// needed to index them.
+pub type Core<
+    RNG,
+    RP,
+    const MAX_PEERS: usize,
+    const MAX_SESSIONS: usize,
+    const REPLAY_WORDS: usize,
+    const MAX_ROUTES: usize,
+> = CoreInner<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>;
 
 /// Internal implementation behind [`Core`].
 #[doc(hidden)]
 pub struct CoreInner<
     RNG,
     RP,
-    const P: usize,
-    const S: usize,
+    const MAX_PEERS: usize,
+    const MAX_SESSIONS: usize,
     const REPLAY_WORDS: usize,
-    const RT: usize,
+    const MAX_ROUTES: usize,
 > where
     RP: RelayPolicy,
 {
@@ -463,26 +482,27 @@ pub struct CoreInner<
     our_cookie_key: [u8; 32],
 
     /// Peer table and slot pool. Under `alloc` these are heap `Vec`s
-    /// pre-filled with `P` / `S` empty entries rather than inline arrays, so
-    /// stable [`PeerIdx`] / [`SlotIdx`] handles and `0..P` loops are unchanged.
+    /// pre-filled with `MAX_PEERS` / `MAX_SESSIONS` empty entries rather
+    /// than inline arrays, so stable [`PeerIdx`] / [`SlotIdx`] handles and
+    /// `0..MAX_PEERS` loops are unchanged.
     /// Public keys are indexed back to stable peer slots, avoiding a full
     /// table scan on every identity lookup. Embedded builds use an inline,
     /// fixed-capacity `heapless::IndexMap`; host builds use `hashbrown`.
     #[cfg(not(feature = "alloc"))]
-    peers: [Option<PeerEntry>; P],
+    peers: [Option<PeerEntry>; MAX_PEERS],
     #[cfg(feature = "alloc")]
     peers: alloc::vec::Vec<Option<PeerEntry>>,
     #[cfg(not(feature = "alloc"))]
-    peers_by_public_key: heapless::index_map::FnvIndexMap<[u8; 32], PeerIdx, P>,
+    peers_by_public_key: heapless::index_map::FnvIndexMap<[u8; 32], PeerIdx, MAX_PEERS>,
     #[cfg(feature = "alloc")]
     peers_by_public_key: hashbrown::HashMap<[u8; 32], PeerIdx>,
     #[cfg(not(feature = "alloc"))]
-    slots: [Slot<REPLAY_WORDS>; S],
+    slots: [Slot<REPLAY_WORDS>; MAX_SESSIONS],
     #[cfg(feature = "alloc")]
     slots: alloc::vec::Vec<Slot<REPLAY_WORDS>>,
-    session_indices: SessionIndexMap<S>,
+    session_indices: SessionIndexMap<MAX_SESSIONS>,
 
-    routes: RouteCache<RT>,
+    routes: RouteCache<MAX_ROUTES>,
     /// Cached lower bound on the next timer deadline, so that `poll_at` — which
     /// embeddings call after every single packet — does not have to walk the
     /// peer table, the slot pool, the parked packets and the resolver table.
@@ -492,11 +512,11 @@ pub struct CoreInner<
     resolves: heapless::Vec<InflightResolve, MAX_INFLIGHT_RESOLVES>,
     #[cfg(feature = "alloc")]
     resolves: alloc::vec::Vec<InflightResolve>,
-    /// Watch removals that outlive the peer-table entry they refer to.
+    /// Released resolver-backed records waiting to be reported as events.
     #[cfg(not(feature = "alloc"))]
-    pending_unwatches: heapless::Vec<[u8; 32], P>,
+    pending_peer_evictions: heapless::Vec<[u8; 32], MAX_PEERS>,
     #[cfg(feature = "alloc")]
-    pending_unwatches: alloc::vec::Vec<[u8; 32]>,
+    pending_peer_evictions: alloc::vec::Vec<[u8; 32]>,
     /// Records whose reconciliation is owed but not yet in flight.
     ///
     /// A watched update that cannot be installed — because it did not fit,
@@ -507,7 +527,7 @@ pub struct CoreInner<
     /// something unrelated happened to disturb it. Each entry becomes a fresh
     /// `by-key` resolve once its `due` time passes.
     #[cfg(not(feature = "alloc"))]
-    pending_reconciles: heapless::Vec<PendingReconcile, P>,
+    pending_reconciles: heapless::Vec<PendingReconcile, MAX_PEERS>,
     #[cfg(feature = "alloc")]
     pending_reconciles: alloc::vec::Vec<PendingReconcile>,
     next_resolve_id: u64,
@@ -530,7 +550,7 @@ pub struct CoreInner<
     /// Recently capacity-evicted identities, used to reject immediate
     /// re-admission and break cache-thrashing cycles.
     evicted_peer_ghosts: [Option<EvictedPeerGhost>; MAX_PEER_EVICTION_GHOSTS],
-    firewall: Firewall<MAX_FIREWALL_FLOWS, P>,
+    firewall: Firewall<MAX_FIREWALL_FLOWS, MAX_PEERS>,
 
     wall: Option<WallClock>,
     last_ts: [u8; TIMESTAMP_LEN],
@@ -563,11 +583,17 @@ pub struct CoreInner<
     #[cfg(feature = "alloc")]
     relay_scratch: Zeroizing<alloc::vec::Vec<u8>>,
     #[cfg(feature = "alloc")]
-    _capacity: core::marker::PhantomData<[(); P]>,
+    _capacity: core::marker::PhantomData<[(); MAX_PEERS]>,
 }
 
-impl<RNG, RP, const P: usize, const S: usize, const REPLAY_WORDS: usize, const RT: usize>
-    core::fmt::Debug for CoreInner<RNG, RP, P, S, REPLAY_WORDS, RT>
+impl<
+    RNG,
+    RP,
+    const MAX_PEERS: usize,
+    const MAX_SESSIONS: usize,
+    const REPLAY_WORDS: usize,
+    const MAX_ROUTES: usize,
+> core::fmt::Debug for CoreInner<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>
 where
     RP: RelayPolicy,
 {
@@ -590,24 +616,28 @@ where
 impl<
     RNG: rand_core::RngCore + rand_core::CryptoRng,
     RP: RelayPolicy,
-    const P: usize,
-    const S: usize,
+    const MAX_PEERS: usize,
+    const MAX_SESSIONS: usize,
     const REPLAY_WORDS: usize,
-    const RT: usize,
-> CoreInner<RNG, RP, P, S, REPLAY_WORDS, RT>
+    const MAX_ROUTES: usize,
+> CoreInner<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>
 {
     /// Validate fixed-capacity pool parameters before constructing any table.
     fn validate_pool_parameters() -> Result<(), Error> {
-        if P == 0
-            || S == 0
+        if MAX_PEERS == 0
+            || MAX_SESSIONS == 0
             || REPLAY_WORDS == 0
-            || P > PeerIdx::MAX as usize
-            || S > SlotIdx::MAX as usize
+            || MAX_PEERS > PeerIdx::MAX as usize
+            || MAX_SESSIONS > SlotIdx::MAX as usize
         {
             return Err(Error::InvalidCapacity);
         }
         #[cfg(not(feature = "alloc"))]
-        if P <= 1 || !P.is_power_of_two() || S <= 1 || !S.is_power_of_two() {
+        if MAX_PEERS <= 1
+            || !MAX_PEERS.is_power_of_two()
+            || MAX_SESSIONS <= 1
+            || !MAX_SESSIONS.is_power_of_two()
+        {
             return Err(Error::InvalidCapacity);
         }
         Ok(())
@@ -635,7 +665,7 @@ impl<
             || core_config.firewall_flows_per_peer > core_config.firewall_flow_entries
             || core_config.max_inflight_resolves > MAX_INFLIGHT_RESOLVES
             || core_config.peer_eviction_ghost_entries > MAX_PEER_EVICTION_GHOSTS
-            || core_config.lazy_peer_reserve > P
+            || core_config.lazy_peer_reserve > MAX_PEERS
         {
             return Err(Error::InvalidCapacity);
         }
@@ -648,9 +678,9 @@ impl<
         }
         info!(
             "core init: peers={} sessions={} routes={} pinned={}",
-            P,
-            S,
-            RT,
+            MAX_PEERS,
+            MAX_SESSIONS,
+            MAX_ROUTES,
             pinned.len()
         );
         if s_priv.iter().all(|byte| *byte == 0) {
@@ -658,7 +688,7 @@ impl<
             return Err(Error::InvalidPrivateKey);
         }
         let s_pub = crate::crypto::public_key(&s_priv);
-        if pinned.len() > P {
+        if pinned.len() > MAX_PEERS {
             error!("core init failed: pinned peer table overflow");
             return Err(Error::PeerTableFull);
         }
@@ -717,7 +747,7 @@ impl<
                     if previous
                         .addresses
                         .iter()
-                        .any(|other| crate::routing::ipnets_overlap(other, cidr))
+                        .any(|other| crate::routing::cidrs_overlap(other, cidr))
                     {
                         error!(
                             "core init failed: pinned peer {} overlaps another pinned CIDR",
@@ -740,17 +770,17 @@ impl<
             s_priv,
             s_pub,
             #[cfg(not(feature = "alloc"))]
-            peers: [const { None }; P],
+            peers: [const { None }; MAX_PEERS],
             #[cfg(feature = "alloc")]
-            peers: (0..P).map(|_| None).collect(),
+            peers: (0..MAX_PEERS).map(|_| None).collect(),
             #[cfg(not(feature = "alloc"))]
             peers_by_public_key: heapless::index_map::FnvIndexMap::new(),
             #[cfg(feature = "alloc")]
-            peers_by_public_key: hashbrown::HashMap::with_capacity(P),
+            peers_by_public_key: hashbrown::HashMap::with_capacity(MAX_PEERS),
             #[cfg(not(feature = "alloc"))]
             slots: core::array::from_fn(|_| Slot::Free),
             #[cfg(feature = "alloc")]
-            slots: (0..S).map(|_| Slot::Free).collect(),
+            slots: (0..MAX_SESSIONS).map(|_| Slot::Free).collect(),
             session_indices: SessionIndexMap::new(),
             routes: RouteCache::new()?,
             timers: TimerCache::new(),
@@ -760,9 +790,9 @@ impl<
             #[cfg(feature = "alloc")]
             resolves: alloc::vec::Vec::new(),
             #[cfg(not(feature = "alloc"))]
-            pending_unwatches: heapless::Vec::new(),
+            pending_peer_evictions: heapless::Vec::new(),
             #[cfg(feature = "alloc")]
-            pending_unwatches: alloc::vec::Vec::new(),
+            pending_peer_evictions: alloc::vec::Vec::new(),
             #[cfg(not(feature = "alloc"))]
             pending_reconciles: heapless::Vec::new(),
             #[cfg(feature = "alloc")]
@@ -887,7 +917,9 @@ impl<
             "inner packet received from local stack: len={}",
             packet.len()
         );
-        self.outbound(now, packet, sink).await
+        let result = self.outbound(now, packet, sink).await;
+        self.flush_sink_output(sink);
+        result
     }
 
     /// Feed one encrypted UDP datagram from the outer network to the engine.
@@ -902,52 +934,23 @@ impl<
         sink: &mut E,
     ) -> Result<(), Error> {
         let source = unmap_socket_addr(source);
-        if datagram.len() > MAX_UDP_SIZE {
+        let result = if datagram.len() > MAX_UDP_SIZE {
             debug!(
                 "dropping oversized outer datagram: len={} max={}",
                 datagram.len(),
                 MAX_UDP_SIZE
             );
-            return Err(Error::PacketTooLarge);
-        }
-
-        trace!(
-            "outer datagram received: len={} port={}",
-            datagram.len(),
-            source.port()
-        );
-        self.datagram(now, source, datagram, sink).await
-    }
-
-    /// Return the current direct endpoint for `public_key`.
-    ///
-    /// The endpoint may come from pinned configuration, the resolver, or
-    /// authenticated inbound traffic. Relayed peers have no direct endpoint to
-    /// expose because their observed UDP source belongs to the relay.
-    pub fn peer_endpoint(&self, public_key: &[u8; 32]) -> Option<SocketAddr> {
-        let pidx = self.find_peer(public_key)?;
-        let peer = self.peers.get(pidx as usize)?.as_ref()?;
-        if peer.relay.is_none() {
-            peer.endpoint
+            Err(Error::PacketTooLarge)
         } else {
-            None
-        }
-    }
-
-    /// Iterate over all current direct peer endpoints.
-    ///
-    /// The iterator borrows the core and performs no allocation. Endpoints may
-    /// come from pinned configuration, the resolver, or authenticated inbound
-    /// traffic. Relayed peers are omitted because they have no direct endpoint.
-    pub fn peer_endpoints(&self) -> impl Iterator<Item = ([u8; 32], SocketAddr)> + '_ {
-        self.peers.iter().filter_map(|entry| {
-            let peer = entry.as_ref()?;
-            if peer.relay.is_none() {
-                peer.endpoint.map(|endpoint| (peer.public_key, endpoint))
-            } else {
-                None
-            }
-        })
+            trace!(
+                "outer datagram received: len={} port={}",
+                datagram.len(),
+                source.port()
+            );
+            self.datagram(now, source, datagram, sink).await
+        };
+        self.flush_sink_output(sink);
+        result
     }
 
     /// Process at most one protocol timer action due at `now`.
@@ -965,7 +968,7 @@ impl<
     /// call was spurious and no deadline was due.
     pub async fn handle_timeout<E: Sink>(&mut self, now: Instant, sink: &mut E) -> bool {
         trace!("processing one protocol timer action");
-        if self.timeout(now, sink).await {
+        let handled = if self.timeout(now, sink).await {
             // More work may still be due at `now`. Hold the bound at or before
             // `now` so the embedding comes straight back after delivering this
             // call's sink output. Doing it here rather than relying on the
@@ -983,7 +986,9 @@ impl<
             }
             self.timers.set_exact(exact);
             false
-        }
+        };
+        self.flush_sink_output(sink);
+        handled
     }
 
     /// Access the relay policy owned by this core.
@@ -1690,7 +1695,7 @@ impl<
         // A live session carries its own expiry deadline (§6.4).
         self.timers.arm(now + REJECT_AFTER_TIME);
 
-        {
+        let endpoint_observed = {
             let peer = self
                 .peers
                 .get_mut(pidx as usize)
@@ -1704,11 +1709,17 @@ impl<
             // Relay spec §9: for a relayed peer, the observed UDP source is
             // the relay, not the peer — the configured relay relation stays
             // the routing authority and the source is not adopted.
-            if peer.relay.is_none() {
-                peer.endpoint = Some(src);
-                peer.endpoint_confirmed = Some(now);
-            }
+            let observed = peer
+                .observe_direct_endpoint(src, now)
+                .then_some(peer.public_key);
             peer.last_activity = now;
+            observed
+        };
+        if let Some(public_key) = endpoint_observed {
+            sink.event(Event::PeerEndpointUpdate {
+                public_key,
+                endpoint: src,
+            });
         }
         let _ = self.transmit_wire(pidx, Some(src), &msg, now, sink).await;
         Ok(())
@@ -1755,7 +1766,7 @@ impl<
 
         // Rotate: current → previous (freeing any old previous), new → current.
         // The transition validates its precondition before mutating peer state.
-        let old_previous = {
+        let (old_previous, endpoint_observed) = {
             let Some(peer) = self.peers.get_mut(pidx as usize).and_then(Option::as_mut) else {
                 if let Err(error) = self.free_slot(sidx) {
                     error!("failed to free orphaned handshake slot: {:?}", error);
@@ -1769,13 +1780,19 @@ impl<
                     return;
                 }
             };
-            if peer.relay.is_none() {
-                peer.endpoint = Some(src);
-                peer.endpoint_confirmed = Some(now);
-            }
+            let endpoint_observed = peer
+                .observe_direct_endpoint(src, now)
+                .then_some(peer.public_key);
             peer.last_activity = now;
-            old_prev
+            (old_prev, endpoint_observed)
         };
+        if let Some(public_key) = endpoint_observed {
+            sink.event(Event::PeerEndpointUpdate {
+                public_key,
+                endpoint: src,
+            });
+        }
+
         let Some(slot) = self.slots.get_mut(sidx as usize) else {
             error!("resolved session index points outside the slot pool");
             return;
@@ -1936,10 +1953,9 @@ impl<
         // the peer's new endpoint — unless the peer is routed via a
         // configured relay, which stays the outbound authority (relay spec
         // §9).
-        if peer.relay.is_none() {
-            peer.endpoint = Some(src);
-            peer.endpoint_confirmed = Some(now);
-        }
+        let endpoint_observed = peer
+            .observe_direct_endpoint(src, now)
+            .then_some(peer.public_key);
         peer.last_activity = now;
         peer.sessions.reply_due = None;
         let persistent_deadline = peer.persistent_keepalive.map(|interval| now + interval);
@@ -1956,6 +1972,12 @@ impl<
         }
         if let Some(deadline) = persistent_deadline {
             self.timers.arm(deadline);
+        }
+        if let Some(public_key) = endpoint_observed {
+            sink.event(Event::PeerEndpointUpdate {
+                public_key,
+                endpoint: src,
+            });
         }
 
         if let Some(old) = freed {
@@ -2117,7 +2139,8 @@ impl<
 
     /// Walk all timer state for the true earliest deadline.
     ///
-    /// `O(P + S)`. This is the work `poll_at` used to do on every call; it now
+    /// `O(MAX_PEERS + MAX_SESSIONS)`. This is the work `poll_at` used to
+    /// do on every call; it now
     /// runs only when a wake turns out to be spurious, so its cost is tied to
     /// the protocol's timer rate rather than to the packet rate.
     fn scan_deadlines(&self) -> Option<Instant> {
@@ -2177,7 +2200,7 @@ impl<
         }
 
         // 4. One slot timer: handshake retransmission or session expiry.
-        for sidx in 0..S as SlotIdx {
+        for sidx in 0..MAX_SESSIONS as SlotIdx {
             let Some(slot) = self.slots.get(sidx as usize) else {
                 error!("timer iteration exceeded the slot pool");
                 return false;
@@ -2217,7 +2240,7 @@ impl<
         }
 
         // 5. One peer timer: passive/persistent keepalive or missing-reply re-handshake.
-        for pidx in 0..P as PeerIdx {
+        for pidx in 0..MAX_PEERS as PeerIdx {
             let (keepalive_due, persistent_keepalive_due, reply_due) =
                 match self.peers.get(pidx as usize).and_then(Option::as_ref) {
                     Some(peer) => (
@@ -2939,8 +2962,8 @@ mod tests {
         (*private, public)
     }
 
-    fn net4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpNet {
-        // `IpNet` is canonical by construction, so build through `IpInet`
+    fn net4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpCidr {
+        // `IpCidr` is canonical by construction, so build through `IpInet`
         // (which tolerates host bits) and take its network. That keeps the
         // host-bit cases these tests deliberately exercise expressible.
         crate::IpInet::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), len)
@@ -2948,7 +2971,7 @@ mod tests {
             .network()
     }
 
-    fn net6(addr: Ipv6Addr, len: u8) -> IpNet {
+    fn net6(addr: Ipv6Addr, len: u8) -> IpCidr {
         crate::IpInet::new(IpAddr::V6(addr), len)
             .expect("valid prefix")
             .network()
@@ -3045,6 +3068,15 @@ mod tests {
 
     type TestCore = Core<ChaCha20Rng, StaticRelayPolicy, PEERS, SESSIONS, REPLAY_WORDS, ROUTES>;
 
+    /// Inspect stored resolver/configuration metadata in tests that exercise
+    /// atomic peer-record updates. Runtime embeddings observe learned endpoints
+    /// exclusively through `Sink::event`.
+    fn stored_direct_endpoint(core: &TestCore, public_key: &[u8; 32]) -> Option<SocketAddr> {
+        let pidx = core.find_peer(public_key)?;
+        let peer = core.peers.get(pidx as usize)?.as_ref()?;
+        peer.relay.is_none().then_some(peer.endpoint).flatten()
+    }
+
     /// Collects everything the engine hands to its embedding. The slices the core
     /// passes borrow its internal buffers and are valid only for the duration of
     /// the call, so both methods copy.
@@ -3053,6 +3085,8 @@ mod tests {
         outer: VecDeque<(SocketAddr, Vec<u8>)>,
         inner: Vec<([u8; 32], Vec<u8>)>,
         inner_endpoints: Vec<Option<SocketAddr>>,
+        resolves: VecDeque<ResolveRequest>,
+        events: Vec<Event>,
     }
 
     impl Capture {
@@ -3060,6 +3094,7 @@ mod tests {
             self.outer.clear();
             self.inner.clear();
             self.inner_endpoints.clear();
+            self.events.clear();
         }
 
         /// Message-type byte of every queued outer datagram, in order.
@@ -3091,6 +3126,15 @@ mod tests {
                 datagram.len()
             );
             self.outer.push_back((destination, datagram.to_vec()));
+        }
+
+        fn resolve(&mut self, request: ResolveRequest) -> bool {
+            self.resolves.push_back(request);
+            true
+        }
+
+        fn event(&mut self, event: Event) {
+            self.events.push(event);
         }
 
         async fn inner_packet(
@@ -3145,7 +3189,7 @@ mod tests {
             response: ResolveResponse,
         ) -> Result<(), Error> {
             self.core
-                .resolve_completed(now, response, &mut self.sink)
+                .resolver_event_completed(now, ResolverEvent::Resolved(response), &mut self.sink)
                 .await
         }
 
@@ -3160,11 +3204,24 @@ mod tests {
         }
 
         fn next_resolve_request(&mut self) -> Option<ResolveRequest> {
-            self.core.next_resolve_request()
+            // Some tests exercise the internal request_* helpers directly rather
+            // than entering through a public Core method. Public entry points
+            // flush queued control-plane output before returning; mirror that
+            // boundary here so direct queueing is observable through Capture too.
+            self.core.flush_sink_output(&mut self.sink);
+            self.sink.resolves.pop_front()
         }
 
-        fn next_unwatch(&mut self) -> Option<[u8; 32]> {
-            self.core.next_unwatch()
+        fn next_peer_evicted(&mut self) -> Option<[u8; 32]> {
+            let index = self
+                .sink
+                .events
+                .iter()
+                .position(|event| matches!(event, Event::PeerEvicted { .. }))?;
+            match self.sink.events.remove(index) {
+                Event::PeerEvicted { public_key } => Some(public_key),
+                _ => unreachable!("matched peer eviction event"),
+            }
         }
 
         /// Run due timer work to completion, checking the documented contract:
@@ -3309,7 +3366,7 @@ mod tests {
         public_key: [u8; 32],
         endpoint: Option<SocketAddr>,
         relay: Option<[u8; 32]>,
-        addresses: &'a [IpNet],
+        addresses: &'a [IpCidr],
         inbound_policy: InboundPolicy,
     ) -> PinnedPeer<'a> {
         PinnedPeer {
@@ -3326,7 +3383,7 @@ mod tests {
         public_key: [u8; 32],
         endpoint: Option<SocketAddr>,
         relay: Option<[u8; 32]>,
-        addresses: &'a [IpNet],
+        addresses: &'a [IpCidr],
         inbound_policy: InboundPolicy,
         interval: Duration,
     ) -> PinnedPeer<'a> {
@@ -3335,7 +3392,7 @@ mod tests {
         peer
     }
 
-    fn addresses(nets: &[IpNet]) -> PeerAddresses {
+    fn addresses(nets: &[IpCidr]) -> PeerAddresses {
         let mut out = PeerAddresses::new();
         for net in nets {
             push_peer_address(&mut out, *net).expect("address fits");
@@ -3347,7 +3404,7 @@ mod tests {
         public_key: [u8; 32],
         endpoint: Option<SocketAddr>,
         relay: Option<[u8; 32]>,
-        nets: &[IpNet],
+        nets: &[IpCidr],
     ) -> ResolvedPeer {
         ResolvedPeer {
             public_key,
@@ -3449,8 +3506,15 @@ mod tests {
         let (_, response) = net.nodes[1].sink.expect_one_outer();
         assert_eq!(response[0], messages::MSG_RESPONSE);
         assert_eq!(response.len(), RESPONSE_LEN);
-        // §2.1: the responder learns the endpoint from the authenticated source.
-        assert_eq!(net.nodes[1].core.peer_endpoint(&a_pub), Some(outer(1)));
+        // §2.1: the responder reports the endpoint learned from the authenticated source.
+        assert_eq!(
+            net.nodes[1].sink.events,
+            vec![Event::PeerEndpointUpdate {
+                public_key: a_pub,
+                endpoint: outer(1),
+            }],
+            "the first authenticated observation is reported even when it matches config"
+        );
 
         // §5.4.5: the initiator must speak first to confirm the session, and the
         // parked packet is what does it — no separate keepalive is emitted.
@@ -3459,6 +3523,13 @@ mod tests {
             .await
             .expect("response accepted");
         let (_, data) = net.nodes[0].sink.expect_one_outer();
+        assert_eq!(
+            net.nodes[0].sink.events,
+            vec![Event::PeerEndpointUpdate {
+                public_key: b_pub,
+                endpoint: outer(2),
+            }],
+        );
         assert_eq!(data[0], messages::MSG_DATA);
         // §5.4.6: the plaintext is padded to a 16-byte boundary before sealing.
         assert_eq!((data.len() - messages::DATA_OVERHEAD) % 16, 0);
@@ -3494,6 +3565,10 @@ mod tests {
             .await
             .expect("reply accepted");
         assert_eq!(net.nodes[0].sink.inner, vec![(b_pub, reply.clone())]);
+        assert!(
+            net.nodes[0].sink.events.is_empty(),
+            "repeated traffic from an already-confirmed endpoint is coalesced"
+        );
 
         // --- Replay: same bytes, same counter, already seen (§5.4.6) ----------
         net.nodes[0].sink.clear();
@@ -3577,10 +3652,9 @@ mod tests {
             .expect("max-size packet accepted");
         assert_eq!(net.nodes[1].sink.inner, vec![(a_pub, bulk)]);
 
-        // Endpoint reporting reflects what both sides learned.
-        assert_eq!(net.nodes[0].core.peer_endpoint(&b_pub), Some(outer(2)));
-        let listed: Vec<_> = net.nodes[0].core.peer_endpoints().collect();
-        assert_eq!(listed, vec![(b_pub, outer(2))]);
+        // Endpoint observations are event-only, and unchanged authenticated
+        // traffic is coalesced rather than reported again.
+        assert!(net.nodes[1].sink.events.is_empty());
     }
 
     // ---------------------------------------------------------------------------
@@ -4000,7 +4074,10 @@ mod tests {
             net.nodes[0].sink.outer_types(),
             vec![messages::MSG_INITIATION]
         );
-        assert_eq!(net.nodes[0].core.peer_endpoint(&b_pub), Some(outer(2)));
+        assert_eq!(
+            stored_direct_endpoint(&net.nodes[0].core, &b_pub),
+            Some(outer(2))
+        );
         net.nodes[0].core.assert_peer_index_consistent();
 
         net.pump(T0).await;
@@ -4035,7 +4112,10 @@ mod tests {
             )
             .await
             .expect("watched update applied");
-        assert_eq!(net.nodes[0].core.peer_endpoint(&b_pub), Some(outer(4)));
+        assert_eq!(
+            stored_direct_endpoint(&net.nodes[0].core, &b_pub),
+            Some(outer(4))
+        );
         net.nodes[0].core.assert_peer_index_consistent();
     }
 
@@ -4062,7 +4142,7 @@ mod tests {
 
         // Installing a resolved peer asks for no subscription of its own: the
         // answer that installed it already carried one.
-        assert!(a.next_unwatch().is_none());
+        assert!(a.next_peer_evicted().is_none());
 
         a.resolver_event_completed(
             T0 + Duration::from_secs(1),
@@ -4073,7 +4153,7 @@ mod tests {
         )
         .await
         .expect("watched update applied");
-        assert_eq!(a.core.peer_endpoint(&b_pub), Some(outer(4)));
+        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(4)));
 
         // Omission is replacement too: it clears the old endpoint rather than
         // inheriting it from the previous accepted record.
@@ -4086,7 +4166,7 @@ mod tests {
         )
         .await
         .expect("endpoint-clearing watched update applied");
-        assert_eq!(a.core.peer_endpoint(&b_pub), None);
+        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), None);
 
         a.resolver_event_completed(
             T0 + Duration::from_secs(3),
@@ -4095,8 +4175,8 @@ mod tests {
         .await
         .expect("authoritative deletion applied");
         assert!(a.core.find_peer(&b_pub).is_none());
-        assert_eq!(a.next_unwatch(), Some(b_pub));
-        assert!(a.next_unwatch().is_none());
+        assert_eq!(a.next_peer_evicted(), Some(b_pub));
+        assert!(a.next_peer_evicted().is_none());
         a.core.assert_peer_index_consistent();
     }
 
@@ -4163,7 +4243,7 @@ mod tests {
         )
         .await
         .expect("dynamic peer installed");
-        assert_eq!(a.core.peer_endpoint(&b_pub), Some(outer(2)));
+        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(2)));
 
         // A watched update that both moves the endpoint and grows the address
         // set past the remaining capacity. There is no eligible victim: every
@@ -4188,7 +4268,7 @@ mod tests {
         // Neither half of the answer was applied. Previously the endpoint moved
         // while the addresses stayed behind.
         assert_eq!(
-            a.core.peer_endpoint(&b_pub),
+            stored_direct_endpoint(&a.core, &b_pub),
             Some(outer(2)),
             "metadata must not be applied when the address set could not be"
         );
@@ -4272,7 +4352,7 @@ mod tests {
         )
         .await
         .expect("first answer installs the peer");
-        assert_eq!(a.core.peer_endpoint(&b_pub), Some(outer(2)));
+        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(2)));
         assert_eq!(a.core.routes.available_slots(), 0);
 
         // The older by-key lookup now returns a different complete record that
@@ -4297,7 +4377,7 @@ mod tests {
         .expect("capacity rejection is not surfaced as a core error");
 
         let pidx = a.core.find_peer(&b_pub).expect("existing peer retained");
-        assert_eq!(a.core.peer_endpoint(&b_pub), Some(outer(2)));
+        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(2)));
         assert_eq!(
             a.core
                 .routes
@@ -4407,7 +4487,7 @@ mod tests {
         .expect("capacity rejection is handled locally");
 
         let pidx = a.core.find_peer(&b_pub).expect("existing peer retained");
-        assert_eq!(a.core.peer_endpoint(&b_pub), Some(outer(2)));
+        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(2)));
         assert_eq!(
             a.core
                 .routes
@@ -4455,7 +4535,7 @@ mod tests {
         )
         .await
         .expect("the rejected update is not an error");
-        assert_eq!(a.core.peer_endpoint(&b_pub), Some(outer(2)));
+        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(2)));
 
         // Not retried immediately: a record that failed once will usually fail
         // again on the next round trip, and the resolve budget is finite.
@@ -4485,7 +4565,7 @@ mod tests {
         )
         .await
         .expect("the reconciliation applies");
-        assert_eq!(a.core.peer_endpoint(&b_pub), Some(outer(5)));
+        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(5)));
 
         let later = due + a.core.core_config().negative_ttl + Duration::from_secs(1);
         while a.handle_timeout(later).await {}
@@ -4619,6 +4699,11 @@ mod tests {
         )
         .await
         .expect("mismatch handled");
+        assert_eq!(
+            a.next_peer_evicted(),
+            Some(other_pub),
+            "a rejected watched answer must release its resolver-side watch"
+        );
 
         // The parked packets are still dropped rather than re-dispatched:
         // replaying them here would allocate a fresh resolve from inside the
@@ -4716,7 +4801,10 @@ mod tests {
             )
             .await
             .expect("peer installed");
-        assert_eq!(net.nodes[0].core.peer_endpoint(&c_pub), Some(outer(3)));
+        assert_eq!(
+            stored_direct_endpoint(&net.nodes[0].core, &c_pub),
+            Some(outer(3))
+        );
         net.nodes[0].core.assert_peer_index_consistent();
 
         // The initiator's own §6.4 retransmission is what heals the exchange.
@@ -5016,11 +5104,10 @@ mod tests {
         );
 
         // Relay spec §9: the configured relay relation is the routing authority,
-        // so the observed UDP source (the relay's) is never adopted and a relayed
-        // peer has no direct endpoint to expose.
-        assert_eq!(net.nodes[0].core.peer_endpoint(&b_pub), None);
-        assert_eq!(net.nodes[0].core.peer_endpoint(&r_pub), Some(outer(9)));
-        assert_eq!(net.nodes[2].core.peer_endpoint(&a_pub), None);
+        // so the relay's UDP source is never reported as an end-peer endpoint.
+        // The hop-local relay endpoints were already confirmed before the sinks
+        // were cleared, so there are no endpoint updates anywhere in this exchange.
+        assert!(net.nodes.iter().all(|node| node.sink.events.is_empty()));
 
         // --- Forwarding is opt-in (§8) ----------------------------------------
         for index in 0..3 {
@@ -5494,8 +5581,9 @@ mod tests {
         );
 
         // Const-parameter validation. Without `alloc` the fixed-capacity index map
-        // rejects an out-of-range capacity at monomorphisation, so an illegal `P`
-        // cannot even be *named* there; the runtime guard is only observable on
+        // rejects an out-of-range capacity at monomorphisation, so an illegal
+        // `MAX_PEERS` cannot even be *named* there; the runtime guard is only
+        // observable on
         // the allocator-backed backend.
         #[cfg(feature = "alloc")]
         {
@@ -5660,7 +5748,7 @@ mod tests {
             )
             .expect("refresh accepted");
         assert!(!routes_changed);
-        assert_eq!(a.core.peer_endpoint(&second_pub), Some(outer(7)));
+        assert_eq!(stored_direct_endpoint(&a.core, &second_pub), Some(outer(7)));
         a.core.assert_peer_index_consistent();
     }
 
@@ -6354,7 +6442,7 @@ mod tests {
             IpAddr::V6(Ipv4Addr::new(203, 0, 113, 2).to_ipv6_mapped()),
             51820,
         );
-        assert_eq!(crate::unmap_socket_addr(mapped), outer(2));
-        assert_eq!(crate::unmap_socket_addr(outer(2)), outer(2));
+        assert_eq!(crate::ip::unmap_socket_addr(mapped), outer(2));
+        assert_eq!(crate::ip::unmap_socket_addr(outer(2)), outer(2));
     }
 }

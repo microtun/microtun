@@ -1,5 +1,5 @@
 //! A path-compressed (radix / Patricia-style) prefix trie mapping
-//! [`IpNet`] prefixes to values, with longest-prefix-match lookups —
+//! [`IpCidr`] prefixes to values, with longest-prefix-match lookups —
 //! the shape needed for WireGuard cryptokey routing
 //! (`allowed_ips -> peer`).
 //!
@@ -15,7 +15,7 @@ use core::net::IpAddr;
 #[cfg(not(feature = "alloc"))]
 use core::ops::{Index, IndexMut};
 
-use crate::IpNet;
+use crate::IpCidr;
 
 /// Index of a node in the pool. Both fixed-capacity and allocator-backed
 /// builds use the platform index width, keeping the trie implementation and
@@ -54,9 +54,10 @@ impl<V> Node<V> {
 /// Inline storage for the allocation-free trie.
 ///
 /// The two address-family roots are always present. Every route/prefix can
-/// require at most two additional Patricia nodes, so `N` two-node buckets are
-/// enough for any set of `N` routes without needing unstable const-generic
-/// arithmetic such as `[Node<V>; 2 + 2 * N]`.
+/// require at most two additional Patricia nodes, so `MAX_PREFIXES` two-node
+/// buckets are enough for any set of `MAX_PREFIXES` routes without needing
+/// unstable const-generic
+/// arithmetic such as `[Node<V>; 2 + 2 * MAX_PREFIXES]`.
 #[cfg(not(feature = "alloc"))]
 #[derive(Debug)]
 struct NodePair<V> {
@@ -113,14 +114,14 @@ impl<V> NodePair<V> {
 
 #[cfg(not(feature = "alloc"))]
 #[derive(Debug)]
-struct NodePool<V, const N: usize> {
+struct NodePool<V, const MAX_PREFIXES: usize> {
     roots: [Node<V>; 2],
-    pairs: [NodePair<V>; N],
+    pairs: [NodePair<V>; MAX_PREFIXES],
     used: usize,
 }
 
 #[cfg(not(feature = "alloc"))]
-impl<V, const N: usize> NodePool<V, N> {
+impl<V, const MAX_PREFIXES: usize> NodePool<V, MAX_PREFIXES> {
     fn new() -> Self {
         Self {
             roots: [Node::new(0, 0), Node::new(0, 0)],
@@ -150,7 +151,7 @@ impl<V, const N: usize> NodePool<V, N> {
     }
 
     fn available(&self) -> usize {
-        N.saturating_mul(2).saturating_sub(self.used)
+        MAX_PREFIXES.saturating_mul(2).saturating_sub(self.used)
     }
 
     fn alloc(&mut self, node: Node<V>) -> Option<NodeId> {
@@ -176,7 +177,7 @@ impl<V, const N: usize> NodePool<V, N> {
 }
 
 #[cfg(not(feature = "alloc"))]
-impl<V, const N: usize> Index<NodeId> for NodePool<V, N> {
+impl<V, const MAX_PREFIXES: usize> Index<NodeId> for NodePool<V, MAX_PREFIXES> {
     type Output = Node<V>;
 
     fn index(&self, index: NodeId) -> &Self::Output {
@@ -185,7 +186,7 @@ impl<V, const N: usize> Index<NodeId> for NodePool<V, N> {
 }
 
 #[cfg(not(feature = "alloc"))]
-impl<V, const N: usize> IndexMut<NodeId> for NodePool<V, N> {
+impl<V, const MAX_PREFIXES: usize> IndexMut<NodeId> for NodePool<V, MAX_PREFIXES> {
     fn index_mut(&mut self, index: NodeId) -> &mut Self::Output {
         self.get_mut(index).expect("valid live trie node id")
     }
@@ -193,26 +194,28 @@ impl<V, const N: usize> IndexMut<NodeId> for NodePool<V, N> {
 
 /// A path-compressed binary trie mapping IPv4 and IPv6 prefixes to `V`.
 ///
-/// On allocation-free builds, `N` is the maximum number of prefixes the trie
+/// On allocation-free builds, `MAX_PREFIXES` is the maximum number of
+/// prefixes the trie
 /// must be able to represent. The backing pool reserves two roots plus two
 /// nodes per prefix, which is the Patricia-trie worst case. With `alloc`, the
-/// pool grows on demand and `N` is only retained so callers can use the same
+/// pool grows on demand and `MAX_PREFIXES` is only retained so callers can
+/// use the same
 /// type spelling in either storage mode.
 ///
 /// Invariant kept by all operations: every non-root node either holds a value
 /// or has two children — chains of single-child nodes are always merged into
 /// one edge.
 #[derive(Debug)]
-pub struct PrefixTrie<V, const N: usize> {
+pub struct PrefixTrie<V, const MAX_PREFIXES: usize> {
     #[cfg(not(feature = "alloc"))]
-    nodes: NodePool<V, N>,
+    nodes: NodePool<V, MAX_PREFIXES>,
     #[cfg(feature = "alloc")]
     nodes: alloc::vec::Vec<Node<V>>,
     /// Nodes freed by [`remove`](Self::remove), available for reuse.
     #[cfg(feature = "alloc")]
     free: alloc::vec::Vec<NodeId>,
     #[cfg(feature = "alloc")]
-    _capacity: core::marker::PhantomData<[(); N]>,
+    _capacity: core::marker::PhantomData<[(); MAX_PREFIXES]>,
 }
 
 // The two roots are ordinary pool nodes at fixed indices with empty edges. A
@@ -220,7 +223,7 @@ pub struct PrefixTrie<V, const N: usize> {
 const V4_ROOT: NodeId = 0;
 const V6_ROOT: NodeId = 1;
 
-impl<V, const N: usize> PrefixTrie<V, N> {
+impl<V, const MAX_PREFIXES: usize> PrefixTrie<V, MAX_PREFIXES> {
     /// Creates an empty trie.
     pub fn new() -> Result<Self, CapacityError> {
         #[cfg(not(feature = "alloc"))]
@@ -244,12 +247,12 @@ impl<V, const N: usize> PrefixTrie<V, N> {
     }
 
     /// Inserts `value` for `net`, returning the value previously stored
-    /// for exactly this prefix, if any. [`IpNet`] cannot carry host bits, so
+    /// for exactly this prefix, if any. [`IpCidr`] cannot carry host bits, so
     /// `10.1.2.3/8` is not a distinct key that has to be folded onto
     /// `10.0.0.0/8` — it is not representable in the first place.
     ///
     /// On `Err(CapacityError)` the trie is left unchanged.
-    pub fn insert(&mut self, net: IpNet, value: V) -> Result<Option<V>, CapacityError> {
+    pub fn insert(&mut self, net: IpCidr, value: V) -> Result<Option<V>, CapacityError> {
         let (key, _, root) = key(net.first_address());
         let klen = net.network_length();
 
@@ -331,7 +334,7 @@ impl<V, const N: usize> PrefixTrie<V, N> {
     }
 
     /// The value stored for exactly `net`, if any (no LPM).
-    pub fn get(&self, net: IpNet) -> Option<&V> {
+    pub fn get(&self, net: IpCidr) -> Option<&V> {
         let (key, _, mut node) = key(net.first_address());
         let klen = net.network_length();
         let mut pos = 0;
@@ -350,7 +353,7 @@ impl<V, const N: usize> PrefixTrie<V, N> {
 
     /// Removes and returns the value stored for exactly `net`, merging
     /// edges back together so freed nodes can be reused.
-    pub fn remove(&mut self, net: IpNet) -> Option<V> {
+    pub fn remove(&mut self, net: IpCidr) -> Option<V> {
         let (key, _, root) = key(net.first_address());
         let klen = net.network_length();
 
@@ -514,10 +517,10 @@ mod tests {
     use core::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
-    use crate::IpNet;
+    use crate::IpCidr;
 
-    fn net4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpNet {
-        // `IpNet` is canonical by construction, so build through `IpInet`
+    fn net4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpCidr {
+        // `IpCidr` is canonical by construction, so build through `IpInet`
         // (which tolerates host bits) and take its network. That keeps the
         // host-bit cases these tests deliberately exercise expressible.
         crate::IpInet::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), len)
@@ -525,7 +528,7 @@ mod tests {
             .network()
     }
 
-    fn net6(addr: Ipv6Addr, len: u8) -> IpNet {
+    fn net6(addr: Ipv6Addr, len: u8) -> IpCidr {
         crate::IpInet::new(IpAddr::V6(addr), len)
             .expect("valid prefix")
             .network()
@@ -714,7 +717,7 @@ mod tests {
 
         // A free function rather than a closure: the second half of this test
         // shrinks `prefixes`, which a closure capturing it would forbid.
-        fn expected(prefixes: &[(IpNet, u32)], address: Ipv4Addr) -> Option<u32> {
+        fn expected(prefixes: &[(IpCidr, u32)], address: Ipv4Addr) -> Option<u32> {
             prefixes
                 .iter()
                 .filter(|(net, _)| net.contains(&IpAddr::V4(address)))
@@ -736,7 +739,7 @@ mod tests {
         }
 
         // Removing half the set must leave the other half exactly as it was.
-        let doomed: Vec<IpNet> = prefixes
+        let doomed: Vec<IpCidr> = prefixes
             .iter()
             .filter(|(net, _)| net.network_length() % 8 != 0)
             .map(|(net, _)| *net)

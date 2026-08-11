@@ -17,8 +17,10 @@
 use std::{fmt, net::SocketAddr, path::Path};
 
 use microtun_core::{
-    IpNet, KEY_TEXT_LEN, MAX_PEER_ADDRESSES, decode_key, encode_key, parse_ip_inet,
-    public_key as derive_public_key, unmap_socket_addr,
+    IpCidr, MAX_PEER_ADDRESSES,
+    ip::{parse_ip_inet, unmap_socket_addr},
+    key::{KEY_TEXT_LEN, decode_key, encode_key},
+    public_key as derive_public_key,
 };
 
 use crate::registry::{KEY_PREFIX_LEN, PeerRecord, Registry};
@@ -345,7 +347,7 @@ struct Draft {
     /// The literal `Relay` value, still to be checked against the file.
     relay: Option<Entry>,
     persistent_keepalive: Option<u16>,
-    addresses: Vec<IpNet>,
+    addresses: Vec<IpCidr>,
 }
 
 fn interface_section(
@@ -449,7 +451,7 @@ fn draft_fields(
     section: &Section,
     name: Option<String>,
     public_key: [u8; 32],
-    addresses: Vec<IpNet>,
+    addresses: Vec<IpCidr>,
     path: &Path,
 ) -> Result<Draft, ConfigError> {
     let endpoint = match field(section, "Endpoint", path)? {
@@ -507,8 +509,8 @@ fn draft_fields(
 /// `Addresses` may repeat and each entry may list several prefixes separated
 /// by commas or whitespace. A prefix length may be omitted, in which case the
 /// entry is a host prefix: `10.0.0.3` is `10.0.0.3/32`.
-fn peer_addresses(section: &Section, path: &Path) -> Result<Vec<IpNet>, ConfigError> {
-    let mut addresses: Vec<IpNet> = Vec::new();
+fn peer_addresses(section: &Section, path: &Path) -> Result<Vec<IpCidr>, ConfigError> {
+    let mut addresses: Vec<IpCidr> = Vec::new();
 
     for entry in section.all("Addresses") {
         for token in entry
@@ -517,7 +519,7 @@ fn peer_addresses(section: &Section, path: &Path) -> Result<Vec<IpNet>, ConfigEr
             .filter(|token| !token.is_empty())
         {
             // Parsed as an `IpInet` (address *plus* prefix) rather than an
-            // `IpNet`, which cannot represent host bits at all. Keeping the
+            // `IpCidr`, which cannot represent host bits at all. Keeping the
             // sloppy form for one moment longer is what lets the operator be
             // told their line was rewritten, instead of having it silently
             // corrected inside the parser.
@@ -817,7 +819,7 @@ Relay = GATEWAY
             .expect("the [Server] record is keyed by the derived public key");
         assert_eq!(
             server.addresses.as_slice(),
-            &["10.0.0.1/32".parse::<IpNet>().unwrap()]
+            &["10.0.0.1/32".parse::<IpCidr>().unwrap()]
         );
         let gateway = loaded.registry.lookup_key(&[0xBB; 32]).expect("gateway");
         assert_eq!(gateway.addresses.len(), 2);
@@ -1016,7 +1018,7 @@ ADDRESSES = 10.0.0.2/32
         let text = format!("[Server]\nPrivateKey = {SERVER_PRIVATE}\nAddresses = 10.1.2.3/24\n");
         let loaded = load_text(&text).expect("loads");
         let peer = loaded.registry.lookup_key(&server_public()).unwrap();
-        assert_eq!(peer.addresses[0], "10.1.2.0/24".parse::<IpNet>().unwrap());
+        assert_eq!(peer.addresses[0], "10.1.2.0/24".parse::<IpCidr>().unwrap());
     }
 
     /// A missing prefix length means a host prefix, which is what almost every
@@ -1027,8 +1029,8 @@ ADDRESSES = 10.0.0.2/32
             format!("[Server]\nPrivateKey = {SERVER_PRIVATE}\nAddresses = 10.0.0.1, fd00::1\n");
         let loaded = load_text(&text).expect("loads");
         let peer = loaded.registry.lookup_key(&server_public()).unwrap();
-        assert_eq!(peer.addresses[0], "10.0.0.1/32".parse::<IpNet>().unwrap());
-        assert_eq!(peer.addresses[1], "fd00::1/128".parse::<IpNet>().unwrap());
+        assert_eq!(peer.addresses[0], "10.0.0.1/32".parse::<IpCidr>().unwrap());
+        assert_eq!(peer.addresses[1], "fd00::1/128".parse::<IpCidr>().unwrap());
     }
 
     /// The abbreviation is an input convenience only: what the server serves

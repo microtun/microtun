@@ -78,7 +78,9 @@ impl<T: tokio::io::AsyncWrite + Unpin + ?Sized> embedded_io_async::Write for Tok
     }
 }
 
-impl<R, W, H, const RX: usize, const TX: usize> Connection<TokioIo<R>, TokioIo<W>, H, RX, TX> {
+impl<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>
+    Connection<TokioIo<R>, TokioIo<W>, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>
+{
     /// Create a connection directly from Tokio reader/writer halves.
     pub fn from_tokio(reader: R, writer: W, handler: H) -> Self {
         Self::new(TokioIo::new(reader), TokioIo::new(writer), handler)
@@ -91,7 +93,7 @@ impl<R, W, H, const RX: usize, const TX: usize> Connection<TokioIo<R>, TokioIo<W
     }
 }
 
-impl<W, const TX: usize> Notifier<TokioIo<W>, TX> {
+impl<W, const TX_BUFFER_SIZE: usize> Notifier<TokioIo<W>, TX_BUFFER_SIZE> {
     /// Create a notification sender directly from a Tokio writer.
     pub fn from_tokio(writer: W) -> Self {
         Self::new(TokioIo::new(writer))

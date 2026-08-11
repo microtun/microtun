@@ -21,8 +21,8 @@ use microtun_jsonrpc::{Error as RpcError, Handler};
 
 /// Peers API connection constructed from native Tokio reader/writer halves.
 #[cfg(feature = "tokio-client")]
-pub type TokioConnection<R, W, H, const RX: usize, const TX: usize> =
-    Connection<TokioIo<R>, TokioIo<W>, H, RX, TX>;
+pub type TokioConnection<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize> =
+    Connection<TokioIo<R>, TokioIo<W>, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>;
 
 use crate::{
     Error, KeyParams, LookupResult, METHOD_CHANGED, METHOD_UNWATCH, METHOD_WATCH, QueryText,
@@ -59,21 +59,22 @@ impl From<RpcError> for ClientError {
 
 /// Collects public keys named by `v1.peer.changed` notifications.
 ///
-/// `N` is the fixed-capacity queue size for allocation-free builds. With
-/// `alloc`, the queue grows as needed and `N` is ignored. Keeping the const
-/// parameter in both configurations makes the type stable under Cargo feature
-/// unification when std and Embassy clients are built in the same graph.
+/// `MAX_CHANGES` is the maximum number of queued changes on allocation-free
+/// builds. With `alloc`, the queue grows as needed and `MAX_CHANGES` is
+/// ignored. Keeping the const parameter in both configurations makes the type
+/// stable under Cargo feature unification when std and Embassy clients are built
+/// in the same graph.
 #[derive(Debug, Default)]
-pub struct ChangeHandler<const N: usize = 0> {
+pub struct ChangeHandler<const MAX_CHANGES: usize = 0> {
     #[cfg(feature = "alloc")]
     changed: alloc::collections::VecDeque<[u8; 32]>,
     #[cfg(not(feature = "alloc"))]
-    changed: Vec<[u8; 32], N>,
+    changed: Vec<[u8; 32], MAX_CHANGES>,
     #[cfg(not(feature = "alloc"))]
     overflowed: bool,
 }
 
-impl<const N: usize> ChangeHandler<N> {
+impl<const MAX_CHANGES: usize> ChangeHandler<MAX_CHANGES> {
     /// Pop the next coalesced invalidated key.
     pub fn take_changed(&mut self) -> Option<[u8; 32]> {
         #[cfg(feature = "alloc")]
@@ -141,7 +142,7 @@ fn decode_changed_notification(
     decode_key(args.public_key).ok()
 }
 
-impl<const N: usize> microtun_jsonrpc::Handler for ChangeHandler<N> {
+impl<const MAX_CHANGES: usize> microtun_jsonrpc::Handler for ChangeHandler<MAX_CHANGES> {
     fn handle_request(
         &mut self,
         _method: &str,
@@ -159,8 +160,8 @@ impl<const N: usize> microtun_jsonrpc::Handler for ChangeHandler<N> {
 }
 
 /// Perform one side-effect-free lookup and validate by-key identity.
-pub async fn lookup<R, W, H, const RX: usize, const TX: usize>(
-    connection: &mut Connection<R, W, H, RX, TX>,
+pub async fn lookup<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(
+    connection: &mut Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>,
     query: ResolveQuery,
 ) -> Result<ResolveOutcome, ClientError>
 where
@@ -179,8 +180,8 @@ where
 }
 
 /// Resolve one peer by its public key.
-pub async fn resolve_key<R, W, H, const RX: usize, const TX: usize>(
-    connection: &mut Connection<R, W, H, RX, TX>,
+pub async fn resolve_key<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(
+    connection: &mut Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>,
     public_key: [u8; 32],
 ) -> Result<ResolveOutcome, ClientError>
 where
@@ -192,8 +193,8 @@ where
 }
 
 /// Resolve the peer owning one destination address.
-pub async fn resolve_address<R, W, H, const RX: usize, const TX: usize>(
-    connection: &mut Connection<R, W, H, RX, TX>,
+pub async fn resolve_address<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(
+    connection: &mut Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>,
     address: IpAddr,
 ) -> Result<ResolveOutcome, ClientError>
 where
@@ -205,8 +206,8 @@ where
 }
 
 /// Atomically subscribe to one public key and return its current state.
-pub async fn watch<R, W, H, const RX: usize, const TX: usize>(
-    connection: &mut Connection<R, W, H, RX, TX>,
+pub async fn watch<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(
+    connection: &mut Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>,
     public_key: [u8; 32],
 ) -> Result<ResolveOutcome, ClientError>
 where
@@ -223,8 +224,8 @@ where
 }
 
 /// Best-effort removal of one key from the connection watch set.
-pub async fn unwatch<R, W, H, const RX: usize, const TX: usize>(
-    connection: &mut Connection<R, W, H, RX, TX>,
+pub async fn unwatch<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(
+    connection: &mut Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>,
     public_key: [u8; 32],
 ) -> Result<(), ClientError>
 where
@@ -240,8 +241,8 @@ where
     Ok(())
 }
 
-async fn call_result<R, W, H, P, const RX: usize, const TX: usize>(
-    connection: &mut Connection<R, W, H, RX, TX>,
+async fn call_result<R, W, H, P, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(
+    connection: &mut Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>,
     method: &str,
     params: &P,
 ) -> Result<ResolveOutcome, ClientError>

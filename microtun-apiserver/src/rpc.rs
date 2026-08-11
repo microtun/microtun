@@ -19,7 +19,8 @@
 //! reopening the race between the state a client installs and the watch that
 //! protects it.
 //!
-//! Registry reloads push `v1.peer.changed` for watched keys whose records changed.
+//! Config reloads and authenticated endpoint observations push `v1.peer.changed`
+//! for watched keys whose effective records changed.
 //! That notification names a key and carries nothing else: the client answers
 //! it with an ordinary `v1.peer.by_key`. A reconnecting client replays
 //! `v1.peer.watch` for its desired set, which both reconciles current state and
@@ -109,7 +110,7 @@ use microtun_api::{
     ByAddressParams, KeyParams, LookupResult, METHOD_BY_ADDRESS, METHOD_BY_KEY, METHOD_CHANGED,
     METHOD_UNWATCH, METHOD_WATCH, PeerInfo, QUERY_FRAME_LEN, RECORD_FRAME_LEN,
 };
-use microtun_core::{decode_key, encode_key};
+use microtun_core::key::{decode_key, encode_key};
 use microtun_jsonrpc::{
     Connection as RpcConnection, Handler, Notifier, Params, Reply, Responder, TokioIo, codes,
 };
@@ -314,7 +315,7 @@ impl AppState {
     /// ordinary request admission still returns the protocol's indistinguishable
     /// `not_found` result.
     fn open_connection(self: &Arc<Self>, key: [u8; 32]) -> Option<ConnectionPermit> {
-        let registry = self.registry.snapshot();
+        let registry = self.registry.config_snapshot();
         if registry.lookup_key(&key).is_none() {
             return Some(ConnectionPermit {
                 state: Arc::clone(self),
@@ -349,7 +350,7 @@ impl AppState {
     }
 
     fn close_connection(&self, key: [u8; 32]) {
-        let configured = self.registry.snapshot().lookup_key(&key).is_some();
+        let configured = self.registry.config_snapshot().lookup_key(&key).is_some();
         let mut usage = self
             .usage
             .lock()
@@ -366,7 +367,7 @@ impl AppState {
     }
 
     fn allow_request(&self, key: [u8; 32]) -> bool {
-        let registry = self.registry.snapshot();
+        let registry = self.registry.config_snapshot();
         if registry.lookup_key(&key).is_none() {
             return true;
         }
@@ -498,48 +499,50 @@ impl PeersApiHandler {
 
     /// Admit the caller and resolve one side-effect-free lookup.
     fn lookup(&self, query: Lookup<'_>) -> Answer {
-        let registry = self.state.registry.snapshot();
-        if admit(&self.state, &registry, self.connection.key).is_none() {
-            return Answer::NotAdmitted;
-        }
-        let record = match query {
-            Lookup::Key(text) => {
-                let Ok(key) = decode_key(text) else {
-                    return Answer::BadArgument;
-                };
-                registry.lookup_key(&key)
+        self.state.registry.read(|published| {
+            if admit(&self.state, published.config(), self.connection.key).is_none() {
+                return Answer::NotAdmitted;
             }
-            Lookup::Address(text) => {
-                let Ok(address) = text.parse::<IpAddr>() else {
-                    return Answer::BadArgument;
-                };
-                registry.lookup_address(microtun_api::unmap_address(address))
+            let record = match query {
+                Lookup::Key(text) => {
+                    let Ok(key) = decode_key(text) else {
+                        return Answer::BadArgument;
+                    };
+                    published.lookup_key(&key)
+                }
+                Lookup::Address(text) => {
+                    let Ok(address) = text.parse::<IpAddr>() else {
+                        return Answer::BadArgument;
+                    };
+                    published.lookup_address(microtun_api::unmap_address(address))
+                }
+            };
+            match record {
+                Some(record) => Answer::Record(published.info(record)),
+                None => Answer::Miss,
             }
-        };
-        match record {
-            Some(record) => Answer::Record(record.info()),
-            None => Answer::Miss,
-        }
+        })
     }
 
     /// Explicitly subscribe to one key and return its current record.
     ///
-    /// The watch-set insertion and registry read share one critical section so
-    /// a reload cannot land after the returned snapshot but before the watch
-    /// becomes visible. Every outcome other than a hit subscribes nothing.
+    /// The watch-set insertion and published-state read share one critical
+    /// section so neither a config reload nor an endpoint observation can land
+    /// after the returned snapshot but before the watch becomes visible. Every
+    /// outcome other than a hit subscribes nothing.
     fn watch(&self, text: &str) -> Answer {
-        self.state.registry.read(|registry| {
-            if admit(&self.state, registry, self.connection.key).is_none() {
+        self.state.registry.read(|published| {
+            if admit(&self.state, published.config(), self.connection.key).is_none() {
                 return Answer::NotAdmitted;
             }
             let Ok(public_key) = decode_key(text) else {
                 return Answer::BadArgument;
             };
-            let Some(record) = registry.lookup_key(&public_key) else {
+            let Some(record) = published.lookup_key(&public_key) else {
                 return Answer::Miss;
             };
             self.watched().insert(public_key);
-            Answer::Record(record.info())
+            Answer::Record(published.info(record))
         })
     }
 
@@ -633,7 +636,7 @@ impl Handler for PeersApiHandler {
             tracing::debug!("ignoring {method} with invalid params");
             return;
         };
-        let registry = self.state.registry.snapshot();
+        let registry = self.state.registry.config_snapshot();
         if admit(&self.state, &registry, self.connection.key).is_none() {
             return;
         }
@@ -695,7 +698,7 @@ where
     // admission lapsed because of a bad config push.
     if state
         .registry
-        .snapshot()
+        .config_snapshot()
         .lookup_key(&connection.key)
         .is_none()
     {
@@ -742,7 +745,7 @@ where
             change = changes.recv() => {
                 match change {
                     Ok(change) => {
-                        if registry.snapshot().lookup_key(&connection.key).is_none() {
+                        if registry.config_snapshot().lookup_key(&connection.key).is_none() {
                             reader_task.abort();
                             return;
                         }
@@ -770,7 +773,7 @@ where
                             .iter()
                             .copied()
                             .collect();
-                        if registry.snapshot().lookup_key(&connection.key).is_none() {
+                        if registry.config_snapshot().lookup_key(&connection.key).is_none() {
                             reader_task.abort();
                             return;
                         }
@@ -1035,6 +1038,25 @@ Relay = gateway
                 "expected invalid-params for {key}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn learned_endpoint_overrides_config_in_rpc_answers() {
+        let state = app_state();
+        let learned: std::net::SocketAddr = "203.0.113.20:42424".parse().unwrap();
+        state.registry().observe_endpoint(GATEWAY_KEY, learned);
+
+        let by_key_record = by_key(&state, LAPTOP_KEY, GATEWAY).await.expect("gateway");
+        assert_eq!(
+            by_key_record.endpoint.as_deref(),
+            Some("203.0.113.20:42424")
+        );
+
+        let by_address_record = by_address(&state, "10.0.0.1").await.expect("gateway");
+        assert_eq!(
+            by_address_record.endpoint.as_deref(),
+            Some("203.0.113.20:42424")
+        );
     }
 
     #[tokio::test]

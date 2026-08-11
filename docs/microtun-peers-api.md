@@ -343,6 +343,13 @@ variant.
 Wire decoding validates field lengths and syntax. Trust and installation policy
 remain the client's responsibility.
 
+The reference `microtun-apiserver` treats a configured `Endpoint` as a fallback.
+Once its tunnel authenticates direct traffic from that public key, the last
+observed outer UDP source becomes the `endpoint` served for that peer and takes
+precedence over later configuration-only endpoint changes. This is runtime
+state, not a new wire field: clients consume the same `PeerInfo` shape and do
+not need to distinguish configured from observed provenance.
+
 A client currently rejects a decoded dynamic record when, for example, it:
 
 - does not name the key requested by `v1.peer.by_key` or `v1.peer.watch`;
@@ -704,22 +711,24 @@ The notification is unacknowledged. A client MUST NOT wait for confirmation.
 ### 7.1 Watch creation atomicity
 
 `v1.peer.watch(K)` both creates the subscription and returns the current state for
-`K`. The server MUST perform the positive watch-set insertion and registry read
-atomically with respect to registry replacement and change dispatch.
+`K`. The server MUST perform the positive watch-set insertion and published-state
+read atomically with respect to configuration replacement, authenticated endpoint
+observation, and change dispatch.
 
 A single critical section is sufficient:
 
 1. admission-check the caller and decode `K`;
-2. resolve `K` in the current registry;
-3. on a hit, insert `K` into the connection watch set while the same registry
-   snapshot is still protected;
-4. release the registry critical section;
+2. resolve `K` in the current published state;
+3. on a hit, insert `K` into the connection watch set while that same state is
+   still protected;
+4. release the published-state critical section;
 5. serialize and write the `LookupResult` later.
 
 The ordering guarantee is: if the watch response describes snapshot S, then any
 change to K after S is either already represented by a later snapshot read or
-causes `v1.peer.changed(K)` on that connection. A reload cannot land between the
-snapshot and watch creation without one side observing the other.
+causes `v1.peer.changed(K)` on that connection. Neither a config reload nor an
+authenticated endpoint observation can land between the snapshot and watch creation
+without one side observing the other.
 
 The response and any later `v1.peer.changed` may be written in either order. That is
 safe because the notification carries no state.

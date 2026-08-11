@@ -37,6 +37,29 @@ use crate::{
     time::{Duration, Instant},
 };
 
+/// Compile-time ceiling for TCP/UDP flows remembered by the ingress firewall.
+///
+/// Allocation-free builds retain the embedded 16-entry table. Host builds
+/// keep entries on the heap and permit a substantially larger bounded table.
+#[cfg(feature = "alloc")]
+pub const MAX_FIREWALL_FLOWS: usize = 16_384;
+#[cfg(not(feature = "alloc"))]
+pub const MAX_FIREWALL_FLOWS: usize = 16;
+
+/// Backend-appropriate active firewall table default.
+#[cfg(feature = "alloc")]
+pub const DEFAULT_FIREWALL_FLOWS: usize = 4_096;
+#[cfg(not(feature = "alloc"))]
+pub const DEFAULT_FIREWALL_FLOWS: usize = MAX_FIREWALL_FLOWS;
+
+/// Backend-appropriate maximum number of live tracked flows owned by one peer.
+/// This quota prevents one authenticated peer from evicting every other
+/// protected peer's return-flow state.
+#[cfg(feature = "alloc")]
+pub const DEFAULT_FIREWALL_FLOWS_PER_PEER: usize = 128;
+#[cfg(not(feature = "alloc"))]
+pub const DEFAULT_FIREWALL_FLOWS_PER_PEER: usize = 8;
+
 const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
@@ -175,13 +198,14 @@ impl Entry {
 
 /// Fixed-capacity flow tracker used by [`crate::Core`].
 ///
-/// `N` is the compile-time storage ceiling and `P` is the peer-table capacity.
+/// `MAX_FLOWS` is the compile-time storage ceiling and `MAX_PEERS` is
+/// the peer-table capacity.
 /// The active global and per-peer limits are runtime settings bounded by those
 /// ceilings. The per-peer accounting is load-bearing: a peer at its quota may
 /// replace only its own entries, so it cannot flush every other peer's return
 /// traffic state by opening a burst of flows.
 #[derive(Debug)]
-pub(crate) struct Firewall<const N: usize, const P: usize> {
+pub(crate) struct Firewall<const MAX_FLOWS: usize, const MAX_PEERS: usize> {
     udp_timeout: Duration,
     icmp_timeout: Duration,
     tcp_timeout: Duration,
@@ -189,23 +213,23 @@ pub(crate) struct Firewall<const N: usize, const P: usize> {
     max_entries: usize,
     max_entries_per_peer: usize,
     #[cfg(not(feature = "alloc"))]
-    entries: heapless::Vec<Entry, N>,
+    entries: heapless::Vec<Entry, MAX_FLOWS>,
     #[cfg(feature = "alloc")]
     entries: alloc::vec::Vec<Entry>,
     #[cfg(not(feature = "alloc"))]
-    peer_counts: [u16; P],
+    peer_counts: [u16; MAX_PEERS],
     #[cfg(feature = "alloc")]
     peer_counts: alloc::vec::Vec<u16>,
     #[cfg(feature = "alloc")]
-    _capacity: core::marker::PhantomData<[(); N]>,
+    _capacity: core::marker::PhantomData<[(); MAX_FLOWS]>,
 }
 
-impl<const N: usize, const P: usize> Firewall<N, P> {
+impl<const MAX_FLOWS: usize, const MAX_PEERS: usize> Firewall<MAX_FLOWS, MAX_PEERS> {
     #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::with_limits_and_timeouts(
-            N,
-            N,
+            MAX_FLOWS,
+            MAX_FLOWS,
             FIREWALL_UDP_TIMEOUT,
             FIREWALL_ICMP_TIMEOUT,
             FIREWALL_TCP_TIMEOUT,
@@ -221,8 +245,8 @@ impl<const N: usize, const P: usize> Firewall<N, P> {
         tcp_closing_timeout: Duration,
     ) -> Self {
         Self::with_limits_and_timeouts(
-            N,
-            N,
+            MAX_FLOWS,
+            MAX_FLOWS,
             udp_timeout,
             icmp_timeout,
             tcp_timeout,
@@ -243,23 +267,25 @@ impl<const N: usize, const P: usize> Firewall<N, P> {
             icmp_timeout,
             tcp_timeout,
             tcp_closing_timeout,
-            max_entries: max_entries.min(N),
-            max_entries_per_peer: max_entries_per_peer.min(max_entries).min(N),
+            max_entries: max_entries.min(MAX_FLOWS),
+            max_entries_per_peer: max_entries_per_peer.min(max_entries).min(MAX_FLOWS),
             #[cfg(not(feature = "alloc"))]
             entries: heapless::Vec::new(),
             #[cfg(feature = "alloc")]
             entries: alloc::vec::Vec::new(),
             #[cfg(not(feature = "alloc"))]
-            peer_counts: [0; P],
+            peer_counts: [0; MAX_PEERS],
             #[cfg(feature = "alloc")]
-            peer_counts: alloc::vec![0; P],
+            peer_counts: alloc::vec![0; MAX_PEERS],
             #[cfg(feature = "alloc")]
             _capacity: core::marker::PhantomData,
         }
     }
 
     fn peer_position(peer: PeerIdx) -> Option<usize> {
-        usize::try_from(peer).ok().filter(|position| *position < P)
+        usize::try_from(peer)
+            .ok()
+            .filter(|position| *position < MAX_PEERS)
     }
 
     fn peer_count(&self, peer: PeerIdx) -> usize {

@@ -26,19 +26,23 @@ use crate::runner::MTU;
 /// of these `'static` (typically via `static_cell::StaticCell`) and pass it to
 /// [`new_tunnel`].
 ///
-/// * `N_RX` — depth of the ingress (decrypted-inbound) queue
-/// * `N_TX` — depth of the egress (plaintext-outbound) queue
-pub struct TunnelState<const N_RX: usize, const N_TX: usize> {
-    inner: State<MTU, N_RX, N_TX>,
+/// * `MAX_RX_PACKETS` — maximum decrypted inbound packets queued
+/// * `MAX_TX_PACKETS` — maximum plaintext outbound packets queued
+pub struct TunnelState<const MAX_RX_PACKETS: usize, const MAX_TX_PACKETS: usize> {
+    inner: State<MTU, MAX_RX_PACKETS, MAX_TX_PACKETS>,
 }
 
-impl<const N_RX: usize, const N_TX: usize> Default for TunnelState<N_RX, N_TX> {
+impl<const MAX_RX_PACKETS: usize, const MAX_TX_PACKETS: usize> Default
+    for TunnelState<MAX_RX_PACKETS, MAX_TX_PACKETS>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N_RX: usize, const N_TX: usize> TunnelState<N_RX, N_TX> {
+impl<const MAX_RX_PACKETS: usize, const MAX_TX_PACKETS: usize>
+    TunnelState<MAX_RX_PACKETS, MAX_TX_PACKETS>
+{
     pub const fn new() -> Self {
         Self {
             inner: State::new(),
@@ -55,8 +59,8 @@ impl<const N_RX: usize, const N_TX: usize> TunnelState<N_RX, N_TX> {
 /// A WireGuard tunnel is a point-to-point IP link with no L2 addressing, so
 /// the hardware address is [`HardwareAddress::Ip`] and the inner stack must be
 /// configured with `medium-ip`.
-pub fn new_tunnel<'d, const N_RX: usize, const N_TX: usize>(
-    state: &'d mut TunnelState<N_RX, N_TX>,
+pub fn new_tunnel<'d, const MAX_RX_PACKETS: usize, const MAX_TX_PACKETS: usize>(
+    state: &'d mut TunnelState<MAX_RX_PACKETS, MAX_TX_PACKETS>,
 ) -> (Runner<'d, MTU>, Device<'d, MTU>) {
     embassy_net_driver_channel::new(&mut state.inner, HardwareAddress::Ip)
 }

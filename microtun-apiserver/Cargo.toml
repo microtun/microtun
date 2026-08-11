@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 microtun-std = { workspace = true }
-microtun-core = { workspace = true }
+microtun-core = { workspace = true, features = ["alloc"] }
 # The server answers with the same codec its clients decode with, so a wire
 # regression is a compile error or a failing contract test rather than a fleet
 # incident.

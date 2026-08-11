@@ -1,8 +1,8 @@
 //! Peer resolution and dynamic-peer lifecycle.
 //!
-//! This module owns the resolver-facing command/event API, in-flight query
-//! bookkeeping, answer validation, dynamic-peer installation, and watched
-//! updates.
+//! This module owns resolver request/event types, in-flight query bookkeeping,
+//! answer validation, dynamic-peer installation, and watched updates. Resolver
+//! output itself is delivered through [`crate::Sink`].
 //!
 //! A resolver must not return a positive answer until its key is being watched.
 //! For the Peers API wire protocol that means the integration explicitly calls
@@ -16,13 +16,14 @@ use core::net::{IpAddr, SocketAddr};
 use defmt_or_log::{debug, info, warn};
 
 use crate::{
-    CoreInner, Error, EvictedPeerGhost, InboundPolicy, PeerAddresses, RelayPolicy, Sink, Slot,
+    CoreInner, Error, EvictedPeerGhost, PeerAddresses, RelayPolicy, Sink, Slot,
+    firewall::InboundPolicy,
+    ip::unmap_socket_addr,
     peer::{PeerEntry, PeerKind},
     pending::Wait,
     push_peer_address,
     routing::PeerIdx,
     time::{Duration, Instant},
-    unmap_socket_addr,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,7 +75,7 @@ pub struct ResolvedPeer {
     pub persistent_keepalive: Option<Duration>,
 }
 
-/// A typed resolution operation returned by [`crate::Core::next_resolve_request`].
+/// A typed resolution operation emitted through [`crate::Sink::resolve`].
 ///
 /// The request owns its correlation identifier. Resolver implementations
 /// should retain the whole value and turn it into a [`ResolveResponse`] with
@@ -111,7 +112,7 @@ impl ResolveRequest {
     }
 
     /// Pair an outcome with this request for delivery through
-    /// [`crate::Core::resolve_completed`].
+    /// [`crate::Core::resolver_event_completed`].
     pub fn complete(self, outcome: ResolveOutcome) -> ResolveResponse {
         ResolveResponse {
             id: self.id,
@@ -127,16 +128,17 @@ pub struct ResolveResponse {
     outcome: ResolveOutcome,
 }
 
-/// Command stream from the core to a resolver integration.
+/// Convenience envelope for integrations that multiplex resolver work onto one
+/// channel.
 ///
-/// There is no subscribe command at this boundary. Resolver integrations must
-/// establish their underlying subscription before returning a positive answer,
-/// so the only watch-set mutation the core has to express is dropping one.
+/// [`ResolverCommand::Resolve`] originates at [`crate::Sink::resolve`].
+/// [`ResolverCommand::Unwatch`] is runtime-derived from [`crate::Event::PeerEvicted`];
+/// the core itself does not expose a separate unwatch sink callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolverCommand {
     /// Perform this lookup. A positive answer guarantees its key is watched.
     Resolve(ResolveRequest),
-    /// Stop watching this key: the core no longer holds the record.
+    /// Stop watching this key after a peer-eviction event.
     Unwatch([u8; 32]),
 }
 
@@ -245,24 +247,12 @@ pub(super) struct InflightResolve {
 impl<
     RNG: rand_core::RngCore + rand_core::CryptoRng,
     RP: RelayPolicy,
-    const P: usize,
-    const S: usize,
+    const MAX_PEERS: usize,
+    const MAX_SESSIONS: usize,
     const REPLAY_WORDS: usize,
-    const RT: usize,
-> CoreInner<RNG, RP, P, S, REPLAY_WORDS, RT>
+    const MAX_ROUTES: usize,
+> CoreInner<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>
 {
-    /// Deliver an answer to a request previously returned by
-    /// [`crate::Core::next_resolve_request`].
-    pub async fn resolve_completed<E: Sink>(
-        &mut self,
-        now: Instant,
-        response: ResolveResponse,
-        sink: &mut E,
-    ) -> Result<(), Error> {
-        debug!("resolver completion received: id={}", response.id.0);
-        self.resolved(now, response, sink).await
-    }
-
     /// Deliver either a lookup completion or an unsolicited watched-peer update.
     pub async fn resolver_event_completed<E: Sink>(
         &mut self,
@@ -270,83 +260,47 @@ impl<
         event: ResolverEvent,
         sink: &mut E,
     ) -> Result<(), Error> {
-        match event {
-            ResolverEvent::Resolved(response) => self.resolve_completed(now, response, sink).await,
+        let result = match event {
+            ResolverEvent::Resolved(response) => {
+                debug!("resolver completion received: id={}", response.id.0);
+                self.resolved(now, response, sink).await
+            }
             ResolverEvent::PeerUpdated(update) => self.peer_updated(now, update),
-        }
+        };
+        self.flush_sink_output(sink);
+        result
     }
 
-    /// Look at the next resolver command without consuming it, prioritizing
-    /// watch-set convergence over lookups.
+    /// Deliver pending control-plane output through the sink.
     ///
-    /// The command is not marked as emitted, so an embedding whose channel
-    /// turns out to be full simply drops the value and tries again on the next
-    /// pass. Commit it with [`Self::resolver_command_sent`] once the embedding
-    /// has actually accepted it.
-    ///
-    /// Constrained runtimes must not await a full command channel, because the
-    /// resolver's own TCP packets travel through the same tunnel loop. Peeking
-    /// before a non-blocking send lets them decline a command without the core
-    /// having to unwind state it already changed.
-    pub fn peek_resolver_command(&self) -> Option<ResolverCommand> {
-        if let Some(public_key) = self.pending_unwatches.last() {
-            return Some(ResolverCommand::Unwatch(*public_key));
+    /// Peer releases are observations, so they are emitted first through
+    /// [`crate::Sink::event`]. Resolver requests use the non-blocking acceptance
+    /// callback: a rejected request remains queued and stops this pass.
+    pub(super) fn flush_sink_output<E: Sink>(&mut self, sink: &mut E) {
+        while let Some(public_key) = self.pending_peer_evictions.pop() {
+            sink.event(crate::Event::PeerEvicted { public_key });
+            debug!("emitted peer eviction event");
         }
-        let pending = self.resolves.iter().find(|resolve| !resolve.emitted)?;
-        Some(ResolverCommand::Resolve(ResolveRequest {
-            id: pending.id,
-            query: pending.query,
-        }))
-    }
 
-    /// Commit a command returned by [`Self::peek_resolver_command`] after the
-    /// embedding has accepted it.
-    ///
-    /// Committing a command the core no longer holds is a no-op, so a late or
-    /// duplicated commit cannot corrupt watch-set state.
-    pub fn resolver_command_sent(&mut self, command: &ResolverCommand) {
-        match command {
-            ResolverCommand::Resolve(request) => {
-                if let Some(resolve) = self
-                    .resolves
-                    .iter_mut()
-                    .find(|resolve| resolve.id == request.id())
-                {
-                    resolve.emitted = true;
-                    debug!("emitted resolver request: id={}", request.id().0);
-                }
+        loop {
+            let Some(pos) = self.resolves.iter().position(|resolve| !resolve.emitted) else {
+                return;
+            };
+            let pending = self.resolves[pos];
+            let request = ResolveRequest {
+                id: pending.id,
+                query: pending.query,
+            };
+            if !sink.resolve(request) {
+                return;
             }
-            ResolverCommand::Unwatch(public_key) => {
-                if let Some(index) = self
-                    .pending_unwatches
-                    .iter()
-                    .position(|queued| queued == public_key)
-                {
-                    self.pending_unwatches.swap_remove(index);
-                }
+            if let Some(resolve) = self.resolves.get_mut(pos) {
+                // The entry can only disappear while the core itself is running,
+                // and sink resolver callbacks are synchronous/non-reentrant.
+                resolve.emitted = true;
             }
+            debug!("emitted resolver request: id={}", request.id().0);
         }
-    }
-
-    /// Take one pending watch-set removal.
-    pub fn next_unwatch(&mut self) -> Option<[u8; 32]> {
-        self.pending_unwatches.pop()
-    }
-
-    /// Take the next peer-resolution request produced by the core.
-    ///
-    /// Requests are owned values and are emitted separately from [`Sink`],
-    /// which is reserved for borrowed packet output. The caller
-    /// should retain the request and eventually return its completion through
-    /// [`crate::Core::resolve_completed`].
-    pub fn next_resolve_request(&mut self) -> Option<ResolveRequest> {
-        let pending = self.resolves.iter_mut().find(|resolve| !resolve.emitted)?;
-        pending.emitted = true;
-        debug!("emitting resolver request: id={}", pending.id.0);
-        Some(ResolveRequest {
-            id: pending.id,
-            query: pending.query,
-        })
     }
 
     /// Park an unrouted outbound packet behind a deduplicated address lookup.
@@ -725,7 +679,7 @@ impl<
     fn push_reconcile(&mut self, pending: PendingReconcile) -> Result<(), Error> {
         #[cfg(feature = "alloc")]
         {
-            if self.pending_reconciles.len() >= P {
+            if self.pending_reconciles.len() >= MAX_PEERS {
                 return Err(Error::ResolverBusy);
             }
             self.pending_reconciles.push(pending);
@@ -879,7 +833,8 @@ impl<
                     {
                         // A freshly admitted peer has no usable old route set.
                         // Remove it entirely rather than retaining a partial
-                        // record; eviction also queues the required unwatch.
+                        // record; eviction reports that the resolver watch must
+                        // be released.
                         if installed_new {
                             self.evict_peer(pidx)?;
                         }
@@ -1033,9 +988,9 @@ impl<
     /// failed multi-victim admission from causing partial churn. Returns
     /// [`Error::RouteCacheFull`] when no safe plan can fit the full set.
     ///
-    /// Sizing note: `RT` is exactly `P * MAX_PEER_ADDRESSES` in the host
+    /// Sizing note: `MAX_ROUTES` is exactly `MAX_PEERS * MAX_PEER_ADDRESSES` in the host
     /// runner, so eviction is normally unnecessary there. The embassy profile
-    /// is deliberately oversubscribed (`PEERS = 8`, `ROUTES = 16`).
+    /// is deliberately oversubscribed (`MAX_PEERS = 8`, `MAX_ROUTES = 16`).
     fn replace_dynamic_routes(
         &mut self,
         pidx: PeerIdx,
@@ -1057,7 +1012,7 @@ impl<
             // Without this preflight, an answer requiring multiple victims
             // could evict one legitimate peer, exhaust the global budget on
             // the next, and then fail to install at all.
-            let mut victims = [None; P];
+            let mut victims = [None; MAX_PEERS];
             let mut victim_count = 0usize;
             let mut reclaimed_slots = 0usize;
             while reclaimed_slots < shortage {
@@ -1181,7 +1136,7 @@ impl<
             push_peer_address(&mut addresses, cidr).map_err(|_| Error::InvalidResolverAnswer)?;
         }
         #[cfg(feature = "alloc")]
-        if addresses.len() > RT {
+        if addresses.len() > MAX_ROUTES {
             return Err(Error::InvalidResolverAnswer);
         }
         info.addresses = addresses;
@@ -1381,7 +1336,7 @@ impl<
         // monotonicity of initiators bounds the damage.
         let route_shortage = Self::required_route_slots(&info.addresses)
             .saturating_sub(self.routes.available_slots());
-        let selected = [None; P];
+        let selected = [None; MAX_PEERS];
         let Some(i) = self
             .capacity_victim_excluding(now, None, &selected, 0, route_shortage)
             .map(|pidx| pidx as usize)
@@ -1429,7 +1384,7 @@ impl<
         &self,
         now: Instant,
         exclude: Option<PeerIdx>,
-        selected: &[Option<PeerIdx>; P],
+        selected: &[Option<PeerIdx>; MAX_PEERS],
         selected_len: usize,
         minimum_routes_to_free: usize,
     ) -> Option<PeerIdx> {
@@ -1582,32 +1537,36 @@ impl<
         self.firewall.remove_peer(pidx);
         self.pending.drop_if(|p| p.wait == Wait::Handshake(pidx));
         if !peer.is_pinned() {
-            self.queue_unwatch(peer.public_key);
+            self.queue_peer_evicted(peer.public_key);
         }
         Ok(())
     }
 
-    /// Release the subscription created by an answer the core did not keep.
+    /// Report release of the subscription created by an answer the core did
+    /// not keep.
     ///
     /// Resolver integrations establish the watch before returning a positive
     /// answer to the core. When admission, policy, or capacity says no, that
     /// subscription would otherwise outlive every local trace of the peer.
     fn discard_answer(&mut self, public_key: &[u8; 32]) {
-        if self.find_peer(public_key).is_some() {
-            return;
-        }
-        self.queue_unwatch(*public_key);
+        // A positive resolver completion has already established a watch for
+        // this key. If this particular answer is rejected, release that watch
+        // even when an older local record for the same key is still retained.
+        // Reconciliation can establish a fresh watch later; keeping the rejected
+        // answer's watch would leave resolver-side state that the core explicitly
+        // declined to accept.
+        self.queue_peer_evicted(*public_key);
     }
 
-    fn queue_unwatch(&mut self, public_key: [u8; 32]) {
-        if self.pending_unwatches.contains(&public_key) {
+    fn queue_peer_evicted(&mut self, public_key: [u8; 32]) {
+        if self.pending_peer_evictions.contains(&public_key) {
             return;
         }
         #[cfg(feature = "alloc")]
-        self.pending_unwatches.push(public_key);
+        self.pending_peer_evictions.push(public_key);
         #[cfg(not(feature = "alloc"))]
         {
-            let _ = self.pending_unwatches.push(public_key);
+            let _ = self.pending_peer_evictions.push(public_key);
         }
     }
 
@@ -1720,10 +1679,10 @@ mod tests {
     use core::net::Ipv4Addr;
 
     use super::*;
-    use crate::{IpNet, push_peer_address};
+    use crate::{IpCidr, push_peer_address};
 
-    fn net4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpNet {
-        // `IpNet` is canonical by construction, so build through `IpInet`
+    fn net4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpCidr {
+        // `IpCidr` is canonical by construction, so build through `IpInet`
         // (which tolerates host bits) and take its network. That keeps the
         // host-bit cases these tests deliberately exercise expressible.
         crate::IpInet::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), len)
