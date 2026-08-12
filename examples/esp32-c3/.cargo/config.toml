@@ -28,5 +28,5 @@ MICROTUN_API_SERVER_TUNNEL_ADDR = "100.64.0.1"
 # MICROTUN_NTP_SERVER = "time.google.com"
 # MICROTUN_NTP_PORT = "123"
 
-[unstable]
-build-std = ["alloc", "core"]
+# [unstable]
+# build-std = ["alloc", "core"]
