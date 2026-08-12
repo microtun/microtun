@@ -344,7 +344,7 @@ impl Inner {
         let tx = SocketBuffer::new(vec![0; TCP_TX_BUFFER]);
         let mut socket = Socket::new(rx, tx);
         // Every accepted RPC connection inherits these settings from the
-        // listening socket. Keep-alives make an otherwise quiet watch session
+        // listening socket. Keep-alives make an otherwise quiet Peers API session
         // observable, and the timeout reclaims peers that disappear without a
         // FIN/RST (for example, an MCU reset).
         socket.set_keep_alive(Some(TCP_KEEP_ALIVE));

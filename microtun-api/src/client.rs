@@ -3,7 +3,7 @@
 //! The protocol-facing API is shared by embedded and Tokio integrations.
 //! [`Connection`] is the allocation-free `embedded-io-async` connection type;
 //! enabling `tokio-client` additionally exposes [`TokioConnection`], which uses
-//! the JSON-RPC crate's Tokio adapter while keeping the same lookup/watch API.
+//! the JSON-RPC crate's Tokio adapter while keeping the same lookup API.
 //!
 //! Keeping the transport features additive is important because Cargo unifies
 //! features when `microtun-std` and `microtun-embassy` are built in one graph.
@@ -25,8 +25,8 @@ pub type TokioConnection<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_S
     Connection<TokioIo<R>, TokioIo<W>, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>;
 
 use crate::{
-    Error, KeyParams, LookupResult, METHOD_CHANGED, METHOD_UNWATCH, METHOD_WATCH, QueryText,
-    classify_result, decode_key, encode_key, encode_query,
+    Error, KeyParams, LookupResult, METHOD_CHANGED, METHOD_REMOVED, QueryText, classify_result,
+    decode_key, encode_query,
 };
 
 /// Failure produced while issuing a typed Peers API operation.
@@ -36,7 +36,7 @@ pub enum ClientError {
     Codec(Error),
     /// The JSON-RPC transport or remote endpoint rejected the operation.
     Rpc(RpcError),
-    /// A by-key or watch response named a key other than the requested one.
+    /// A by-key response named a key other than the requested one.
     UnexpectedPublicKey {
         /// Key the operation requested.
         expected: [u8; 32],
@@ -57,7 +57,7 @@ impl From<RpcError> for ClientError {
     }
 }
 
-/// Collects public keys named by `v1.peer.changed` notifications.
+/// Collects public keys named by `v1.peer.changed` and `v1.peer.removed` notifications.
 ///
 /// `MAX_CHANGES` is the maximum number of queued changes on allocation-free
 /// builds. With `alloc`, the queue grows as needed and `MAX_CHANGES` is
@@ -67,26 +67,26 @@ impl From<RpcError> for ClientError {
 #[derive(Debug, Default)]
 pub struct ChangeHandler<const MAX_CHANGES: usize = 0> {
     #[cfg(feature = "alloc")]
-    changed: alloc::collections::VecDeque<[u8; 32]>,
+    invalidated: alloc::collections::VecDeque<[u8; 32]>,
     #[cfg(not(feature = "alloc"))]
-    changed: Vec<[u8; 32], MAX_CHANGES>,
+    invalidated: Vec<[u8; 32], MAX_CHANGES>,
     #[cfg(not(feature = "alloc"))]
     overflowed: bool,
 }
 
 impl<const MAX_CHANGES: usize> ChangeHandler<MAX_CHANGES> {
     /// Pop the next coalesced invalidated key.
-    pub fn take_changed(&mut self) -> Option<[u8; 32]> {
+    pub fn take_invalidated(&mut self) -> Option<[u8; 32]> {
         #[cfg(feature = "alloc")]
         {
-            self.changed.pop_front()
+            self.invalidated.pop_front()
         }
         #[cfg(not(feature = "alloc"))]
         {
-            if self.changed.is_empty() {
+            if self.invalidated.is_empty() {
                 None
             } else {
-                Some(self.changed.swap_remove(0))
+                Some(self.invalidated.swap_remove(0))
             }
         }
     }
@@ -94,11 +94,15 @@ impl<const MAX_CHANGES: usize> ChangeHandler<MAX_CHANGES> {
     /// Drop any queued invalidation for a key the client no longer holds.
     pub fn forget(&mut self, public_key: [u8; 32]) {
         #[cfg(feature = "alloc")]
-        self.changed.retain(|queued| *queued != public_key);
+        self.invalidated.retain(|queued| *queued != public_key);
 
         #[cfg(not(feature = "alloc"))]
-        if let Some(index) = self.changed.iter().position(|queued| *queued == public_key) {
-            self.changed.swap_remove(index);
+        if let Some(index) = self
+            .invalidated
+            .iter()
+            .position(|queued| *queued == public_key)
+        {
+            self.invalidated.swap_remove(index);
         }
     }
 
@@ -116,26 +120,26 @@ impl<const MAX_CHANGES: usize> ChangeHandler<MAX_CHANGES> {
         }
     }
 
-    fn push_changed(&mut self, public_key: [u8; 32]) {
-        if self.changed.contains(&public_key) {
+    fn push_invalidated(&mut self, public_key: [u8; 32]) {
+        if self.invalidated.contains(&public_key) {
             return;
         }
 
         #[cfg(feature = "alloc")]
-        self.changed.push_back(public_key);
+        self.invalidated.push_back(public_key);
 
         #[cfg(not(feature = "alloc"))]
-        if self.changed.push(public_key).is_err() {
+        if self.invalidated.push(public_key).is_err() {
             self.overflowed = true;
         }
     }
 }
 
-fn decode_changed_notification(
+fn decode_invalidation_notification(
     method: &str,
     params: microtun_jsonrpc::Params<'_>,
 ) -> Option<[u8; 32]> {
-    if method != METHOD_CHANGED {
+    if method != METHOD_CHANGED && method != METHOD_REMOVED {
         return None;
     }
     let args = params.parse::<KeyParams<'_>>().ok()?;
@@ -153,8 +157,8 @@ impl<const MAX_CHANGES: usize> microtun_jsonrpc::Handler for ChangeHandler<MAX_C
     }
 
     fn handle_notification(&mut self, method: &str, params: microtun_jsonrpc::Params<'_>) {
-        if let Some(public_key) = decode_changed_notification(method, params) {
-            self.push_changed(public_key);
+        if let Some(public_key) = decode_invalidation_notification(method, params) {
+            self.push_invalidated(public_key);
         }
     }
 }
@@ -203,42 +207,6 @@ where
     H: Handler,
 {
     lookup(connection, ResolveQuery::ByDstAddress(address)).await
-}
-
-/// Atomically subscribe to one public key and return its current state.
-pub async fn watch<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(
-    connection: &mut Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>,
-    public_key: [u8; 32],
-) -> Result<ResolveOutcome, ClientError>
-where
-    R: Read,
-    W: Write,
-    H: Handler,
-{
-    let text = encode_key(&public_key);
-    let params = KeyParams {
-        public_key: text.as_str(),
-    };
-    let outcome = call_result(connection, METHOD_WATCH, &params).await?;
-    validate_public_key(outcome, Some(public_key))
-}
-
-/// Best-effort removal of one key from the connection watch set.
-pub async fn unwatch<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(
-    connection: &mut Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>,
-    public_key: [u8; 32],
-) -> Result<(), ClientError>
-where
-    R: Read,
-    W: Write,
-    H: Handler,
-{
-    let text = encode_key(&public_key);
-    let params = KeyParams {
-        public_key: text.as_str(),
-    };
-    connection.notify(METHOD_UNWATCH, Some(&params)).await?;
-    Ok(())
 }
 
 async fn call_result<R, W, H, P, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(

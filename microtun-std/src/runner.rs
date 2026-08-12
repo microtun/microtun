@@ -151,7 +151,7 @@ struct TunnelSink<'a, D> {
     outer: &'a tokio::net::UdpSocket,
     observer: &'a dyn TunnelObserver,
     resolver_commands: &'a mpsc::Sender<ResolverCommand>,
-    pending_unwatches: &'a mut VecDeque<[u8; 32]>,
+    pending_forgets: &'a mut VecDeque<[u8; 32]>,
 }
 
 impl<'a, D> TunnelSink<'a, D> {
@@ -160,27 +160,27 @@ impl<'a, D> TunnelSink<'a, D> {
         outer: &'a tokio::net::UdpSocket,
         observer: &'a dyn TunnelObserver,
         resolver_commands: &'a mpsc::Sender<ResolverCommand>,
-        pending_unwatches: &'a mut VecDeque<[u8; 32]>,
+        pending_forgets: &'a mut VecDeque<[u8; 32]>,
     ) -> Self {
         Self {
             device,
             outer,
             observer,
             resolver_commands,
-            pending_unwatches,
+            pending_forgets,
         }
     }
 
-    fn flush_unwatches(&mut self) -> bool {
-        while let Some(public_key) = self.pending_unwatches.front().copied() {
+    fn flush_forgets(&mut self) -> bool {
+        while let Some(public_key) = self.pending_forgets.front().copied() {
             if self
                 .resolver_commands
-                .try_send(ResolverCommand::Unwatch(public_key))
+                .try_send(ResolverCommand::Forget(public_key))
                 .is_err()
             {
                 return false;
             }
-            self.pending_unwatches.pop_front();
+            self.pending_forgets.pop_front();
         }
         true
     }
@@ -230,7 +230,7 @@ impl<D: TunnelDevice> Sink for TunnelSink<'_, D> {
     }
 
     fn resolve(&mut self, request: ResolveRequest) -> bool {
-        self.flush_unwatches()
+        self.flush_forgets()
             && self
                 .resolver_commands
                 .try_send(ResolverCommand::Resolve(request))
@@ -239,13 +239,13 @@ impl<D: TunnelDevice> Sink for TunnelSink<'_, D> {
 
     fn event(&mut self, event: Event) {
         if let Event::PeerEvicted { public_key } = event {
-            if !self.flush_unwatches()
+            if !self.flush_forgets()
                 || self
                     .resolver_commands
-                    .try_send(ResolverCommand::Unwatch(public_key))
+                    .try_send(ResolverCommand::Forget(public_key))
                     .is_err()
             {
-                self.pending_unwatches.push_back(public_key);
+                self.pending_forgets.push_back(public_key);
             }
         }
         self.observer.event(event);
@@ -337,9 +337,9 @@ where
     /// Run the tunnel until `shutdown` completes or an I/O task fails.
     ///
     /// A resolver task is created automatically. One long-lived Peers API server
-    /// connection carries ordinary lookups and dynamic-peer watch updates.
+    /// connection carries ordinary lookups and dynamic-peer change updates.
     /// Resolve requests use the sink's non-blocking acceptance callback; peer
-    /// eviction events are translated into unwatch commands and retained by the
+    /// eviction events are translated into forget commands and retained by the
     /// runner until the bounded resolver channel accepts them.
     pub async fn run<S, T>(self, resolver: PeersApiResolver<T>, shutdown: S) -> Result<(), Error>
     where
@@ -374,7 +374,7 @@ where
     ///
     /// This mirrors the explicit task wiring exposed by `microtun-embassy` and
     /// is useful for custom resolvers. The command sender must be bounded:
-    /// resolve requests are accepted non-blockingly, while unwatch commands are
+    /// resolve requests are accepted non-blockingly, while forget commands are
     /// derived from peer-eviction events and retried by the runner if needed.
     pub async fn run_with_resolver_task<S>(
         mut self,
@@ -388,7 +388,7 @@ where
     {
         let mut inner_packet = vec![0u8; MAX_IP_PACKET_SIZE];
         let mut outer_datagram = vec![0u8; OUTER_RECV_SIZE];
-        let mut pending_unwatches = VecDeque::new();
+        let mut pending_forgets = VecDeque::new();
 
         let engine = &mut self.engine;
         let device = &self.device;
@@ -433,7 +433,7 @@ where
                                     outer,
                                     observer,
                                     &resolve_tx,
-                                    &mut pending_unwatches,
+                                    &mut pending_forgets,
                                 );
                                 if let Err(error) = engine
                                     .receive_outer(
@@ -469,7 +469,7 @@ where
                         outer,
                         observer,
                         &resolve_tx,
-                        &mut pending_unwatches,
+                        &mut pending_forgets,
                     );
                     if let Err(error) = engine
                         .send_inner(
@@ -488,7 +488,7 @@ where
                         outer,
                         observer,
                         &resolve_tx,
-                        &mut pending_unwatches,
+                        &mut pending_forgets,
                     );
                     if let Err(error) = engine
                         .resolver_event_completed(now(clock_base), response, &mut sink)
@@ -505,7 +505,7 @@ where
                         outer,
                         observer,
                         &resolve_tx,
-                        &mut pending_unwatches,
+                        &mut pending_forgets,
                     );
                     if !engine.handle_timeout(fired_at, &mut sink).await {
                         log::trace!("core protocol timer had no due work");
@@ -531,14 +531,14 @@ where
                 }
             }
 
-            while let Some(public_key) = pending_unwatches.front().copied() {
+            while let Some(public_key) = pending_forgets.front().copied() {
                 if resolve_tx
-                    .try_send(ResolverCommand::Unwatch(public_key))
+                    .try_send(ResolverCommand::Forget(public_key))
                     .is_err()
                 {
                     break;
                 }
-                pending_unwatches.pop_front();
+                pending_forgets.pop_front();
             }
         }
     }

@@ -23,9 +23,10 @@
 //!   DNS, static addressing, etc. for free.
 //! * Peer resolution runs in a second task, [`resolver_task`], joined with
 //!   the tunnel loop via [`embassy_futures::join`]. One persistent JSON-RPC
-//!   connection over the **inner** stack carries lookups, watch mutations, and
-//!   pushed peer snapshots, so the only bootstrap dependency is the pinned
-//!   Peers API server peer. Reconnect replays the complete desired watch set.
+//!   connection over the **inner** stack carries lookups and pushed
+//!   `v1.peer.changed` / `v1.peer.removed` broadcasts, so the only bootstrap
+//!   dependency is the pinned Peers API server peer. Reconnect re-looks up every
+//!   peer the core still holds.
 //!
 //! ## Allocator-backed core state
 //!

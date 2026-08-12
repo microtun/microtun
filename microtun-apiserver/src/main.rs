@@ -45,7 +45,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::{
     registry::SharedRegistry,
-    rpc::{AppState, Connection, serve_connection},
+    rpc::{AppState, serve_connection},
     smoltcp_net::{SmolTcpListener, SmolTcpNic},
 };
 
@@ -231,8 +231,7 @@ async fn accept_loop(
             tracing::warn!("dropping virtual TCP connection without authenticated peer metadata");
             continue;
         };
-        let connection = Connection::new(peer_key);
-        tokio::spawn(serve_connection(stream, Arc::clone(&state), connection));
+        tokio::spawn(serve_connection(stream, Arc::clone(&state), peer_key));
     }
 }
 

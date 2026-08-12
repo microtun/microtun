@@ -13,7 +13,7 @@
 //!
 //! * encrypted datagrams from a Tokio UDP socket,
 //! * plaintext packets received from the supplied tunnel device,
-//! * Peers API resolver lookup completions and watched-peer updates, and
+//! * Peers API resolver lookup completions and peer-change updates, and
 //! * the core's next timer deadline.
 //!
 //! This crate enables `microtun-core/async`, and packet outputs are awaited
@@ -21,14 +21,14 @@
 //! queue. Resolver requests arrive through [`microtun_core::Sink::resolve`] and
 //! are forwarded to the resolver task with a non-blocking bounded-channel send.
 //! Dynamic peer releases arrive as [`microtun_core::Event::PeerEvicted`] sink
-//! events; the runner translates those observations into `v1.peer.unwatch`
-//! commands, retaining them locally if the resolver channel is temporarily
-//! full. The tunnel loop therefore never awaits resolver-channel capacity on
+//! events; the runner forwards local forget commands to the resolver, retaining
+//! them locally if the resolver channel is temporarily full. The tunnel loop therefore never awaits resolver-channel capacity on
 //! the packet path.
 //!
-//! Lookups, watch mutations, and pushed peer updates share one continuously
-//! serviced JSON-RPC stream to the Peers API server's inner address. After reconnect
-//! the resolver replays the complete watch set on that same stream. Opening the
+//! Lookups and pushed `v1.peer.changed` / `v1.peer.removed` broadcasts share
+//! one continuously serviced JSON-RPC stream to the Peers API server's inner
+//! address. After
+//! reconnect the resolver re-looks up every peer the core still holds. Opening the
 //! stream is the caller's job — see [`PeersApiTransport`] and the security notes on
 //! [`PeersApiResolver`].
 

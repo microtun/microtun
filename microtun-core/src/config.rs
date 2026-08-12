@@ -2,7 +2,7 @@
 //!
 //! Pinned peers are the bootstrap peers of a microtun deployment. They are
 //! loaded at init, can never be evicted, and their tunnel address prefixes
-//! live in the route cache without a resolver watch or polling deadline.
+//! live in the route cache without a pushed-change feed or polling deadline.
 
 use core::net::SocketAddr;
 

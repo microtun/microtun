@@ -1,13 +1,13 @@
 //! Pacing jitter for reconnect and reconciliation bursts.
 //!
 //! Registry churn is a *synchronised* event: one reload invalidates a key for
-//! every client watching it at the same instant, and one Peers API server restart
+//! every interested client at the same instant, and one Peers API server restart
 //! drops every client's connection at the same instant. Without jitter each
 //! population answers in lockstep, so the server sees the whole fleet's
 //! refresh traffic inside one round-trip window rather than spread across the
 //! recovery interval. The Peers API therefore requires clients to spread both
-//! reconnect attempts and change-driven refresh bursts (see `docs/peers-api.md`
-//! §11.3).
+//! reconnect attempts and change-driven refresh bursts (see `docs/microtun-peers-api.md`
+//! §10.3).
 //!
 //! This is pacing, not cryptography, so the generator is [`rand`]'s
 //! [`SmallRng`] — fast, `no_std`, and 16 bytes of state on the 32-bit targets
@@ -28,7 +28,7 @@ use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
 
 /// Width of the window a change-driven reconciliation burst is spread over.
 ///
-/// A client that has queued refreshes because of `v1.peer.changed` waits a
+/// A client that has queued refreshes because of peer invalidations waits a
 /// uniformly random part of this window before issuing the first one. One
 /// reload therefore arrives at the server spread over a second rather than as
 /// a single spike. Reconnect replay is *not* delayed by this window: it is

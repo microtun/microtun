@@ -96,8 +96,8 @@ fn server_addresses(loaded: &Loaded) -> Result<Vec<IpCidr>, String> {
 /// Run the published-state resolver until its request channel is closed.
 ///
 /// A successful reload replaces the registry used by both this task and the
-/// RPC handlers. Watched peers are refreshed immediately from the resulting
-/// peer-level change stream; a lagged subscriber reconciles its complete watch
+/// RPC handlers. Locally held peers are refreshed immediately from the resulting
+/// peer-level change stream; a lagged subscriber reconciles its complete held
 /// set from the latest registry snapshot.
 pub async fn task(
     config_path: PathBuf,
@@ -110,7 +110,7 @@ pub async fn task(
     let mut interval = tokio::time::interval(RELOAD_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut changes = registry.subscribe();
-    let mut watched = HashSet::new();
+    let mut held = HashSet::new();
 
     loop {
         tokio::select! {
@@ -123,24 +123,24 @@ pub async fn task(
                         let query = request.query();
                         let outcome = resolve_shared(&registry, query, fixed.public_key);
                         // The core-facing resolver contract requires a positive
-                        // answer to remain watched. This local resolver tracks
-                        // that directly; remote clients use explicit v1.peer.watch.
+                        // answer to remain tracked. This local resolver and remote
+                        // clients both keep that interest locally.
                         if let ResolveOutcome::Found(peer) = &outcome {
-                            watched.insert(peer.public_key);
+                            held.insert(peer.public_key);
                         }
                         let response = request.complete(outcome);
                         if events.send(ResolverEvent::Resolved(response)).await.is_err() {
                             return;
                         }
                     }
-                    ResolverCommand::Unwatch(public_key) => {
-                        watched.remove(&public_key);
+                    ResolverCommand::Forget(public_key) => {
+                        held.remove(&public_key);
                     }
                 }
             }
             change = changes.recv() => {
                 match change {
-                    Ok(change) if watched.contains(&change.public_key) => {
+                    Ok(change) if held.contains(&change.public_key) => {
                         if send_update(
                             &events,
                             &registry,
@@ -155,7 +155,7 @@ pub async fn task(
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        for public_key in watched.iter().copied().collect::<Vec<_>>() {
+                        for public_key in held.iter().copied().collect::<Vec<_>>() {
                             if send_update(
                                 &events,
                                 &registry,

@@ -10,32 +10,25 @@
 //! ```text
 //! --> {"jsonrpc":"2.0","id":1,"method":"v1.peer.by_key","params":{"public_key":"<base64>"}}
 //! --> {"jsonrpc":"2.0","id":2,"method":"v1.peer.by_address","params":{"address":"10.0.0.5"}}
-//! --> {"jsonrpc":"2.0","id":3,"method":"v1.peer.watch","params":{"public_key":"<base64>"}}
-//! --> {"jsonrpc":"2.0","method":"v1.peer.unwatch","params":{"public_key":"<base64>"}}
 //! <-- {"jsonrpc":"2.0","id":1,"result":{"found":{ ...record... }}}
 //! <-- {"jsonrpc":"2.0","id":2,"result":{"not_found":{}}}     // authoritatively unknown
 //! <-- {"jsonrpc":"2.0","id":2,"error":{...}}                  // transient failure
-//! <-- {"jsonrpc":"2.0","id":3,"result":{"found":{ ...record... }}}
 //! <-- {"jsonrpc":"2.0","method":"v1.peer.changed","params":{"public_key":"<base64>"}}
+//! <-- {"jsonrpc":"2.0","method":"v1.peer.removed","params":{"public_key":"<base64>"}}
 //! ```
 //!
 //! Both lookups answer questions about *another* peer; the caller's own
 //! identity is fixed by the connection and is never a parameter.
 //!
-//! Lookups are side-effect free. A client that wants to keep a returned record
-//! current explicitly calls `v1.peer.watch` for its public key. `v1.peer.watch`
-//! atomically installs the subscription and returns the current by-key
-//! [`LookupResult`], closing the race between learning a record and subscribing
-//! to changes.
+//! Lookups are side-effect free. The server broadcasts `v1.peer.changed` when
+//! a peer is added or its effective record changes, and `v1.peer.removed` when
+//! a peer disappears. Both notifications name only the public key: clients that
+//! currently care about that key answer either invalidation with an ordinary
+//! `v1.peer.by_key` lookup, while all other clients ignore it. There is no
+//! per-connection peer subscription state.
 //!
-//! When a watched record
-//! changes or disappears the server sends `v1.peer.changed`, which names a key and
-//! carries nothing else: it means *whatever you hold for this key may no
-//! longer be current*. The client answers it with an ordinary `v1.peer.by_key`,
-//! whose result is the new record or the `{"not_found":{}}` variant
-//! that authoritatively removes the peer. A reconnecting client replays
-//! `v1.peer.watch` for every record it still holds, which both reconciles its
-//! state and re-establishes every subscription.
+//! A reconnecting client re-looks up the records it still holds. This reconciles
+//! any changes whose notifications were lost with the old connection.
 //!
 //! # `not_found` answers a question about the registry, and nothing else
 //!
@@ -51,20 +44,14 @@
 //!   caller that cannot spell a key has learned nothing about who exists.
 //!
 //! Both are transient in the client's classification, so an installed record
-//! survives them. See `docs/peers-api.md` §3.2 and §11.2.
+//! survives them. See `docs/microtun-peers-api.md` §3.2 and §10.2.
 //!
-//! A notification with no payload cannot be stale, so it cannot be reordered
-//! into a stale install. That is the whole reason it carries no record: a
-//! record on the wire twice, from two snapshots, would oblige the server to
-//! order responses against notifications — a guarantee that is invisible when
-//! violated and undetectable by the client. Omitting it also merges
-//! authoritative removal into the ordinary `not_found` lookup result. The price is
-//! one round trip per changed key.
-//!
-//! `v1.peer.watch` and `v1.peer.unwatch` are the explicit watch-set operations.
-//! `v1.peer.unwatch` is still safe to treat as best-effort: a stale notification
-//! can race an eviction, so clients must ignore notifications for records they
-//! no longer hold.
+//! Notifications carry no peer record and are treated as invalidations rather
+//! than authoritative replacement state. Even `v1.peer.removed` is confirmed
+//! through `v1.peer.by_key`, which makes remove/re-add and in-flight lookup races
+//! converge on the registry's current state. The price is one round trip for
+//! each invalidated peer a client actually holds; unrelated broadcasts are
+//! discarded locally without a lookup.
 //!
 //! # One shape per outcome
 //!
@@ -132,24 +119,20 @@ use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 pub const METHOD_BY_KEY: &str = "v1.peer.by_key";
 /// Resolve the peer that owns a tunnel address (longest prefix wins).
 pub const METHOD_BY_ADDRESS: &str = "v1.peer.by_address";
-/// Start watching one peer record by static public key.
+/// Server-to-client notice that one peer's state may have changed. This is a
+/// broadcast notification and carries the key and nothing else. Clients that
+/// currently hold that peer answer it with an ordinary [`METHOD_BY_KEY`]
+/// lookup; clients that do not care about the key ignore it.
 ///
-/// This is a request, not a notification. The server adds the key to the
-/// connection watch set and reads the current record in one registry critical
-/// section, then returns a [`LookupResult`]. A `found` response therefore
-/// establishes both the initial state and the subscription without a race.
-pub const METHOD_WATCH: &str = "v1.peer.watch";
-/// Stop watching one peer record by static public key. This is a notification.
-pub const METHOD_UNWATCH: &str = "v1.peer.unwatch";
-/// Server-to-client notice that a watched key's state may have changed. This
-/// is a notification, and it carries the key and nothing else: the client
-/// answers it with an ordinary [`METHOD_BY_KEY`] lookup.
-///
-/// The name states what the server observed, not what the client should
-/// conclude. The server knows only that the record is no longer the one the
-/// client was last told about; whether that is a modification or a removal is
-/// settled by the re-lookup, not by this notification.
+/// This method identifies an observed add/modify transition. The re-lookup is
+/// still authoritative about the peer's current state, so a later removal can
+/// safely race this notification.
 pub const METHOD_CHANGED: &str = "v1.peer.changed";
+/// Server-to-client notice that a peer disappeared from the published registry.
+/// Like [`METHOD_CHANGED`], this is a key-only invalidation: interested clients
+/// confirm the current state with [`METHOD_BY_KEY`] rather than treating the
+/// notification itself as replacement state.
+pub const METHOD_REMOVED: &str = "v1.peer.removed";
 
 // ---------------------------------------------------------------------------
 // Application error codes
@@ -197,9 +180,9 @@ pub const RECORD_FRAME_LEN: usize = 1024;
 
 /// Frame buffer size for small control traffic.
 ///
-/// Lookup, watch, and unwatch messages carry a method name and one short string. This
-/// also has to fit the small error responses each side emits for malformed
-/// traffic. Watch updates travel in the record direction, not this one.
+/// Lookup messages carry a method name and one short string. This also has to
+/// fit the small error responses each side emits for malformed traffic. Peer
+/// invalidation notifications travel in the record direction, not this one.
 pub const QUERY_FRAME_LEN: usize = 256;
 
 /// Scratch capacity for a rendered query argument: a base64 key (44) or a
@@ -230,9 +213,9 @@ pub enum Error {
 
 /// Parameters of every message that names one peer key.
 ///
-/// [`METHOD_BY_KEY`], [`METHOD_WATCH`], [`METHOD_UNWATCH`], and
-/// [`METHOD_CHANGED`] all carry the same single-member object, so they share one
-/// identical type. The key borrows from the frame it was read out of.
+/// [`METHOD_BY_KEY`], [`METHOD_CHANGED`], and [`METHOD_REMOVED`] carry the same
+/// single-member object, so they share one identical type. The key borrows from the frame it was read
+/// out of.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct KeyParams<'a> {
     /// The peer's public key, as WireGuard's base64: 44 characters.
@@ -603,8 +586,8 @@ mod tests {
         assert_eq!(parsed.address, "10.0.0.5");
     }
 
-    /// `v1.peer.by_key`, `v1.peer.watch`, `v1.peer.unwatch`, and `v1.peer.changed` all carry the same
-    /// single-member object, which is why they share one type.
+    /// By-key lookups and both peer invalidations carry the same single-member object,
+    /// which is why they share one type.
     #[test]
     fn key_params_round_trip() {
         let params = KeyParams {
@@ -625,18 +608,20 @@ mod tests {
         );
     }
 
-    /// A `v1.peer.changed` notification names a key and carries nothing else, so it
-    /// sits far below the frame it shares with lookup responses.
+    /// Peer invalidations name a key and carry nothing else, so they sit far below
+    /// the frame they share with lookup responses.
     #[test]
-    fn changed_notification_fits_the_frame_budget() {
-        let body = format!(
-            r#"{{"jsonrpc":"2.0","method":"v1.peer.changed","params":{{"public_key":"{KEY_B64}"}}}}"#
-        );
-        assert!(
-            body.len() < QUERY_FRAME_LEN,
-            "changed notification frame is {} bytes",
-            body.len()
-        );
+    fn peer_invalidations_fit_the_frame_budget() {
+        for method in [METHOD_CHANGED, METHOD_REMOVED] {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","method":"{method}","params":{{"public_key":"{KEY_B64}"}}}}"#
+            );
+            assert!(
+                body.len() < QUERY_FRAME_LEN,
+                "{method} notification frame is {} bytes",
+                body.len()
+            );
+        }
     }
 
     fn peer_info(body: &str) -> PeerInfo {

@@ -42,22 +42,17 @@ pub const KEY_TEXT_LEN: usize = 44;
 /// decoded are ever copied out.
 const DECODE_SCRATCH_LEN: usize = 33;
 
-/// A key rendered as text.
+/// A key in WireGuard's standard base64: 44 characters ending in `=`.
 ///
 /// Owns its characters, so it can be built and returned on a `no_std` target
-/// with nothing to allocate. `TEXT_LEN` is the length of the encoding: see
-/// [`KeyBase64`], which is currently the only one.
-///
-/// This is only an encoding of bytes the caller already holds. It applies no
-/// secrecy of its own, and a value built from a *private* key will print it —
-/// which is why nothing in this workspace encodes one.
+/// with nothing to allocate. This is only an encoding of bytes the caller
+/// already holds. It applies no secrecy of its own, and a value built from a
+/// *private* key will print it — which is why nothing in this workspace encodes
+/// one.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct KeyText<const TEXT_LEN: usize>([u8; TEXT_LEN]);
+pub struct KeyBase64([u8; KEY_TEXT_LEN]);
 
-/// A key in WireGuard's standard base64: 44 characters ending in `=`.
-pub type KeyBase64 = KeyText<KEY_TEXT_LEN>;
-
-impl<const TEXT_LEN: usize> KeyText<TEXT_LEN> {
+impl KeyBase64 {
     /// The encoded characters.
     pub fn as_str(&self) -> &str {
         // Only alphabet characters and `=` are ever written, so this cannot
@@ -67,19 +62,19 @@ impl<const TEXT_LEN: usize> KeyText<TEXT_LEN> {
     }
 }
 
-impl<const TEXT_LEN: usize> AsRef<str> for KeyText<TEXT_LEN> {
+impl AsRef<str> for KeyBase64 {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-impl<const TEXT_LEN: usize> fmt::Display for KeyText<TEXT_LEN> {
+impl fmt::Display for KeyBase64 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-impl<const TEXT_LEN: usize> fmt::Debug for KeyText<TEXT_LEN> {
+impl fmt::Debug for KeyBase64 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.as_str())
     }
@@ -110,7 +105,7 @@ pub fn encode_key(key: &[u8; 32]) -> KeyBase64 {
         .encode_slice(key, &mut text)
         .expect("KEY_TEXT_LEN is the padded base64 length of 32 bytes");
     debug_assert_eq!(written, KEY_TEXT_LEN);
-    KeyText(text)
+    KeyBase64(text)
 }
 
 /// Decode a key from WireGuard's standard base64.

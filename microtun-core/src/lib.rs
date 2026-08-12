@@ -13,15 +13,12 @@
 //! a handshake initiation) and outbound (destination address not in the route
 //! cache) — cause the engine to emit a [`ResolveRequest`] through [`Sink::resolve`].
 //! The embedding answers later through [`Core::resolver_event_completed`]. Resolver
-//! integrations establish a watch before returning a positive answer (the Peers
-//! API server integration does this with an explicit `v1.peer.watch` request),
-//! then feed unsolicited authoritative snapshots back through
-//! [`Core::resolver_event_completed`]. When the core releases a watched dynamic
-//! peer record it reports [`Event::PeerEvicted`] through [`Sink::event`]; resolver
-//! integrations use that observation to send their corresponding unwatch RPC.
-//! Consuming that event is mandatory for integrations that establish watches:
-//! there is no polling fallback. Authoritative misses use a
-//! short local negative TTL. The Peers API server wire integration — JSON-RPC methods, parameters, and
+//! integrations retain local interest in accepted dynamic peer keys and may feed
+//! unsolicited authoritative updates back through [`Core::resolver_event_completed`].
+//! When the core releases a resolver-backed dynamic peer record it reports
+//! [`Event::PeerEvicted`] through [`Sink::event`]; resolver integrations use that
+//! observation to forget the key locally. No Peers API unsubscribe RPC is needed.
+//! Authoritative misses use a short local negative TTL. The Peers API server wire integration — JSON-RPC methods, parameters, and
 //! record decoding — lives in the separate `microtun-api` crate; nothing in
 //! this one knows how an answer arrived.
 //!
@@ -57,7 +54,7 @@
 //! returns `false`, the core retains that request and retries it on a later
 //! sink-bearing call. Dynamic peer removals are reported as non-blocking events;
 //! the embedding owns any retry/backpressure policy needed to turn those events
-//! into resolver-side unwatch operations. By default the sink packet methods and
+//! into resolver-side local forget operations. By default the sink packet methods and
 //! core stimulus methods are synchronous. Enabling the `async` feature changes
 //! the packet sink methods and core stimulus methods in place to native async
 //! trait methods and async functions; [`Sink::resolve`] and [`Sink::event`]
@@ -289,11 +286,10 @@ pub enum Event {
     },
     /// The core released a resolver-backed dynamic peer record.
     ///
-    /// Resolver integrations that establish a watch before returning a positive
-    /// answer should translate this event into their unwatch operation. It is
-    /// also emitted when such an answer is rejected before admission, because
-    /// the resolver-side watch must still be released even though no peer-table
-    /// entry survived.
+    /// Resolver integrations that retain local interest in positive answers
+    /// should translate this event into their local forget operation. It is also
+    /// emitted when such an answer is rejected before admission, so resolver-side
+    /// interest cannot outlive the core record.
     PeerEvicted {
         /// Static public key identifying the released peer record.
         public_key: [u8; 32],
@@ -450,18 +446,7 @@ struct EvictedPeerGhost {
 /// to 8,128 counters behind the high-water mark. `MAX_ROUTES` sizes both
 /// the route slots and, on allocation-free builds, the prefix-trie storage
 /// needed to index them.
-pub type Core<
-    RNG,
-    RP,
-    const MAX_PEERS: usize,
-    const MAX_SESSIONS: usize,
-    const REPLAY_WORDS: usize,
-    const MAX_ROUTES: usize,
-> = CoreInner<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>;
-
-/// Internal implementation behind [`Core`].
-#[doc(hidden)]
-pub struct CoreInner<
+pub struct Core<
     RNG,
     RP,
     const MAX_PEERS: usize,
@@ -519,7 +504,7 @@ pub struct CoreInner<
     pending_peer_evictions: alloc::vec::Vec<[u8; 32]>,
     /// Records whose reconciliation is owed but not yet in flight.
     ///
-    /// A watched update that cannot be installed — because it did not fit,
+    /// A held-peer update that cannot be installed — because it did not fit,
     /// because it failed policy, or because the lookup itself failed — leaves
     /// the peer holding its previous record. That record is now known to be
     /// possibly stale, so the obligation to ask again has to outlive the
@@ -539,7 +524,7 @@ pub struct CoreInner<
     /// unknown destination keys. Neither caller is authorized, and neither
     /// can be attributed to a source address that is worth limiting, so the
     /// limit is on this device's total outbound query rate. Locally driven
-    /// lookups — an outbound packet to an unrouted address, plus watch
+    /// lookups — an outbound packet to an unrouted address, plus change tracking
     /// maintenance for records we already hold — are not charged.
     remote_resolves: TokenBucket,
     /// Bounds the second DH and timestamp authentication for identities that
@@ -593,7 +578,7 @@ impl<
     const MAX_SESSIONS: usize,
     const REPLAY_WORDS: usize,
     const MAX_ROUTES: usize,
-> core::fmt::Debug for CoreInner<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>
+> core::fmt::Debug for Core<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>
 where
     RP: RelayPolicy,
 {
@@ -620,7 +605,7 @@ impl<
     const MAX_SESSIONS: usize,
     const REPLAY_WORDS: usize,
     const MAX_ROUTES: usize,
-> CoreInner<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>
+> Core<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>
 {
     /// Validate fixed-capacity pool parameters before constructing any table.
     fn validate_pool_parameters() -> Result<(), Error> {
@@ -4088,9 +4073,9 @@ mod tests {
         );
         assert_eq!(net.nodes[1].sink.inner[0], (a_pub, payload.clone()));
 
-        // --- A watched update refreshes the dynamic record --------------------
+        // --- A held-peer update refreshes the dynamic record --------------------
         //
-        // Freshness is delivered by the watch transport, so no timer arms a
+        // Freshness is delivered by the change-broadcast transport, so no timer arms a
         // lookup of its own: nothing is due but the protocol's own deadlines.
         assert!(
             net.nodes[0].next_resolve_request().is_none(),
@@ -4111,7 +4096,7 @@ mod tests {
                 )),
             )
             .await
-            .expect("watched update applied");
+            .expect("held-peer update applied");
         assert_eq!(
             stored_direct_endpoint(&net.nodes[0].core, &b_pub),
             Some(outer(4))
@@ -4152,7 +4137,7 @@ mod tests {
             )),
         )
         .await
-        .expect("watched update applied");
+        .expect("held-peer update applied");
         assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(4)));
 
         // Omission is replacement too: it clears the old endpoint rather than
@@ -4165,7 +4150,7 @@ mod tests {
             )),
         )
         .await
-        .expect("endpoint-clearing watched update applied");
+        .expect("endpoint-clearing held-peer update applied");
         assert_eq!(stored_direct_endpoint(&a.core, &b_pub), None);
 
         a.resolver_event_completed(
@@ -4180,7 +4165,7 @@ mod tests {
         a.core.assert_peer_index_consistent();
     }
 
-    /// A watched update that cannot be installed must change *nothing*.
+    /// A held-peer update that cannot be installed must change *nothing*.
     ///
     /// The failure mode this pins down is a peer left describing one answer's
     /// endpoint and a previous answer's addresses: a record that never existed
@@ -4245,7 +4230,7 @@ mod tests {
         .expect("dynamic peer installed");
         assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(2)));
 
-        // A watched update that both moves the endpoint and grows the address
+        // A held-peer update that both moves the endpoint and grows the address
         // set past the remaining capacity. There is no eligible victim: every
         // other peer is pinned.
         let grown = [
@@ -4545,7 +4530,7 @@ mod tests {
         );
 
         // Once the delay passes, the obligation becomes an ordinary by-key
-        // lookup — the same path a `v1.peer.changed` and a reconnect replay use.
+        // lookup — the same path a peer invalidation and a reconnect replay use.
         let due = at + a.core.core_config().negative_ttl;
         while a.handle_timeout(due).await {}
         let retry = a
@@ -4702,7 +4687,7 @@ mod tests {
         assert_eq!(
             a.next_peer_evicted(),
             Some(other_pub),
-            "a rejected watched answer must release its resolver-side watch"
+            "a rejected resolver answer must release its local resolver interest"
         );
 
         // The parked packets are still dropped rather than re-dispatched:

@@ -137,20 +137,27 @@ impl Default for Registry {
     }
 }
 
-/// One peer whose effective published state changed.
+/// What happened to one peer in the published registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryChangeKind {
+    /// The peer was added or its effective published record changed.
+    Changed,
+    /// The peer disappeared from the published registry.
+    Removed,
+}
+
+/// One key-only peer-registry invalidation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegistryChange {
-    /// Subscribers re-read the published state rather than carrying it here,
-    /// so a change is just a name.
     pub public_key: [u8; 32],
+    pub kind: RegistryChangeKind,
 }
 
 /// The published registry.
 ///
-/// There is no revision counter, cursor, or replay log. A notification carries
-/// no state, so it cannot be reordered into a stale install; the only ordering
-/// this type owes the Peers API is the explicit watch-creation atomicity in
-/// [`Self::read`].
+/// There is no revision counter, cursor, or replay log. Notifications carry no
+/// peer record and only trigger a fresh lookup, so clients that miss them can
+/// reconcile their locally held keys after reconnect.
 #[derive(Debug, Clone)]
 struct PublishedRegistry {
     registry: Arc<Registry>,
@@ -223,22 +230,13 @@ impl SharedRegistry {
             .clone()
     }
 
-    /// Read the current registry with change dispatch held off.
+    /// Read one coherent view of the current config and runtime endpoint overlay.
     ///
-    /// This is the critical section the Peers API requires of `v1.peer.watch`:
-    /// insert the requested key into the connection's watch set and read its
-    /// current record inside `read`, and no change to that key can land after
-    /// the snapshot yet escape the new watch. Both [`Self::replace`] and
-    /// [`Self::observe_endpoint`] publish and dispatch under the matching write
-    /// lock, so the two orderings are mutually exclusive — either the watch ran
-    /// first and precedes the notification, or the state change ran first and
-    /// the watch already answers from the new published state.
+    /// Lookups use this read lock so a returned [`PeerInfo`] is projected from one
+    /// published state. Change dispatch uses the matching write lock; no protocol
+    /// subscription state is mutated here.
     ///
-    /// Nothing else is owed. The response may be serialized and written
-    /// afterwards, from any task, in any order relative to notifications.
-    ///
-    /// `read` must not block or acquire the registry lock again; keep it to the
-    /// watch-set insertion and one by-key lookup.
+    /// `read` must not block or acquire the registry lock again.
     pub(crate) fn read<T>(&self, with: impl FnOnce(PublishedView<'_>) -> T) -> T {
         let current = self
             .current
@@ -274,7 +272,10 @@ impl SharedRegistry {
         }
         current.observed_endpoints.insert(public_key, endpoint);
         if before != Some(endpoint) {
-            let _ = self.changes.send(RegistryChange { public_key });
+            let _ = self.changes.send(RegistryChange {
+                public_key,
+                kind: RegistryChangeKind::Changed,
+            });
         }
     }
 
@@ -294,8 +295,8 @@ impl SharedRegistry {
     /// direct routing is enabled again later.
     ///
     /// Both config publication and endpoint-observation dispatch use this same
-    /// write lock, preserving the watch-creation ordering guaranteed by
-    /// [`Self::read`].
+    /// write lock, so readers observe a coherent configuration/runtime overlay
+    /// through [`Self::read`].
     pub fn replace(&self, registry: Registry) {
         let mut current = self
             .current
@@ -314,12 +315,13 @@ impl SharedRegistry {
             .chain(registry.by_key.keys())
             .copied()
             .collect();
-        let mut changed = Vec::new();
+        let mut changes = Vec::new();
         for public_key in keys {
             let before = old_registry.lookup_key(&public_key);
             let after = registry.lookup_key(&public_key);
-            let differs = match (before, after) {
-                (None, Some(_)) | (Some(_), None) => true,
+            let kind = match (before, after) {
+                (None, Some(_)) => Some(RegistryChangeKind::Changed),
+                (Some(_), None) => Some(RegistryChangeKind::Removed),
                 (Some(before), Some(after)) => {
                     let before_endpoint =
                         old_observed.get(&public_key).copied().or(before.endpoint);
@@ -328,16 +330,17 @@ impl SharedRegistry {
                         .get(&public_key)
                         .copied()
                         .or(after.endpoint);
-                    before.public_key != after.public_key
+                    (before.public_key != after.public_key
                         || before_endpoint != after_endpoint
                         || before.relay != after.relay
                         || before.persistent_keepalive != after.persistent_keepalive
-                        || before.addresses != after.addresses
+                        || before.addresses != after.addresses)
+                        .then_some(RegistryChangeKind::Changed)
                 }
-                (None, None) => false,
+                (None, None) => None,
             };
-            if differs {
-                changed.push(public_key);
+            if let Some(kind) = kind {
+                changes.push(RegistryChange { public_key, kind });
             }
         }
 
@@ -345,8 +348,8 @@ impl SharedRegistry {
         // change. If the observation is later invalidated, fallback must use the
         // newest configuration rather than the snapshot from when it was learned.
         current.registry = Arc::new(registry);
-        for public_key in changed {
-            let _ = self.changes.send(RegistryChange { public_key });
+        for change in changes {
+            let _ = self.changes.send(change);
         }
     }
 }
@@ -523,7 +526,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn replacement_broadcasts_only_changed_peer_keys() {
+    fn replacement_broadcasts_only_invalidated_peer_keys() {
         let shared = SharedRegistry::new(
             Registry::build(vec![
                 record(0x01, &["10.0.0.1/32"]),
@@ -545,10 +548,17 @@ pub(crate) mod tests {
 
         let mut observed = Vec::new();
         while let Ok(change) = changes.try_recv() {
-            observed.push(change.public_key[0]);
+            observed.push((change.public_key[0], change.kind));
         }
-        observed.sort_unstable();
-        assert_eq!(observed, vec![0x02, 0x03, 0x04]);
+        observed.sort_unstable_by_key(|(key, _)| *key);
+        assert_eq!(
+            observed,
+            vec![
+                (0x02, RegistryChangeKind::Changed),
+                (0x03, RegistryChangeKind::Removed),
+                (0x04, RegistryChangeKind::Changed),
+            ]
+        );
 
         shared.replace(
             Registry::build(vec![
@@ -584,7 +594,7 @@ pub(crate) mod tests {
 
         // The first authenticated observation matters even when its value is
         // identical to configuration: it establishes provenance without
-        // changing the served record, so no watch notification is needed.
+        // changing the served record, so no change broadcast is needed.
         shared.observe_endpoint(key, configured);
         assert!(matches!(
             changes.try_recv(),
@@ -609,14 +619,16 @@ pub(crate) mod tests {
         ));
 
         // A genuinely new authenticated source replaces the learned value and
-        // does change the served record, so watched clients are invalidated.
+        // does change the served record, so clients receive a change broadcast.
         shared.observe_endpoint(key, roamed);
         let effective = shared.read(|published| {
             let record = published.lookup_key(&key).unwrap();
             published.effective_endpoint(record)
         });
         assert_eq!(effective, Some(roamed));
-        assert_eq!(changes.try_recv().unwrap().public_key, key);
+        let change = changes.try_recv().unwrap();
+        assert_eq!(change.public_key, key);
+        assert_eq!(change.kind, RegistryChangeKind::Changed);
     }
 
     #[test]

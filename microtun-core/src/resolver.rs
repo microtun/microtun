@@ -1,22 +1,20 @@
 //! Peer resolution and dynamic-peer lifecycle.
 //!
 //! This module owns resolver request/event types, in-flight query bookkeeping,
-//! answer validation, dynamic-peer installation, and watched updates. Resolver
+//! answer validation, dynamic-peer installation, and held-peer updates. Resolver
 //! output itself is delivered through [`crate::Sink`].
 //!
-//! A resolver must not return a positive answer until its key is being watched.
-//! For the Peers API wire protocol that means the integration explicitly calls
-//! `v1.peer.watch` before completing the resolve. The core therefore never needs a
-//! separate subscribe command; it only asks the resolver to stop watching when
-//! a record leaves the peer table — including when an answer arrives that the
-//! core declines to install.
+//! A resolver that can receive peer changes keeps local interest in keys whose
+//! positive answers the core has installed. The core does not expose subscribe
+//! or unsubscribe wire operations: when a dynamic record leaves the peer table
+//! it emits an eviction observation so the resolver can forget that key locally.
 
 use core::net::{IpAddr, SocketAddr};
 
 use defmt_or_log::{debug, info, warn};
 
 use crate::{
-    CoreInner, Error, EvictedPeerGhost, PeerAddresses, RelayPolicy, Sink, Slot,
+    Core, Error, EvictedPeerGhost, PeerAddresses, RelayPolicy, Sink, Slot,
     firewall::InboundPolicy,
     ip::unmap_socket_addr,
     peer::{PeerEntry, PeerKind},
@@ -53,7 +51,7 @@ pub enum ResolveOutcome {
     /// target until the configured negative TTL elapses (see [`ResolveKind::Negative`]).
     NotFound,
     /// Transient failure (timeout, `429`, `5xx`). Initial lookups are left
-    /// uncached so traffic can retry; watched peers retain their last known-good
+    /// uncached so traffic can retry; held peers retain their last known-good
     /// record, while polling integrations schedule another check.
     Failed,
 }
@@ -132,24 +130,23 @@ pub struct ResolveResponse {
 /// channel.
 ///
 /// [`ResolverCommand::Resolve`] originates at [`crate::Sink::resolve`].
-/// [`ResolverCommand::Unwatch`] is runtime-derived from [`crate::Event::PeerEvicted`];
-/// the core itself does not expose a separate unwatch sink callback.
+/// [`ResolverCommand::Forget`] is runtime-derived from [`crate::Event::PeerEvicted`];
+/// the core itself does not expose a separate forget sink callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolverCommand {
-    /// Perform this lookup. A positive answer guarantees its key is watched.
+    /// Perform this lookup. A positive answer may become a locally held key.
     Resolve(ResolveRequest),
-    /// Stop watching this key after a peer-eviction event.
-    Unwatch([u8; 32]),
+    /// Forget local resolver interest in this key after peer eviction.
+    Forget([u8; 32]),
 }
 
 /// Authoritative state for a peer the core already holds.
 ///
 /// A resolver integration produces one of these when it reconciles a held
-/// record — because the Peers API server named the key in a `v1.peer.changed`
+/// record — because the Peers API server named the key in a peer invalidation
 /// notification, or because a reconnect replayed the whole held set. Either
-/// way the state here came from resolver reconciliation (`v1.peer.by_key` after a
-/// stale notice, or `v1.peer.watch` during reconnect), so it is subject to the
-/// same validation as a first answer.
+/// way the state here came from a `v1.peer.by_key` reconciliation, so it is
+/// subject to the same validation as a first answer.
 #[derive(Debug)]
 pub struct PeerUpdate {
     pub public_key: [u8; 32],
@@ -157,7 +154,7 @@ pub struct PeerUpdate {
 }
 
 impl PeerUpdate {
-    /// Build an update for a watched peer.
+    /// Build an update for a peer the core already holds.
     pub fn new(public_key: [u8; 32], outcome: ResolveOutcome) -> Self {
         Self {
             public_key,
@@ -189,9 +186,9 @@ enum PeerAdmission {
     /// An authenticated peer named a relay destination. Relay admissions are
     /// intentionally non-evicting as well as subject to the protected reserve.
     LazyRelay,
-    /// Apply a watched update to an already-installed dynamic peer; never
+    /// Apply a held-peer update to an already-installed dynamic peer; never
     /// create a replacement.
-    WatchedUpdate,
+    HeldUpdate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,14 +212,14 @@ enum ResolveKind {
     Negative,
     /// A re-lookup of a record this device already holds, issued because an
     /// earlier reconciliation of that record could not be completed. Its
-    /// answer goes down the watched-update path, so it can refresh or
+    /// answer goes down the local interested-update path, so it can refresh or
     /// authoritatively remove the peer but never create one.
     Reconcile,
 }
 
 /// A reconciliation this device owes itself.
 ///
-/// Created when a watched update cannot be applied and discharged when one
+/// Created when a held-peer update cannot be applied and discharged when one
 /// finally is. The obligation is deliberately not the same thing as a queued
 /// lookup: it survives the failure of any number of lookups, and it holds a
 /// `due` time so a peer whose record simply does not fit cannot spin the
@@ -251,9 +248,9 @@ impl<
     const MAX_SESSIONS: usize,
     const REPLAY_WORDS: usize,
     const MAX_ROUTES: usize,
-> CoreInner<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>
+> Core<RNG, RP, MAX_PEERS, MAX_SESSIONS, REPLAY_WORDS, MAX_ROUTES>
 {
-    /// Deliver either a lookup completion or an unsolicited watched-peer update.
+    /// Deliver either a lookup completion or an unsolicited held-peer update.
     pub async fn resolver_event_completed<E: Sink>(
         &mut self,
         now: Instant,
@@ -509,11 +506,11 @@ impl<
         match entry.kind {
             ResolveKind::Outbound => self.resolved_outbound(now, entry, outcome, sink).await,
             ResolveKind::Install(source) => self.resolved_install(now, entry, source, outcome),
-            // A reconciliation answer is an ordinary watched update: it may
+            // A reconciliation answer is an ordinary held-peer update: it may
             // refresh or authoritatively remove the record, never create one.
             ResolveKind::Reconcile => match entry.query {
                 ResolveQuery::ByPublicKey(public_key) => {
-                    self.apply_watched_answer(now, public_key, outcome)
+                    self.apply_held_answer(now, public_key, outcome)
                 }
                 ResolveQuery::ByDstAddress(_) => Ok(()),
             },
@@ -534,11 +531,11 @@ impl<
             public_key,
             outcome,
         } = update;
-        self.apply_watched_answer(now, public_key, outcome)
+        self.apply_held_answer(now, public_key, outcome)
     }
 
     /// The single reconciliation routine for a record this device already
-    /// holds, whatever prompted it: a `v1.peer.changed` relayed by the embedding, a
+    /// holds, whatever prompted it: a peer invalidation relayed by the embedding, a
     /// reconnect replay, or one of this core's own retries.
     ///
     /// Three properties matter here, and each is a rule the protocol states
@@ -551,7 +548,7 @@ impl<
     ///   failed answer leaves the held record exactly as it was;
     /// * a reconciliation that could not be completed is still owed, so it is
     ///   recorded rather than dropped on the floor.
-    fn apply_watched_answer(
+    fn apply_held_answer(
         &mut self,
         now: Instant,
         public_key: [u8; 32],
@@ -583,14 +580,14 @@ impl<
                         // authoritative miss: the peer keeps its record. But
                         // the record is still unreconciled, so the obligation
                         // has to survive the rejection.
-                        warn!("rejected an invalid watched update: peer={}", pidx);
+                        warn!("rejected an invalid held-peer update: peer={}", pidx);
                         self.queue_reconcile(public_key, now);
                         return Ok(());
                     }
                 };
-                if let Err(error) = self.commit_watched_update(pidx, &info, now) {
+                if let Err(error) = self.commit_held_update(pidx, &info, now) {
                     warn!(
-                        "keeping the last complete record for a peer whose watched update could not be installed: peer={} error={:?}",
+                        "keeping the last complete record for a peer whose held-peer update could not be installed: peer={} error={:?}",
                         pidx, error
                     );
                     self.queue_reconcile(public_key, now);
@@ -616,7 +613,7 @@ impl<
         Ok(())
     }
 
-    /// Install a watched answer as one complete record, or change nothing.
+    /// Install local interested answer as one complete record, or change nothing.
     ///
     /// Route replacement is the only step that can fail, and it is fully
     /// preflighted — it plans every eviction and draws the whole eviction
@@ -628,13 +625,13 @@ impl<
     /// Doing it the other way round is what produced records carrying a new
     /// endpoint, relay, policy and keepalive alongside the addresses of the
     /// previous answer, with nothing scheduled to ever reconcile them.
-    fn commit_watched_update(
+    fn commit_held_update(
         &mut self,
         pidx: PeerIdx,
         info: &ResolvedPeer,
         now: Instant,
     ) -> Result<(), Error> {
-        self.commit_existing_resolved_peer(pidx, info, now, PeerAdmission::WatchedUpdate, true)
+        self.commit_existing_resolved_peer(pidx, info, now, PeerAdmission::HeldUpdate, true)
     }
 
     /// Record that `public_key` still needs reconciling, without issuing the
@@ -667,7 +664,7 @@ impl<
                     .push_reconcile(PendingReconcile { public_key, due })
                     .is_err()
                 {
-                    warn!("reconciliation backlog full; dropping a watched-update retry");
+                    warn!("reconciliation backlog full; dropping local interested-update retry");
                     return;
                 }
                 due
@@ -746,7 +743,7 @@ impl<
             self.defer_reconcile(index, now);
             return true;
         }
-        debug!("issuing a watched-record reconciliation: id={}", id.0);
+        debug!("issuing a held-record reconciliation: id={}", id.0);
         self.pending_reconciles.swap_remove(index);
         true
     }
@@ -774,7 +771,7 @@ impl<
         };
         match outcome {
             ResolveOutcome::Found(info) => {
-                // The resolver established a watch for this key before
+                // The resolver established local interest for this key before
                 // returning the answer. Every path below that does not leave
                 // the record installed must say so.
                 let info_key = info.public_key;
@@ -833,7 +830,7 @@ impl<
                     {
                         // A freshly admitted peer has no usable old route set.
                         // Remove it entirely rather than retaining a partial
-                        // record; eviction reports that the resolver watch must
+                        // record; eviction reports that the resolver interest must
                         // be released.
                         if installed_new {
                             self.evict_peer(pidx)?;
@@ -885,9 +882,9 @@ impl<
                 let info_key = info.public_key;
                 if !info.addresses.iter().any(|cidr| cidr.contains(&address)) {
                     warn!("discarding a by-address answer that does not cover the query");
-                    // The resolver explicitly watched the key returned by the
+                    // The resolver locally retained the key returned by the
                     // address lookup before completing this answer. Every path
-                    // that does not leave it installed has to release the watch.
+                    // that does not leave it installed has to release the local interest.
                     self.discard_answer(&info_key);
                     self.pending.drop_if(|p| p.wait == Wait::Resolve(entry.id));
                     return Ok(());
@@ -1119,7 +1116,7 @@ impl<
     /// own. A resolver that is compromised, or that is reached over a path
     /// this device cannot authenticate, can therefore reroute everything and —
     /// by claiming a prefix covering the Peers API server itself — make the
-    /// misdirection self-sustaining across watched updates. That is accepted
+    /// misdirection self-sustaining across held-peer updates. That is accepted
     /// deliberately: the resolver is already the authority that names peers,
     /// and layering partial address-space restrictions on top bought
     /// consistency, not safety. What still protects the deployment is the
@@ -1312,9 +1309,9 @@ impl<
             }
         }
 
-        // A watched update is existing-only. A stale invalidation must never
+        // A held-peer update is existing-only. A stale invalidation must never
         // turn into a fresh admission after the original peer was removed.
-        if matches!(admission, PeerAdmission::WatchedUpdate) {
+        if matches!(admission, PeerAdmission::HeldUpdate) {
             return Err(Error::InvalidResolverAnswer);
         }
 
@@ -1542,18 +1539,18 @@ impl<
         Ok(())
     }
 
-    /// Report release of the subscription created by an answer the core did
+    /// Report release of resolver interest created by an answer the core did
     /// not keep.
     ///
-    /// Resolver integrations establish the watch before returning a positive
+    /// Resolver integrations establish local interest before returning a positive
     /// answer to the core. When admission, policy, or capacity says no, that
-    /// subscription would otherwise outlive every local trace of the peer.
+    /// interest would otherwise outlive every local trace of the peer.
     fn discard_answer(&mut self, public_key: &[u8; 32]) {
-        // A positive resolver completion has already established a watch for
-        // this key. If this particular answer is rejected, release that watch
+        // A positive resolver completion has already established local interest
+        // for this key. If this particular answer is rejected, release that interest
         // even when an older local record for the same key is still retained.
-        // Reconciliation can establish a fresh watch later; keeping the rejected
-        // answer's watch would leave resolver-side state that the core explicitly
+        // Reconciliation can establish fresh local interest later; keeping the
+        // rejected answer's interest would leave resolver-side state that the core explicitly
         // declined to accept.
         self.queue_peer_evicted(*public_key);
     }

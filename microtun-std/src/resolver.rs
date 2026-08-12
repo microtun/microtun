@@ -1,27 +1,21 @@
 //! Tokio/`std` Peers API resolver.
 //!
-//! Lookups, explicit `v1.peer.watch` requests, `v1.peer.unwatch` notifications, and
-//! `v1.peer.changed` notifications all share one long-lived newline-delimited
-//! JSON-RPC connection. Ordinary lookups are side-effect free. Before returning
-//! a positive resolution to the core, the resolver explicitly watches that
-//! key; `v1.peer.watch` returns the current record while installing the
-//! subscription atomically. The resolver services the socket while idle, so
-//! notifications do not depend on a lookup being outstanding.
+//! Lookups and key-only peer invalidations share one long-lived
+//! newline-delimited JSON-RPC connection. The server broadcasts every peer
+//! change to every admitted client; the resolver keeps a local set of peer keys
+//! the core currently holds and ignores notifications for everything else.
 //!
 //! # One re-lookup queue
 //!
-//! `v1.peer.changed` names a key and carries nothing else, so it cannot be applied:
-//! it means *whatever we hold for this key may no longer be current*. The
-//! answer is an ordinary `v1.peer.by_key`, whose result installs the new record
-//! or authoritatively removes the peer. Reconnect replay is slightly different:
-//! it reissues `v1.peer.watch` for every held key so the replacement connection
-//! restores its explicit subscriptions. Both kinds of work share one ordered
-//! reconciliation queue.
+//! `v1.peer.changed` / `v1.peer.removed` name a key and carry nothing else, so they cannot be
+//! applied directly: it means *whatever we hold for this key may no longer be
+//! current*. If the key is locally held, the resolver answers the invalidation
+//! with an ordinary `v1.peer.by_key`, whose result installs the new record or
+//! authoritatively removes the peer. Unrelated broadcasts are discarded.
 //!
-//! The queue also settles an invalidation that races `v1.peer.watch`. Only one
-//! call is ever in flight here, and a notification read during that call is
-//! queued before its answer is applied, so the newly watched key is refreshed
-//! once more before the queue drains.
+//! Reconnect recovery uses the same operation. Every locally held key is
+//! re-looked up on the replacement connection, covering notifications that may
+//! have been lost when the previous connection died or lagged the broadcast.
 //!
 //! # Failure handling
 //!
@@ -41,8 +35,8 @@
 //!
 //! Every failure is transient and drops the session. The core keeps the record
 //! it already had and asks again when traffic next needs it, and the
-//! replacement connection reconciles the whole set, so there is no
-//! retry-on-a-fresh-connection special case to get right. A `v1.peer.changed` lost
+//! replacement connection reconciles the whole locally held set, so there is no
+//! retry-on-a-fresh-connection special case to get right. A peer invalidation lost
 //! with a dropped connection is recovered by that same replay.
 
 use std::{
@@ -74,7 +68,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// A Peers API server restart drops every client at the same instant, so an
 /// unjittered delay would reconnect the whole fleet in one spike. See
-/// `docs/peers-api.md` §11.3.
+/// `docs/microtun-peers-api.md` §10.3.
 const RECONNECT_DELAY_MS: u32 = 1_000;
 
 /// JSON-RPC connection over the read/write halves of the Tokio transport.
@@ -97,28 +91,12 @@ pub trait PeersApiTransport: Clone + Send + Sync + 'static {
 
     /// Open a connection to the Peers API server's inner address.
     ///
-    /// The resulting connection is retained for lookups, watches, and pushed
-    /// updates until either side closes it. TCP implementations must enable
+    /// The resulting connection is retained for lookups and pushed updates
+    /// until either side closes it. TCP implementations must enable
     /// keep-alive probes plus a bounded liveness timeout so an otherwise quiet
     /// session cannot survive indefinitely after the peer or path disappears
     /// without a FIN/RST.
     fn connect(&self, api: SocketAddr) -> impl Future<Output = io::Result<Self::Stream>> + Send;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reconcile {
-    /// Re-establish an explicit subscription on a replacement connection.
-    Rewatch([u8; 32]),
-    /// Refresh a subscription that is already active on this connection.
-    Refresh([u8; 32]),
-}
-
-impl Reconcile {
-    const fn public_key(self) -> [u8; 32] {
-        match self {
-            Self::Rewatch(public_key) | Self::Refresh(public_key) => public_key,
-        }
-    }
 }
 
 /// Stateful Peers API client.
@@ -155,11 +133,11 @@ impl Reconcile {
 pub struct PeersApiResolver<T: PeersApiTransport> {
     api: SocketAddr,
     transport: T,
-    /// Keys whose records the core currently holds. A successful `v1.peer.watch`
-    /// puts each one here; a `v1.peer.unwatch` command takes it away.
+    /// Keys whose records the core currently holds. Successful lookups add
+    /// them here; local peer eviction removes them.
     desired: HashSet<[u8; 32]>,
     /// Ordered reconnect and invalidation reconciliation work.
-    replay: VecDeque<Reconcile>,
+    replay: VecDeque<[u8; 32]>,
     /// Pacing source for reconnect delays and reconciliation bursts.
     jitter: Jitter,
     /// When the current change-driven burst may issue its first refresh.
@@ -176,7 +154,7 @@ impl<T: PeersApiTransport> core::fmt::Debug for PeersApiResolver<T> {
             .debug_struct("PeersApiResolver")
             .field("api", &self.api)
             .field("connected", &self.connection.is_some())
-            .field("watches", &self.desired.len())
+            .field("held_peers", &self.desired.len())
             .finish_non_exhaustive()
     }
 }
@@ -246,15 +224,9 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
             writer,
             ChangeHandler::default(),
         ));
-        // Subscriptions live on the connection, so a replacement connection
-        // has none. Re-issuing `v1.peer.watch` restores each one and returns the
-        // current record in the same round trip.
-        self.replay = self
-            .desired
-            .iter()
-            .copied()
-            .map(Reconcile::Rewatch)
-            .collect();
+        // A replacement connection may have missed broadcasts while the old
+        // session was down. Re-look up every locally held key to reconcile it.
+        self.replay = self.desired.iter().copied().collect();
         // Reconnect replay is already paced by the jittered reconnect delay
         // that preceded it, so it starts immediately.
         self.burst_at = None;
@@ -266,13 +238,23 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
     }
 
     async fn fetch(&mut self, query: ResolveQuery) -> ResolveOutcome {
-        match query {
-            ResolveQuery::ByPublicKey(public_key) => self.watch(public_key).await,
-            ResolveQuery::ByDstAddress(_) => match self.lookup(query).await {
-                ResolveOutcome::Found(peer) => self.watch(peer.public_key).await,
-                outcome => outcome,
-            },
+        let queried_key = match query {
+            ResolveQuery::ByPublicKey(public_key) => Some(public_key),
+            ResolveQuery::ByDstAddress(_) => None,
+        };
+        let outcome = self.lookup(query).await;
+        match &outcome {
+            ResolveOutcome::Found(peer) => {
+                self.desired.insert(peer.public_key);
+            }
+            ResolveOutcome::NotFound => {
+                if let Some(public_key) = queried_key {
+                    self.desired.remove(&public_key);
+                }
+            }
+            ResolveOutcome::Failed => {}
         }
+        outcome
     }
 
     /// Perform one side-effect-free lookup.
@@ -290,33 +272,7 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
         self.finish_client_call("lookup", result)
     }
 
-    /// Explicitly subscribe to one key and return the atomically sampled state.
-    async fn watch(&mut self, public_key: [u8; 32]) -> ResolveOutcome {
-        if self.connection.is_none() && self.establish().await.is_err() {
-            return ResolveOutcome::Failed;
-        }
-
-        let result = peer_api::watch(
-            self.connection
-                .as_mut()
-                .expect("a connection was just established"),
-            public_key,
-        )
-        .await;
-        let outcome = self.finish_client_call(microtun_api::METHOD_WATCH, result);
-        match &outcome {
-            ResolveOutcome::Found(_) => {
-                self.desired.insert(public_key);
-            }
-            ResolveOutcome::NotFound => {
-                self.desired.remove(&public_key);
-            }
-            ResolveOutcome::Failed => {}
-        }
-        outcome
-    }
-
-    /// Refresh a key that is already watched on this connection.
+    /// Refresh a locally held key after a broadcast or reconnect.
     async fn refresh(&mut self, public_key: [u8; 32]) -> ResolveOutcome {
         if self.connection.is_none() && self.establish().await.is_err() {
             return ResolveOutcome::Failed;
@@ -360,33 +316,22 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
         }
     }
 
-    async fn apply_unwatch(&mut self, public_key: [u8; 32]) {
+    fn apply_forget(&mut self, public_key: [u8; 32]) {
         if let Some(connection) = self.connection.as_mut() {
             connection.handler_mut().forget(public_key);
         }
-        self.replay
-            .retain(|queued| queued.public_key() != public_key);
-        if !self.desired.remove(&public_key) || self.connection.is_none() {
-            return;
-        }
-        let result =
-            peer_api::unwatch(self.connection.as_mut().expect("checked above"), public_key).await;
-        if let Err(error) = result {
-            log::warn!("Peers API server unwatch failed: {error:?}");
-            self.connection = None;
-        }
+        self.replay.retain(|queued| *queued != public_key);
+        self.desired.remove(&public_key);
     }
 
     /// Move every notified key onto the re-lookup queue.
     ///
-    /// A key the core no longer holds is dropped here rather than looked up:
-    /// an eviction and a notification crossing is the normal outcome for a
-    /// client that has not sent `v1.peer.unwatch` yet, and the record set is the
-    /// final local authority on whether the answer would be wanted.
-    fn drain_changed(&mut self) {
+    /// A key the core does not hold is dropped here rather than looked up. The
+    /// local held set is the final authority on whether a broadcast is relevant.
+    fn drain_invalidated(&mut self) {
         let mut changed = VecDeque::new();
         if let Some(connection) = self.connection.as_mut() {
-            while let Some(public_key) = connection.handler_mut().take_changed() {
+            while let Some(public_key) = connection.handler_mut().take_invalidated() {
                 changed.push_back(public_key);
             }
         }
@@ -394,12 +339,9 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
         let mut queued_any = false;
         for public_key in changed {
             if self.desired.contains(&public_key)
-                && !self
-                    .replay
-                    .iter()
-                    .any(|queued| queued.public_key() == public_key)
+                && !self.replay.iter().any(|queued| *queued == public_key)
             {
-                self.replay.push_back(Reconcile::Refresh(public_key));
+                self.replay.push_back(public_key);
                 queued_any = true;
             }
         }
@@ -417,18 +359,17 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
 
 /// Run one multiplexed resolver session until the command side closes.
 ///
-/// The same connection carries lookups, explicit `v1.peer.watch` requests,
-/// `v1.peer.unwatch` notifications, and `v1.peer.changed` notifications. While no core
-/// command is ready the task polls the RPC connection, so notifications arrive
-/// without a request being outstanding. Losing a session triggers reconnect
-/// and an explicit re-watch of every record the core holds.
+/// The same connection carries lookups and peer invalidation broadcasts. While
+/// no core command is ready the task polls the RPC connection, so notifications
+/// arrive without a request being outstanding. Losing a session triggers
+/// reconnect and a by-key reconciliation of every record the core holds.
 pub async fn resolver_task<T: PeersApiTransport>(
     mut resolver: PeersApiResolver<T>,
     mut commands: mpsc::Receiver<ResolverCommand>,
     events: mpsc::Sender<ResolverEvent>,
 ) {
     loop {
-        resolver.drain_changed();
+        resolver.drain_invalidated();
 
         if resolver.connection.is_none() && !resolver.desired.is_empty() {
             let connected = matches!(
@@ -462,24 +403,17 @@ pub async fn resolver_task<T: PeersApiTransport>(
             resolver.burst_at = None;
         }
 
-        // Reconcile one outstanding record before servicing anything else.
-        // Reconnect items explicitly restore the watch; refresh items use a pure
-        // by-key lookup because the subscription is already active.
+        // Reconcile one outstanding held record before servicing anything else.
+        // Both change-driven work and reconnect recovery use a pure by-key lookup.
         if resolver.connection.is_some()
-            && let Some(item) = resolver.replay.pop_front()
+            && let Some(public_key) = resolver.replay.pop_front()
         {
-            let public_key = item.public_key();
-            let operation = async {
-                match item {
-                    Reconcile::Rewatch(public_key) => resolver.watch(public_key).await,
-                    Reconcile::Refresh(public_key) => resolver.refresh(public_key).await,
-                }
-            };
+            let operation = resolver.refresh(public_key);
             let outcome = match tokio::time::timeout(REQUEST_TIMEOUT, operation).await {
                 Ok(ResolveOutcome::Failed) | Err(_) => {
-                    // Reconnect and start the set again rather than leaving one
-                    // record unsubscribed and silently stale.
-                    log::warn!("failed to reconcile a watched record; reconnecting");
+                    // Reconnect and start the held set again rather than leaving
+                    // one record silently stale.
+                    log::warn!("failed to reconcile a held record; reconnecting");
                     resolver.connection = None;
                     resolver.replay.clear();
                     continue;
@@ -544,14 +478,13 @@ async fn handle_command<T: PeersApiTransport>(
     match command {
         ResolverCommand::Resolve(request) => {
             let response = resolver.resolve(request).await;
-            // Any key invalidated while the lookup/watch sequence was in
-            // flight is queued. Once the watch succeeds the key is in the held
-            // set, so the queued invalidation forces one refresh at the
-            // top of the loop.
+            // Any broadcast read while the lookup is in flight is queued. Once
+            // a successful lookup adds its key to the held set, a matching
+            // queued invalidation forces one refresh at the top of the loop.
             events.send(ResolverEvent::Resolved(response)).await.is_ok()
         }
-        ResolverCommand::Unwatch(public_key) => {
-            resolver.apply_unwatch(public_key).await;
+        ResolverCommand::Forget(public_key) => {
+            resolver.apply_forget(public_key);
             true
         }
     }
@@ -616,8 +549,8 @@ async fn wait_before_retry<T: PeersApiTransport>(
                     return false;
                 };
                 match command {
-                    ResolverCommand::Unwatch(public_key) => {
-                        resolver.apply_unwatch(public_key).await
+                    ResolverCommand::Forget(public_key) => {
+                        resolver.apply_forget(public_key)
                     }
                     ResolverCommand::Resolve(request) => {
                         if events
@@ -641,7 +574,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use microtun_api::{KeyParams, LookupResult, METHOD_CHANGED, METHOD_UNWATCH, METHOD_WATCH};
+    use microtun_api::{KeyParams, LookupResult, METHOD_CHANGED, METHOD_REMOVED};
     use microtun_core::{
         ResolveQuery,
         key::{decode_key, encode_key},
@@ -679,9 +612,7 @@ mod tests {
             responder: Responder<'_>,
         ) -> Reply {
             assert!(
-                method == microtun_api::METHOD_BY_KEY
-                    || method == microtun_api::METHOD_BY_ADDRESS
-                    || method == microtun_api::METHOD_WATCH,
+                method == microtun_api::METHOD_BY_KEY || method == microtun_api::METHOD_BY_ADDRESS,
                 "unexpected method {method}"
             );
             match self.0 {
@@ -883,11 +814,7 @@ mod tests {
 
     #[derive(Debug)]
     struct CombinedHandler {
-        /// Keys the client explicitly started watching.
-        watches: mpsc::UnboundedSender<[u8; 32]>,
-        /// Keys the client asked to stop watching.
-        unwatches: mpsc::UnboundedSender<[u8; 32]>,
-        /// Keys the client refreshed with side-effect-free by-key lookups.
+        /// Keys the client looked up by public key.
         lookups: mpsc::UnboundedSender<[u8; 32]>,
     }
 
@@ -898,37 +825,19 @@ mod tests {
             params: Params<'_>,
             responder: Responder<'_>,
         ) -> Reply {
+            if method != microtun_api::METHOD_BY_KEY {
+                return responder.method_not_found();
+            }
             let Ok(args) = params.parse::<KeyParams<'_>>() else {
                 return responder.invalid_params();
             };
             let Ok(public_key) = decode_key(args.public_key) else {
                 return responder.invalid_params();
             };
-            match method {
-                METHOD_WATCH => {
-                    let _ = self.watches.send(public_key);
-                }
-                microtun_api::METHOD_BY_KEY => {
-                    let _ = self.lookups.send(public_key);
-                }
-                _ => return responder.method_not_found(),
-            }
+            let _ = self.lookups.send(public_key);
             let (record, _) = serde_json_core::from_str::<microtun_api::PeerInfo>(RECORD)
                 .expect("test record parses");
             responder.ok(&LookupResult::Found(record))
-        }
-
-        fn handle_notification(&mut self, method: &str, params: Params<'_>) {
-            if method != METHOD_UNWATCH {
-                return;
-            }
-            let Ok(args) = params.parse::<KeyParams<'_>>() else {
-                return;
-            };
-            let Ok(public_key) = decode_key(args.public_key) else {
-                return;
-            };
-            let _ = self.unwatches.send(public_key);
         }
     }
 
@@ -974,32 +883,18 @@ mod tests {
             RECORD_FRAME_LEN,
         >,
         mpsc::UnboundedReceiver<[u8; 32]>,
-        mpsc::UnboundedReceiver<[u8; 32]>,
-        mpsc::UnboundedReceiver<[u8; 32]>,
     ) {
         let (reader, writer) = tokio::io::split(stream);
-        let (watch_tx, watch_rx) = mpsc::unbounded_channel();
-        let (unwatch_tx, unwatch_rx) = mpsc::unbounded_channel();
         let (lookup_tx, lookup_rx) = mpsc::unbounded_channel();
         (
-            Connection::from_tokio(
-                reader,
-                writer,
-                CombinedHandler {
-                    watches: watch_tx,
-                    unwatches: unwatch_tx,
-                    lookups: lookup_tx,
-                },
-            ),
-            watch_rx,
-            unwatch_rx,
+            Connection::from_tokio(reader, writer, CombinedHandler { lookups: lookup_tx }),
             lookup_rx,
         )
     }
 
-    /// One connection carries the explicit watch and pushed updates at once.
+    /// One connection carries a lookup and pushed broadcasts at once.
     #[tokio::test]
-    async fn an_explicit_watch_shares_its_connection_with_updates() {
+    async fn a_lookup_shares_its_connection_with_updates() {
         const A: [u8; 32] = [0xAA; 32];
         let (servers_tx, mut servers_rx) = mpsc::unbounded_channel();
         let connections = Arc::new(AtomicUsize::new(0));
@@ -1018,13 +913,12 @@ mod tests {
         });
 
         let stream = servers_rx.recv().await.expect("one session opens");
-        let (mut server, mut watch_rx, mut unwatch_rx, mut lookup_rx) =
-            server_connection(stream).await;
+        let (mut server, mut lookup_rx) = server_connection(stream).await;
 
-        // The notifications arrive while the same client Connection is waiting for
-        // the `v1.peer.watch` response. `Connection::call` dispatches them before
+        // The notifications arrive while the same client Connection is waiting
+        // for the by-key response. `Connection::call` dispatches them before
         // completing the request, proving the connection is genuinely
-        // multiplexed and exercising the in-flight watch race.
+        // multiplexed and exercising the in-flight lookup race.
         let key_text = encode_key(&A);
         let params = KeyParams {
             public_key: key_text.as_str(),
@@ -1034,24 +928,23 @@ mod tests {
             .await
             .expect("first notification sent");
         server
-            .notify(METHOD_CHANGED, Some(&params))
+            .notify(METHOD_REMOVED, Some(&params))
             .await
-            .expect("repeat notification sent");
-        server.poll().await.expect("watch arrives on same session");
-        assert_eq!(watch_rx.recv().await, Some(A));
+            .expect("removed notification sent");
+        server.poll().await.expect("lookup arrives on same session");
+        assert_eq!(lookup_rx.recv().await, Some(A));
 
         let (mut resolver, outcome) = client.await.expect("client finishes");
         assert!(matches!(outcome, ResolveOutcome::Found(_)));
 
-        // The explicit watch is mirrored locally, and no unwatch was sent.
+        // A successful lookup is mirrored in the local held set.
         assert!(resolver.desired.contains(&A));
-        assert!(unwatch_rx.try_recv().is_err());
         assert!(lookup_rx.try_recv().is_err());
 
-        // A notification that raced the watch still forces one pure by-key
-        // refresh, and repeats coalesce into one queue entry.
-        resolver.drain_changed();
-        assert_eq!(resolver.replay.pop_front(), Some(Reconcile::Refresh(A)));
+        // Either invalidation kind that raced the lookup still forces one pure
+        // by-key refresh, and multiple signals for one key coalesce.
+        resolver.drain_invalidated();
+        assert_eq!(resolver.replay.pop_front(), Some(A));
         assert!(
             resolver.replay.is_empty(),
             "notifications for one key coalesce into a single re-lookup"
@@ -1082,7 +975,7 @@ mod tests {
         });
 
         let stream = servers_rx.recv().await.expect("one session opens");
-        let (mut server, mut watch_rx, _unwatch_rx, _lookup_rx) = server_connection(stream).await;
+        let (mut server, mut lookup_rx) = server_connection(stream).await;
 
         let key_text = encode_key(&B);
         server
@@ -1094,20 +987,20 @@ mod tests {
             )
             .await
             .expect("notification sent");
-        server.poll().await.expect("watch arrives");
-        assert_eq!(watch_rx.recv().await, Some(A));
+        server.poll().await.expect("lookup arrives");
+        assert_eq!(lookup_rx.recv().await, Some(A));
 
         let (mut resolver, _) = client.await.expect("client finishes");
-        resolver.drain_changed();
+        resolver.drain_invalidated();
         assert!(
             resolver.replay.is_empty(),
             "a key the core never held is not looked up"
         );
     }
 
-    /// After a disconnect every held record is explicitly watched again.
+    /// After a disconnect every held record is looked up again.
     #[tokio::test]
-    async fn reconnect_rewatches_every_held_record() {
+    async fn reconnect_relooks_up_every_held_record() {
         const A: [u8; 32] = [0xAA; 32];
         let (servers_tx, mut servers_rx) = mpsc::unbounded_channel();
         let connections = Arc::new(AtomicUsize::new(0));
@@ -1135,9 +1028,9 @@ mod tests {
             .unwrap();
 
         let first = servers_rx.recv().await.expect("first session opens");
-        let (mut server, mut watch_rx, _unwatch_rx, _lookup_rx) = server_connection(first).await;
-        server.poll().await.expect("first watch arrives");
-        assert_eq!(watch_rx.recv().await, Some(A));
+        let (mut server, mut lookup_rx) = server_connection(first).await;
+        server.poll().await.expect("first lookup arrives");
+        assert_eq!(lookup_rx.recv().await, Some(A));
 
         let resolved = tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
             .await
@@ -1146,16 +1039,16 @@ mod tests {
         assert!(matches!(resolved, ResolverEvent::Resolved(_)));
 
         // Closing an otherwise idle session must trigger a replacement
-        // connection and a replayed `v1.peer.watch` for every held record.
+        // connection and a replayed by-key lookup for every held record.
         drop(server);
 
         let second = tokio::time::timeout(Duration::from_secs(5), servers_rx.recv())
             .await
             .expect("session is re-established")
             .expect("transport stays open");
-        let (mut server, mut watch_rx, _unwatch_rx, _lookup_rx) = server_connection(second).await;
-        server.poll().await.expect("the replay watch arrives");
-        assert_eq!(watch_rx.recv().await, Some(A));
+        let (mut server, mut lookup_rx) = server_connection(second).await;
+        server.poll().await.expect("the replay lookup arrives");
+        assert_eq!(lookup_rx.recv().await, Some(A));
 
         let a = next_peer_update(&mut events_rx).await;
         assert_eq!(a.public_key, A);

@@ -2,8 +2,8 @@
 //!
 //! A classic WireGuard device has a static cryptokey-routing table; microtun has a
 //! resolver-filled cache, pre-seeded with the pinned peers' CIDRs. Dynamic
-//! records stay usable while watched invalidations reconcile them; integrations
-//! without a watch transport retain periodic by-key refresh as a fallback.
+//! records stay usable while change invalidations reconcile them; integrations
+//! without pushed changes retain periodic by-key refresh as a fallback.
 //! Records are replaced or removed only by an authoritative resolver answer.
 //!
 //! Routes live in stable fixed-capacity slots. A path-compressed prefix trie
@@ -124,7 +124,7 @@ impl<const MAX_ROUTES: usize> RouteCache<MAX_ROUTES> {
     /// [`Self::lookup`] breaks a length tie in favour of the entry inserted
     /// first. A reassignment of an address from one peer to another therefore
     /// does not take effect until the previous owner's route is removed
-    /// (peer eviction, or an authoritative `404` in a watched update). Until then
+    /// (peer eviction, or an authoritative `404` in a held-peer update). Until then
     /// the new owner is unroutable in both directions — outbound traffic goes
     /// to the incumbent, and the new owner's inner packets fail the source
     /// check in the transport receive path.

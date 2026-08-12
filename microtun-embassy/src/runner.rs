@@ -62,7 +62,7 @@ struct TunnelSink<'s, 'd, 'o, 'r> {
     device: &'s mut ChannelRunner<'d, MTU>,
     outer: &'s UdpSocket<'o>,
     resolver_commands: &'s CommandSender<'r>,
-    pending_unwatches: &'s mut Deque<[u8; 32], MAX_PEERS>,
+    pending_forgets: &'s mut Deque<[u8; 32], MAX_PEERS>,
 }
 
 impl<'s, 'd, 'o, 'r> TunnelSink<'s, 'd, 'o, 'r> {
@@ -70,26 +70,26 @@ impl<'s, 'd, 'o, 'r> TunnelSink<'s, 'd, 'o, 'r> {
         device: &'s mut ChannelRunner<'d, MTU>,
         outer: &'s UdpSocket<'o>,
         resolver_commands: &'s CommandSender<'r>,
-        pending_unwatches: &'s mut Deque<[u8; 32], MAX_PEERS>,
+        pending_forgets: &'s mut Deque<[u8; 32], MAX_PEERS>,
     ) -> Self {
         Self {
             device,
             outer,
             resolver_commands,
-            pending_unwatches,
+            pending_forgets,
         }
     }
 
-    fn flush_unwatches(&mut self) -> bool {
-        while let Some(public_key) = self.pending_unwatches.front().copied() {
+    fn flush_forgets(&mut self) -> bool {
+        while let Some(public_key) = self.pending_forgets.front().copied() {
             if self
                 .resolver_commands
-                .try_send(ResolverCommand::Unwatch(public_key))
+                .try_send(ResolverCommand::Forget(public_key))
                 .is_err()
             {
                 return false;
             }
-            self.pending_unwatches.pop_front();
+            self.pending_forgets.pop_front();
         }
         true
     }
@@ -149,7 +149,7 @@ impl Sink for TunnelSink<'_, '_, '_, '_> {
     }
 
     fn resolve(&mut self, request: ResolveRequest) -> bool {
-        self.flush_unwatches()
+        self.flush_forgets()
             && self
                 .resolver_commands
                 .try_send(ResolverCommand::Resolve(request))
@@ -158,14 +158,14 @@ impl Sink for TunnelSink<'_, '_, '_, '_> {
 
     fn event(&mut self, event: Event) {
         if let Event::PeerEvicted { public_key } = event {
-            if (!self.flush_unwatches()
+            if (!self.flush_forgets()
                 || self
                     .resolver_commands
-                    .try_send(ResolverCommand::Unwatch(public_key))
+                    .try_send(ResolverCommand::Forget(public_key))
                     .is_err())
-                && self.pending_unwatches.push_back(public_key).is_err()
+                && self.pending_forgets.push_back(public_key).is_err()
             {
-                warn!("pending unwatch queue full; dropping peer eviction");
+                warn!("pending forget queue full; dropping peer eviction");
             }
         }
     }
@@ -246,7 +246,7 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
             .set_link_state(embassy_net_driver_channel::driver::LinkState::Up);
 
         let mut outer_datagram = [0u8; OUTER_SIZE];
-        let mut pending_unwatches = Deque::<[u8; 32], MAX_PEERS>::new();
+        let mut pending_forgets = Deque::<[u8; 32], MAX_PEERS>::new();
         // Split the borrow once: the device is both an awaited event source
         // and a sink destination, so it cannot live inside a long-lived sink.
         let forwarding = self.forwarding;
@@ -278,16 +278,16 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
                 Either4::First(()) => {
                     let fired_at = now();
                     let mut sink =
-                        TunnelSink::new(&mut *device, &outer, &resolve_tx, &mut pending_unwatches);
+                        TunnelSink::new(&mut *device, &outer, &resolve_tx, &mut pending_forgets);
                     trace!("protocol timer fired");
                     if !engine.handle_timeout(fired_at, &mut sink).await {
                         trace!("protocol timer had no due work");
                     }
                 }
-                // The resolver task produced a lookup completion or watched-peer update.
+                // The resolver task produced a lookup completion or peer-change update.
                 Either4::Second(response) => {
                     let mut sink =
-                        TunnelSink::new(&mut *device, &outer, &resolve_tx, &mut pending_unwatches);
+                        TunnelSink::new(&mut *device, &outer, &resolve_tx, &mut pending_forgets);
                     if engine
                         .resolver_event_completed(now(), response, &mut sink)
                         .await
@@ -305,7 +305,7 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
                             &mut *device,
                             &outer,
                             &resolve_tx,
-                            &mut pending_unwatches,
+                            &mut pending_forgets,
                         );
                         if engine
                             .receive_outer(now(), source, &mut outer_datagram[..n], &mut sink)
@@ -323,7 +323,7 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
                     outer_datagram[..n].copy_from_slice(&tx[..n]);
                     device.tx_done();
                     let mut sink =
-                        TunnelSink::new(&mut *device, &outer, &resolve_tx, &mut pending_unwatches);
+                        TunnelSink::new(&mut *device, &outer, &resolve_tx, &mut pending_forgets);
                     if engine
                         .send_inner(now(), &outer_datagram[..n], &mut sink)
                         .await
@@ -334,14 +334,14 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
                 }
             }
 
-            while let Some(public_key) = pending_unwatches.front().copied() {
+            while let Some(public_key) = pending_forgets.front().copied() {
                 if resolve_tx
-                    .try_send(ResolverCommand::Unwatch(public_key))
+                    .try_send(ResolverCommand::Forget(public_key))
                     .is_err()
                 {
                     break;
                 }
-                pending_unwatches.pop_front();
+                pending_forgets.pop_front();
             }
         }
     }

@@ -212,7 +212,7 @@ The important ones:
 
 ## Documentation
 
-* `docs/peers-api.md` — the Peers API protocol.
+* `docs/microtun-peers-api.md` — the Peers API protocol.
 * `docs/microtun-relay-protocol.md` — the relay extension.
 
 Crate-level docs are the reference for everything else: `cargo doc --open`.
