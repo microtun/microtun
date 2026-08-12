@@ -680,12 +680,10 @@ mod tests {
 
     #[test]
     fn accepts_explicit_listen_socket_and_zero_keepalive() {
-        let text = base()
-            .replace(
-                "Address = 10.0.0.2/24",
-                "ListenPort = [::1]:51999\nAddress = 10.0.0.2/24",
-            )
-            .replace("Addresses = 10.0.0.1/32", "Addresses = 10.0.0.1/32");
+        let text = base().replace(
+            "Address = 10.0.0.2/24",
+            "ListenPort = [::1]:51999\nAddress = 10.0.0.2/24",
+        );
         let runtime = parse(&text, &path()).unwrap();
         assert_eq!(runtime.listen, "[::1]:51999".parse().unwrap());
     }
