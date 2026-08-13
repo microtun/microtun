@@ -195,13 +195,10 @@ enum PeerAdmission {
 enum ResolveKind {
     /// Answer unblocks pending outbound packets carrying this id.
     Outbound,
-    /// Answer populates the peer table and route cache; nothing is parked
-    /// behind it. Used for both remotely-provoked `by-key` lookups — a
-    /// cryptographically valid initiation from an unknown static key, and a
-    /// relay envelope naming an unknown destination key. The provoking
-    /// message itself is dropped: the initiator retransmits within
-    /// `Rekey-Timeout` (and a relay submitter's own retries carry its
-    /// envelope again), and the retransmission finds a configured peer.
+    /// Answer populates the peer table and route cache. Authenticated unknown
+    /// initiators may additionally retain one bounded responder-side Noise
+    /// state entry until this lookup completes; relay envelopes are still
+    /// dropped and rely on the submitter's own retry behavior.
     Install(InstallSource),
     /// A spent entry: the resolver authoritatively answered "no such peer" for
     /// `query`. It emits no request and parks nothing; its only job is to make
@@ -382,9 +379,14 @@ impl<
                 self.pending
                     .drop_if(|packet| packet.wait == Wait::Resolve(entry.id));
             }
-            // Install resolves park nothing; the query simply lapses and the
-            // next retransmission may retry.
-            ResolveKind::Install(_) => {}
+            ResolveKind::Install(source) => {
+                // Authenticated initiator installs may own one parked Noise
+                // generation. Expiry drops it atomically with the lookup; the
+                // initiator's normal retransmission remains the fallback.
+                if matches!(source, InstallSource::AuthenticatedInitiator) {
+                    self.drop_pending_initiation(entry.id);
+                }
+            }
             // A reconciliation lookup parks nothing either, but it carries an
             // obligation that must not lapse with it: the record it was going
             // to reconcile is still held and still unreconciled.
@@ -403,21 +405,45 @@ impl<
         true
     }
 
-    /// Ask the resolver to install an authenticated unknown initiator,
-    /// parking nothing.
+    /// Ask the resolver to install an authenticated unknown initiator.
     ///
-    /// The initiation has proved possession of the claimed static private key,
-    /// but that key is not configured yet. The provoking packet is dropped;
-    /// WireGuard retransmission finds the installed peer after a successful
-    /// lookup. This path and relay-driven destination lookup share the global
-    /// unattributed remote-resolve budget, while relay requests additionally
-    /// pass a per-submitter gate and protected-reserve check.
-    pub(super) fn request_peer_install(&mut self, key: [u8; 32], now: Instant) {
+    /// Returns the resolver id only when a live lookup was successfully queued;
+    /// the caller may use it to bind bounded pending handshake state to the
+    /// completion. Failure to queue is intentionally lossy because WireGuard
+    /// retransmission preserves the previous recovery behavior.
+    pub(super) fn request_peer_install(
+        &mut self,
+        key: [u8; 32],
+        now: Instant,
+    ) -> Option<ResolveId> {
         if self.peer_is_ghosted(&key, now) {
             debug!("unknown initiator suppressed by recently-evicted ghost");
-            return;
+            return None;
         }
-        self.queue_peer_install(key, InstallSource::AuthenticatedInitiator, now);
+        self.queue_peer_install(key, InstallSource::AuthenticatedInitiator, now)
+    }
+
+    /// Return the id of the live install resolve created by an authenticated
+    /// initiation for `key`. This deliberately excludes relay installs,
+    /// negative markers, and expired entries so only proof-bearing retries may
+    /// refresh responder-side pending handshake state.
+    pub(super) fn authenticated_initiator_resolve_id(
+        &self,
+        key: [u8; 32],
+        now: Instant,
+    ) -> Option<ResolveId> {
+        let query = ResolveQuery::ByPublicKey(key);
+        self.resolves
+            .iter()
+            .find(|entry| {
+                entry.query == query
+                    && entry.deadline > now
+                    && matches!(
+                        entry.kind,
+                        ResolveKind::Install(InstallSource::AuthenticatedInitiator)
+                    )
+            })
+            .map(|entry| entry.id)
     }
 
     /// Ask the resolver to install a relay destination, with a quota attached
@@ -458,16 +484,21 @@ impl<
             }
             peer.last_relay_resolve = Some(now);
         }
-        self.queue_peer_install(key, InstallSource::Relay, now);
+        let _ = self.queue_peer_install(key, InstallSource::Relay, now);
     }
 
-    fn queue_peer_install(&mut self, key: [u8; 32], source: InstallSource, now: Instant) {
+    fn queue_peer_install(
+        &mut self,
+        key: [u8; 32],
+        source: InstallSource,
+        now: Instant,
+    ) -> Option<ResolveId> {
         if self.resolve_suppressed(ResolveQuery::ByPublicKey(key), now) {
-            return;
+            return None;
         }
         if !self.remote_resolves.try_take(now) {
             debug!("remote resolve budget exhausted; dropping by-key lookup");
-            return;
+            return None;
         }
         let id = self.alloc_resolve_id();
         let query = ResolveQuery::ByPublicKey(key);
@@ -478,10 +509,12 @@ impl<
             deadline: now + self.core_config.resolve_timeout,
             emitted: false,
         };
-        // Best effort: nothing is parked behind an install resolve, so a full
-        // resolver queue simply means this message is dropped and a
-        // retransmission may try again later.
-        let _ = self.push_resolve(entry);
+        // Best effort. Authenticated initiators may park state only after this
+        // succeeds; relay callers still rely entirely on their own retry path.
+        if self.push_resolve(entry).is_err() {
+            return None;
+        }
+        Some(id)
     }
 
     // -----------------------------------------------------------------------
@@ -505,7 +538,10 @@ impl<
         let entry = self.resolves.swap_remove(pos);
         match entry.kind {
             ResolveKind::Outbound => self.resolved_outbound(now, entry, outcome, sink).await,
-            ResolveKind::Install(source) => self.resolved_install(now, entry, source, outcome),
+            ResolveKind::Install(source) => {
+                self.resolved_install(now, entry, source, outcome, sink)
+                    .await
+            }
             // A reconciliation answer is an ordinary held-peer update: it may
             // refresh or authoritatively remove the record, never create one.
             ResolveKind::Reconcile => match entry.query {
@@ -757,18 +793,30 @@ impl<
     }
 
     /// A `by-key` answer for an unknown initiator or a relay-forwarding
-    /// destination: populate the peer table and route cache so the
-    /// retransmitted initiation (or envelope) finds a configured peer.
-    fn resolved_install(
+    /// destination. Authenticated initiators retain their newest bounded Noise
+    /// generation while the lookup is in flight, so a successful install can
+    /// answer immediately rather than waiting for Rekey-Timeout. Relay
+    /// destinations continue to rely on the submitter's retry behavior.
+    async fn resolved_install<E: Sink>(
         &mut self,
         now: Instant,
         entry: InflightResolve,
         source: InstallSource,
         outcome: ResolveOutcome,
+        sink: &mut E,
     ) -> Result<(), Error> {
-        let ResolveQuery::ByPublicKey(_) = entry.query else {
+        let ResolveQuery::ByPublicKey(expected_key) = entry.query else {
             return Ok(());
         };
+
+        // Take before applying the answer so every completion path — found,
+        // not-found, failed, malformed, or capacity-rejected — releases the
+        // parked cryptographic state exactly once. A successful install below
+        // is the only path that consumes it into a handshake response.
+        let pending = matches!(source, InstallSource::AuthenticatedInitiator)
+            .then(|| self.take_pending_initiation(entry.id))
+            .flatten();
+
         match outcome {
             ResolveOutcome::Found(info) => {
                 // The resolver established local interest for this key before
@@ -789,7 +837,7 @@ impl<
                     InstallSource::AuthenticatedInitiator => PeerAdmission::AuthenticatedInitiator,
                     InstallSource::Relay => PeerAdmission::LazyRelay,
                 };
-                if let Some(pidx) = self.find_peer(&info.public_key) {
+                let pidx = if let Some(pidx) = self.find_peer(&info.public_key) {
                     // Another resolve can install the peer while this lookup
                     // is in flight. In that race this answer is a replacement,
                     // not a new admission: commit routes first so a capacity
@@ -802,7 +850,7 @@ impl<
                         admission,
                         !matches!(source, InstallSource::Relay),
                     ) {
-                        Ok(()) => (),
+                        Ok(()) => pidx,
                         Err(Error::RouteCacheFull) | Err(Error::PeerAdmissionLimited) => {
                             return Ok(());
                         }
@@ -837,8 +885,27 @@ impl<
                         }
                         return Ok(());
                     }
-                }
+                    pidx
+                };
                 self.clear_negative(entry.query);
+
+                if let Some(pending) = pending {
+                    // Both the resolver answer and the parked proof are bound to
+                    // this exact by-key query. Keep the check explicit so future
+                    // resolver refactors cannot accidentally cross-wire state.
+                    if pending.consumed.s_pub_i != expected_key || info.public_key != expected_key {
+                        warn!("dropping mismatched pending initiation after peer install");
+                        return Ok(());
+                    }
+                    self.accept_authenticated_initiation(
+                        pidx,
+                        &pending.consumed,
+                        pending.src,
+                        now,
+                        sink,
+                    )
+                    .await?;
+                }
                 Ok(())
             }
             ResolveOutcome::NotFound => {

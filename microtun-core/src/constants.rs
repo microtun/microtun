@@ -38,9 +38,11 @@ pub const COOKIE_REFRESH_TIME: Duration = Duration::from_secs(120);
 
 /// How long an emitted `by-key` resolver query may remain unanswered before
 /// it is treated as failed and its table entry reclaimed. Chosen as
-/// 2 × `REKEY_TIMEOUT`: nothing is parked behind these queries — the
-/// provoking initiation or envelope was dropped — so a lapsed one simply
-/// means the sender's next retransmission starts a fresh lookup.
+/// 2 × `REKEY_TIMEOUT`: an authenticated unknown initiator may retain one
+/// bounded Noise generation behind the lookup, with a retransmission refreshing
+/// it to the newest generation; relay envelopes remain unparked. When the
+/// deadline lapses, any parked initiation is dropped and the sender's next
+/// retransmission starts a fresh lookup.
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a queued outbound packet may wait on a `by-address` resolve.

@@ -439,6 +439,30 @@ struct EvictedPeerGhost {
     expires: Instant,
 }
 
+/// Maximum number of authenticated unknown-peer initiations retained while
+/// their `by-key` resolver lookups are in flight. Overflow is intentionally
+/// lossy: the resolver lookup still proceeds, and normal WireGuard
+/// retransmission remains the fallback.
+const MAX_PENDING_INITIATIONS: usize = 4;
+
+/// Authenticated responder-side Noise state held only until the matching
+/// unknown-peer resolver lookup completes.
+struct PendingInitiation {
+    resolve_id: ResolveId,
+    src: SocketAddr,
+    consumed: noise::ConsumedInitiation,
+}
+
+impl core::fmt::Debug for PendingInitiation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingInitiation")
+            .field("resolve_id", &self.resolve_id)
+            .field("src", &self.src)
+            .field("consumed", &self.consumed)
+            .finish()
+    }
+}
+
 /// The sans-IO WireGuard engine. See the crate-level documentation.
 ///
 /// `REPLAY_WORDS` is the number of 64-bit bitmap words retained per established
@@ -493,6 +517,10 @@ pub struct Core<
     /// peer table, the slot pool, the parked packets and the resolver table.
     timers: TimerCache,
     pending: PendingPool<2>,
+    #[cfg(not(feature = "alloc"))]
+    pending_initiations: [Option<PendingInitiation>; MAX_PENDING_INITIATIONS],
+    #[cfg(feature = "alloc")]
+    pending_initiations: alloc::vec::Vec<Option<PendingInitiation>>,
     #[cfg(not(feature = "alloc"))]
     resolves: heapless::Vec<InflightResolve, MAX_INFLIGHT_RESOLVES>,
     #[cfg(feature = "alloc")]
@@ -770,6 +798,10 @@ impl<
             routes: RouteCache::new()?,
             timers: TimerCache::new(),
             pending: PendingPool::new(),
+            #[cfg(not(feature = "alloc"))]
+            pending_initiations: core::array::from_fn(|_| None),
+            #[cfg(feature = "alloc")]
+            pending_initiations: (0..MAX_PENDING_INITIATIONS).map(|_| None).collect(),
             #[cfg(not(feature = "alloc"))]
             resolves: heapless::Vec::new(),
             #[cfg(feature = "alloc")]
@@ -1407,6 +1439,72 @@ impl<
         Ok(())
     }
 
+    /// Retain an authenticated unknown-peer initiation until its resolver
+    /// lookup completes. A retransmission for the same lookup replaces the
+    /// parked Noise state only when it carries a newer authenticated timestamp,
+    /// preventing reordering or replay from rolling the responder back to a
+    /// stale ephemeral.
+    fn park_pending_initiation(
+        &mut self,
+        resolve_id: ResolveId,
+        src: SocketAddr,
+        consumed: noise::ConsumedInitiation,
+    ) -> bool {
+        if let Some(slot) = self.pending_initiations.iter_mut().find(|slot| {
+            slot.as_ref()
+                .is_some_and(|pending| pending.resolve_id == resolve_id)
+        }) {
+            let should_replace = slot
+                .as_ref()
+                .is_some_and(|pending| consumed.timestamp > pending.consumed.timestamp);
+            if should_replace {
+                *slot = Some(PendingInitiation {
+                    resolve_id,
+                    src,
+                    consumed,
+                });
+                debug!(
+                    "refreshed pending unknown-peer initiation: resolve_id={}",
+                    resolve_id.0
+                );
+            }
+            return true;
+        }
+
+        let Some(slot) = self
+            .pending_initiations
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        else {
+            warn!("pending initiation pool full; falling back to WireGuard retransmission");
+            return false;
+        };
+        *slot = Some(PendingInitiation {
+            resolve_id,
+            src,
+            consumed,
+        });
+        debug!(
+            "parked unknown-peer initiation: resolve_id={}",
+            resolve_id.0
+        );
+        true
+    }
+
+    fn take_pending_initiation(&mut self, resolve_id: ResolveId) -> Option<PendingInitiation> {
+        self.pending_initiations
+            .iter_mut()
+            .find(|slot| {
+                slot.as_ref()
+                    .is_some_and(|pending| pending.resolve_id == resolve_id)
+            })
+            .and_then(|slot| slot.take())
+    }
+
+    fn drop_pending_initiation(&mut self, resolve_id: ResolveId) {
+        let _ = self.take_pending_initiation(resolve_id);
+    }
+
     async fn rx_initiation<E: Sink>(
         &mut self,
         now: Instant,
@@ -1455,14 +1553,17 @@ impl<
                 .await;
         }
 
-        // This check is read-only: stage one reveals a claimed identity but
-        // does not yet prove possession of its private key. A lookup already in
-        // flight or a still-honoured negative answer suppresses a duplicate
-        // resolver request, but must not make the unknown-key rejection cheaper
-        // than the matching known-key authentication failure. Charge the same
-        // gated scalar multiplication before returning so suppression state
-        // cannot reopen the peer-membership cost oracle.
-        if self.resolve_suppressed(ResolveQuery::ByPublicKey(claimed_key), now) {
+        // Stage one reveals only a claimed identity. Most resolver suppression
+        // therefore keeps the old equalized rejection path: an in-flight lookup
+        // or negative marker must not make an unknown-key probe cheaper than a
+        // matching known-key authentication failure. The one exception is a live
+        // lookup that was itself started by an already-authenticated initiation.
+        // A retransmission for that exact lookup may authenticate fully so it can
+        // refresh the parked Noise generation without issuing another query.
+        let pending_resolve = self.authenticated_initiator_resolve_id(claimed_key, now);
+        if pending_resolve.is_none()
+            && self.resolve_suppressed(ResolveQuery::ByPublicKey(claimed_key), now)
+        {
             self.equalize_unknown_identity_cost(&claimed_key, now);
             return Ok(());
         }
@@ -1475,13 +1576,24 @@ impl<
             debug!("unknown initiation failed static-key proof");
             return Ok(());
         };
+
+        if let Some(resolve_id) = pending_resolve {
+            // WireGuard retransmissions keep the sender index but use a fresh
+            // ephemeral. Keep the newest authenticated generation so a resolver
+            // completion that crosses Rekey-Timeout does not answer stale state.
+            let _ = self.park_pending_initiation(resolve_id, src, consumed);
+            return Ok(());
+        }
+
         // The sender demonstrably holds the private key for the claimed
-        // identity. Ask the resolver who it is and drop this initiation:
-        // nothing is parked, and the initiator's retransmission (§6.4, every
-        // Rekey-Timeout) finds a configured peer once the answer has been
-        // installed — the same self-healing a slow resolver relies on anyway.
+        // identity. Start the resolver lookup and retain this authenticated
+        // initiation when bounded storage is available. If the pool or resolver
+        // queue is full, normal WireGuard retransmission preserves the previous
+        // self-healing behavior.
         info!("valid initiation from unknown peer; requesting resolution");
-        self.request_peer_install(consumed.s_pub_i, now);
+        if let Some(resolve_id) = self.request_peer_install(consumed.s_pub_i, now) {
+            let _ = self.park_pending_initiation(resolve_id, src, consumed);
+        }
         Ok(())
     }
 
@@ -4307,7 +4419,7 @@ mod tests {
         );
 
         // Start a by-key install first, but leave it in flight.
-        a.core.request_peer_install(b_pub, T0);
+        let _ = a.core.request_peer_install(b_pub, T0);
         let by_key = a.next_resolve_request().expect("by-key lookup queued");
         assert_eq!(by_key.query(), ResolveQuery::ByPublicKey(b_pub));
 
@@ -4435,7 +4547,7 @@ mod tests {
 
         // While it is in flight, a by-key install for that identity wins the
         // race and occupies the final route slot.
-        a.core.request_peer_install(b_pub, T0);
+        let _ = a.core.request_peer_install(b_pub, T0);
         let by_key = a.next_resolve_request().expect("by-key lookup emitted");
         let old_nets = [net4(10, 107, 0, 1, 32)];
         a.resolve_completed(
@@ -4759,8 +4871,8 @@ mod tests {
         let (_, initiation) = net.nodes[1].sink.expect_one_outer();
 
         // The initiation is cryptographically valid but names an identity B has
-        // never heard of. B proves possession, asks the resolver, and drops the
-        // message: nothing is parked on the responder side (§5.1).
+        // never heard of. B proves possession, asks the resolver, and parks the
+        // authenticated responder-side Noise state behind that lookup.
         net.nodes[0]
             .receive_outer(T0, outer(3), &initiation)
             .await
@@ -4791,18 +4903,22 @@ mod tests {
             Some(outer(3))
         );
         net.nodes[0].core.assert_peer_index_consistent();
-
-        // The initiator's own §6.4 retransmission is what heals the exchange.
-        let retry_at = T0 + REKEY_TIMEOUT + REKEY_TIMEOUT_JITTER_MAX;
-        let steps = net.nodes[1].drain_timers(retry_at).await;
-        assert_eq!(steps, 1, "only the handshake retransmission was due");
         assert_eq!(
-            net.nodes[1].sink.outer_types(),
-            vec![messages::MSG_INITIATION]
+            net.nodes[0].sink.outer_types(),
+            vec![messages::MSG_RESPONSE],
+            "a successful by-key resolve should answer the parked initiation immediately"
         );
 
-        net.pump(retry_at).await;
+        // The response arrives before Rekey-Timeout and completes the original
+        // session attempt; no initiation retransmission is required.
+        net.pump(T0).await;
         assert_eq!(net.nodes[0].sink.inner, vec![(c_pub, payload)]);
+        let retry_at = T0 + REKEY_TIMEOUT + REKEY_TIMEOUT_JITTER_MAX;
+        assert_eq!(
+            net.nodes[1].drain_timers(retry_at).await,
+            0,
+            "the completed cold handshake must not retransmit"
+        );
 
         // --- The budget for remotely provoked work is finite ------------------
         // A fresh responder, five initiations from five freshly minted identities
@@ -4829,6 +4945,85 @@ mod tests {
             "the remote-provoked lookup budget was not enforced"
         );
         assert!(fresh.sink.outer.is_empty());
+    }
+
+    #[maybe_async::test(not(feature = "async"), async(feature = "async", tokio::test))]
+    async fn unknown_initiator_retry_refreshes_parked_noise_generation() {
+        let (_, b_pub) = keypair(30);
+        let (_, c_pub) = keypair(31);
+        let b_nets = [net4(10, 0, 0, 2, 32)];
+        let c_nets = [net4(10, 0, 0, 3, 32)];
+
+        let b = node(30, outer(2), &[], StaticRelayPolicy::DenyAll, T0);
+        let c = node(
+            31,
+            outer(3),
+            &[pinned(
+                b_pub,
+                Some(outer(2)),
+                None,
+                &b_nets,
+                InboundPolicy::AllowAll,
+            )],
+            StaticRelayPolicy::DenyAll,
+            T0,
+        );
+        let mut net = Net { nodes: vec![b, c] };
+
+        let payload = ipv4(tun(3), tun(2), IPPROTO_UDP, &udp(6, 6, b"refresh me"));
+        net.nodes[1].send_inner(T0, &payload).await.expect("parked");
+        let (_, first) = net.nodes[1].sink.expect_one_outer();
+        net.nodes[0]
+            .receive_outer(T0, outer(3), &first)
+            .await
+            .expect("first initiation authenticated");
+        let request = net.nodes[0]
+            .next_resolve_request()
+            .expect("by-key lookup queued");
+        assert_eq!(request.query(), ResolveQuery::ByPublicKey(c_pub));
+
+        // Let the initiator cross Rekey-Timeout while the resolver is still in
+        // flight. The retry uses a fresh ephemeral and must replace the parked
+        // generation without producing a duplicate resolver request.
+        let retry_at = T0 + REKEY_TIMEOUT + REKEY_TIMEOUT_JITTER_MAX;
+        assert_eq!(net.nodes[1].drain_timers(retry_at).await, 1);
+        let (_, retry) = net.nodes[1].sink.expect_one_outer();
+        assert_eq!(retry[0], messages::MSG_INITIATION);
+        assert_ne!(
+            retry, first,
+            "a retransmission should carry fresh Noise state"
+        );
+        net.nodes[0]
+            .receive_outer(retry_at, outer(3), &retry)
+            .await
+            .expect("retry refreshes parked initiation");
+        assert!(
+            net.nodes[0].next_resolve_request().is_none(),
+            "an authenticated retry must reuse the in-flight by-key lookup"
+        );
+
+        net.nodes[0]
+            .resolve_completed(
+                retry_at,
+                request.complete(ResolveOutcome::Found(resolved(
+                    c_pub,
+                    Some(outer(3)),
+                    None,
+                    &c_nets,
+                ))),
+            )
+            .await
+            .expect("peer installed and latest initiation answered");
+        assert_eq!(
+            net.nodes[0].sink.outer_types(),
+            vec![messages::MSG_RESPONSE]
+        );
+
+        // If the responder had answered the first generation, the initiator's
+        // current handshake state would reject that response. Successful payload
+        // delivery therefore proves the queued state was refreshed to the retry.
+        net.pump(retry_at).await;
+        assert_eq!(net.nodes[0].sink.inner, vec![(c_pub, payload)]);
     }
 
     // ---------------------------------------------------------------------------
@@ -5888,7 +6083,7 @@ mod tests {
         .enumerate()
         {
             let at = T0 + Duration::from_secs(offset as u64 + 1);
-            net.nodes[0].core.request_peer_install(public, at);
+            let _ = net.nodes[0].core.request_peer_install(public, at);
             let request = net.nodes[0]
                 .next_resolve_request()
                 .expect("idle peer lookup queued");
@@ -5983,7 +6178,7 @@ mod tests {
             Err(Error::PeerAdmissionLimited),
             "the evicted identity cannot immediately force its way back"
         );
-        a.core.request_peer_install(publics[0], first_evict);
+        let _ = a.core.request_peer_install(publics[0], first_evict);
         assert!(
             a.next_resolve_request().is_none(),
             "ghost suppression should happen before another resolver query"
@@ -6051,7 +6246,7 @@ mod tests {
         .enumerate()
         {
             let at = T0 + Duration::from_secs(offset as u64);
-            a.core.request_peer_install(public, at);
+            let _ = a.core.request_peer_install(public, at);
             let request = a.next_resolve_request().expect("install lookup queued");
             a.resolve_completed(
                 at,
@@ -6063,7 +6258,7 @@ mod tests {
         assert_eq!(a.core.routes.available_slots(), 0, "route cache is full");
 
         let at = T0 + DYNAMIC_PEER_MIN_IDLE + Duration::from_secs(10);
-        a.core.request_peer_install(newcomer_pub, at);
+        let _ = a.core.request_peer_install(newcomer_pub, at);
         let request = a.next_resolve_request().expect("newcomer lookup queued");
         a.resolve_completed(
             at,
@@ -6105,7 +6300,7 @@ mod tests {
                 net4(10, 70 + offset as u8, 1, 0, 24),
             ];
             let at = T0 + Duration::from_secs(offset as u64);
-            a.core.request_peer_install(public, at);
+            let _ = a.core.request_peer_install(public, at);
             let request = a.next_resolve_request().expect("table-fill lookup queued");
             a.resolve_completed(
                 at,
@@ -6123,7 +6318,7 @@ mod tests {
             net4(10, 80, 2, 0, 24),
             net4(10, 80, 3, 0, 24),
         ];
-        a.core.request_peer_install(oversized, at);
+        let _ = a.core.request_peer_install(oversized, at);
         let request = a.next_resolve_request().expect("oversized lookup queued");
         a.resolve_completed(
             at,
@@ -6142,7 +6337,7 @@ mod tests {
         }
 
         let fitting_routes = [net4(10, 81, 0, 0, 24), net4(10, 81, 1, 0, 24)];
-        a.core.request_peer_install(fitting, at);
+        let _ = a.core.request_peer_install(fitting, at);
         let request = a.next_resolve_request().expect("fitting lookup queued");
         a.resolve_completed(
             at,
@@ -6288,7 +6483,7 @@ mod tests {
             "relay installs cannot consume the protected peer-table reserve"
         );
 
-        a.core.request_peer_install(second_pub, later);
+        let _ = a.core.request_peer_install(second_pub, later);
         let direct = a
             .next_resolve_request()
             .expect("the reserved slot remains available to a direct initiator");
