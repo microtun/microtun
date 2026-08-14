@@ -25,10 +25,10 @@
 //! them locally if the resolver channel is temporarily full. The tunnel loop therefore never awaits resolver-channel capacity on
 //! the packet path.
 //!
-//! Lookups and pushed `v1.peer.changed` / `v1.peer.removed` broadcasts share
+//! Lookups and pushed `v1.peer.changed` / `v1.peer.removed` keyed invalidations share
 //! one continuously serviced JSON-RPC stream to the Peers API server's inner
 //! address. After
-//! reconnect the resolver re-looks up every peer the core still holds. Opening the
+//! reconnect the resolver re-watches every peer the core still holds. Opening the
 //! stream is the caller's job — see [`PeersApiTransport`] and the security notes on
 //! [`PeersApiResolver`].
 

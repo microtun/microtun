@@ -24,8 +24,8 @@
 //! * Peer resolution runs in a second task, [`resolver_task`], joined with
 //!   the tunnel loop via [`embassy_futures::join`]. One persistent JSON-RPC
 //!   connection over the **inner** stack carries lookups and pushed
-//!   `v1.peer.changed` / `v1.peer.removed` broadcasts, so the only bootstrap
-//!   dependency is the pinned Peers API server peer. Reconnect re-looks up every
+//!   `v1.peer.changed` / `v1.peer.removed` keyed invalidations, so the only bootstrap
+//!   dependency is the pinned Peers API server peer. Reconnect re-watches every
 //!   peer the core still holds.
 //!
 //! ## Allocator-backed core state

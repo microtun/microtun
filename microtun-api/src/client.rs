@@ -3,7 +3,7 @@
 //! The protocol-facing API is shared by embedded and Tokio integrations.
 //! [`Connection`] is the allocation-free `embedded-io-async` connection type;
 //! enabling `tokio-client` additionally exposes [`TokioConnection`], which uses
-//! the JSON-RPC crate's Tokio adapter while keeping the same lookup API.
+//! the JSON-RPC crate's Tokio adapter while keeping the same lookup/watch API.
 //!
 //! Keeping the transport features additive is important because Cargo unifies
 //! features when `microtun-std` and `microtun-embassy` are built in one graph.
@@ -25,8 +25,8 @@ pub type TokioConnection<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_S
     Connection<TokioIo<R>, TokioIo<W>, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>;
 
 use crate::{
-    Error, KeyParams, LookupResult, METHOD_CHANGED, METHOD_REMOVED, QueryText, classify_result,
-    decode_key, encode_query,
+    Error, KeyParams, LookupResult, METHOD_CHANGED, METHOD_REMOVED, METHOD_UNWATCH, METHOD_WATCH,
+    QueryText, classify_result, decode_key, encode_key, encode_query,
 };
 
 /// Failure produced while issuing a typed Peers API operation.
@@ -36,7 +36,7 @@ pub enum ClientError {
     Codec(Error),
     /// The JSON-RPC transport or remote endpoint rejected the operation.
     Rpc(RpcError),
-    /// A by-key response named a key other than the requested one.
+    /// A by-key or watch response named a key other than the requested one.
     UnexpectedPublicKey {
         /// Key the operation requested.
         expected: [u8; 32],
@@ -207,6 +207,43 @@ where
     H: Handler,
 {
     lookup(connection, ResolveQuery::ByDstAddress(address)).await
+}
+
+/// Atomically subscribe to one public key and return its current state.
+pub async fn watch<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(
+    connection: &mut Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>,
+    public_key: [u8; 32],
+) -> Result<ResolveOutcome, ClientError>
+where
+    R: Read,
+    W: Write,
+    H: Handler,
+{
+    let text = encode_key(&public_key);
+    let params = KeyParams {
+        public_key: text.as_str(),
+    };
+    let outcome = call_result(connection, METHOD_WATCH, &params).await?;
+    validate_public_key(outcome, Some(public_key))
+}
+
+/// Best-effort removal of one public key from the current connection's watch
+/// set.
+pub async fn unwatch<R, W, H, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(
+    connection: &mut Connection<R, W, H, RX_BUFFER_SIZE, TX_BUFFER_SIZE>,
+    public_key: [u8; 32],
+) -> Result<(), ClientError>
+where
+    R: Read,
+    W: Write,
+    H: Handler,
+{
+    let text = encode_key(&public_key);
+    let params = KeyParams {
+        public_key: text.as_str(),
+    };
+    connection.notify(METHOD_UNWATCH, Some(&params)).await?;
+    Ok(())
 }
 
 async fn call_result<R, W, H, P, const RX_BUFFER_SIZE: usize, const TX_BUFFER_SIZE: usize>(

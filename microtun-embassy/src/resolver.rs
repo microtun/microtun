@@ -1,16 +1,15 @@
 //! The peer-resolution task.
 //!
-//! A single long-lived TCP/JSON-RPC session carries lookups and
-//! `v1.peer.changed` / `v1.peer.removed` broadcasts. The server sends every peer invalidation to every
-//! admitted client; this resolver keeps a local set of the peer keys the core
-//! currently holds and ignores broadcasts for everything else. While the core
+//! A single long-lived TCP/JSON-RPC session carries lookups, explicit peer
+//! watches, and `v1.peer.changed` / `v1.peer.removed` invalidations. The server
+//! dispatches invalidations only for keys this resolver watches. While the core
 //! has no command ready the task continuously polls the same RPC connection.
 //!
 //! `v1.peer.changed` / `v1.peer.removed` name a key and carry nothing else, so they cannot be
 //! applied directly. If the key is locally held, the resolver answers it with
 //! an ordinary `v1.peer.by_key`; otherwise it discards the notification. On
-//! reconnect it re-looks up every held key, which reconciles any broadcasts
-//! lost with the previous connection.
+//! reconnect it re-watches every held key, which reconciles invalidations lost
+//! with the previous connection.
 //!
 //! Only one call is ever in flight here. A notification read during a lookup
 //! is queued before its answer is applied, so a matching successful lookup adds
@@ -111,7 +110,7 @@ pub async fn resolver_task<'stack, 'channels, 'buffers>(
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut *buffers.socket_rx, &mut *buffers.socket_tx);
-        // Keep a quiet broadcast session alive without application polling, but
+        // Keep a quiet keyed-invalidation session alive without application polling, but
         // still detect a Peers API server or path that disappears without a FIN/RST.
         // The timeout intentionally exceeds the TCP keep-alive interval.
         socket.set_keep_alive(Some(TCP_KEEP_ALIVE));
@@ -137,8 +136,8 @@ pub async fn resolver_task<'stack, 'channels, 'buffers>(
             let mut connection: Connection<_, _, _, RECORD_FRAME_LEN, QUERY_FRAME_LEN> =
                 Connection::new(reader, writer, ChangeHandler::default());
 
-            // A replacement socket may have missed broadcasts while the old
-            // session was down. Re-look up every locally held key to reconcile it.
+            // A replacement socket may have missed invalidations while the old
+            // session was down. Re-watch every locally held key to reconcile it.
             debug!("resolver reconciling {} records", desired.len());
             if reconcile(&mut connection, &ch, &mut desired).await {
                 run_session(&mut connection, &ch, &mut desired, &mut jitter).await
@@ -198,7 +197,11 @@ where
         match ready {
             Ready::Command(ResolverCommand::Forget(public_key)) => {
                 connection.handler_mut().forget(public_key);
-                forget_desired(desired, public_key);
+                let was_desired = forget_desired(desired, public_key);
+                if was_desired && peer_api::unwatch(connection, public_key).await.is_err() {
+                    warn!("Peers API server unwatch failed; reconnecting");
+                    return false;
+                }
             }
             Ready::Command(ResolverCommand::Resolve(request)) => {
                 let (outcome, reconnect) = resolve(connection, desired, request.query()).await;
@@ -208,7 +211,7 @@ where
                 if reconnect {
                     return false;
                 }
-                // Any broadcast read while the lookup is in flight is queued.
+                // Any invalidation read while the lookup is in flight is queued.
                 // Once a successful lookup adds its key to the held set, a
                 // matching invalidation is refreshed at the top of the loop.
             }
@@ -218,7 +221,8 @@ where
     }
 }
 
-/// Resolve one core query and remember any positive peer locally.
+/// Resolve one core query and establish an explicit watch before returning a
+/// positive result.
 async fn resolve<R, W>(
     connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
     desired: &mut HeldSet,
@@ -228,24 +232,21 @@ where
     R: embedded_io_async::Read,
     W: embedded_io_async::Write,
 {
-    let queried_key = match query {
-        ResolveQuery::ByPublicKey(public_key) => Some(public_key),
-        ResolveQuery::ByDstAddress(_) => None,
-    };
-    let (outcome, reconnect) = lookup(connection, query).await;
-    if reconnect {
-        return (outcome, true);
-    }
-    match &outcome {
-        ResolveOutcome::Found(record) => remember_desired(desired, record.public_key),
-        ResolveOutcome::NotFound => {
-            if let Some(public_key) = queried_key {
-                forget_desired(desired, public_key);
+    match query {
+        ResolveQuery::ByPublicKey(public_key) => watch(connection, desired, public_key).await,
+        ResolveQuery::ByDstAddress(_) => {
+            let (outcome, reconnect) = lookup(connection, query).await;
+            if reconnect {
+                return (outcome, true);
+            }
+            match outcome {
+                ResolveOutcome::Found(record) => {
+                    watch(connection, desired, record.public_key).await
+                }
+                outcome => (outcome, false),
             }
         }
-        ResolveOutcome::Failed => {}
     }
-    (outcome, false)
 }
 
 /// Perform one side-effect-free lookup.
@@ -260,7 +261,35 @@ where
     timed_call("lookup", peer_api::lookup(connection, query)).await
 }
 
-/// Refresh a locally held key after a broadcast or reconnect.
+/// Explicitly subscribe to one key and return the atomically sampled state.
+async fn watch<R, W>(
+    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    desired: &mut HeldSet,
+    public_key: [u8; 32],
+) -> (ResolveOutcome, bool)
+where
+    R: embedded_io_async::Read,
+    W: embedded_io_async::Write,
+{
+    let (outcome, reconnect) = timed_call(
+        microtun_api::METHOD_WATCH,
+        peer_api::watch(connection, public_key),
+    )
+    .await;
+    if reconnect {
+        return (outcome, true);
+    }
+    match &outcome {
+        ResolveOutcome::Found(_) => remember_desired(desired, public_key),
+        ResolveOutcome::NotFound => {
+            forget_desired(desired, public_key);
+        }
+        ResolveOutcome::Failed => {}
+    }
+    (outcome, false)
+}
+
+/// Refresh a locally held key after an invalidation.
 async fn refresh<R, W>(
     connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
     public_key: [u8; 32],
@@ -318,7 +347,7 @@ where
 /// one ordinary `v1.peer.by_key`, whose result installs the new record or
 /// authoritatively removes the peer. A key the core no longer holds is
 /// discarded instead; the local held set is the final authority on whether a
-/// broadcast is relevant.
+/// invalidation is relevant.
 ///
 /// Returns `false` when the session must be discarded.
 async fn reconcile_invalidated<R, W>(
@@ -359,9 +388,9 @@ where
     true
 }
 
-/// Re-look up every held record on a freshly opened session.
+/// Re-watch every held record on a freshly opened session.
 ///
-/// This is the whole of reconnect recovery: each by-key lookup reconciles one
+/// This is the whole of reconnect recovery: each watch response reconciles one
 /// locally held peer after any notifications lost with the previous session.
 /// Returns `false` when the session dies partway through.
 async fn reconcile<R, W>(
@@ -375,14 +404,14 @@ where
 {
     let held: HeldSet = desired.iter().copied().collect();
     for public_key in held {
-        if !refresh_one(connection, ch, public_key).await {
+        if !rewatch_one(connection, ch, desired, public_key).await {
             return false;
         }
     }
     true
 }
 
-/// Refresh one locally held key after a peer invalidation or reconnect.
+/// Refresh one locally held key after a peer invalidation.
 async fn refresh_one<R, W>(
     connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
     ch: &ResolverChannels<'_>,
@@ -395,6 +424,30 @@ where
     let (outcome, reconnect) = refresh(connection, public_key).await;
     if reconnect || matches!(outcome, ResolveOutcome::Failed) {
         warn!("failed to refresh a held record; reconnecting");
+        return false;
+    }
+    ch.events
+        .send(ResolverEvent::PeerUpdated(PeerUpdate::new(
+            public_key, outcome,
+        )))
+        .await;
+    true
+}
+
+/// Re-establish one explicit watch on a replacement connection.
+async fn rewatch_one<R, W>(
+    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    ch: &ResolverChannels<'_>,
+    desired: &mut HeldSet,
+    public_key: [u8; 32],
+) -> bool
+where
+    R: embedded_io_async::Read,
+    W: embedded_io_async::Write,
+{
+    let (outcome, reconnect) = watch(connection, desired, public_key).await;
+    if reconnect || matches!(outcome, ResolveOutcome::Failed) {
+        warn!("failed to restore a watched record; reconnecting");
         return false;
     }
     ch.events

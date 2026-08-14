@@ -6,32 +6,37 @@ The Microtun Peers API lets a Microtun node resolve peer records and keep the
 records it actually uses up to date. The API is served over the Microtun tunnel
 using JSON-RPC 2.0 on one persistent, newline-delimited TCP stream.
 
-Version 1 has two lookup methods and two key-only server notifications:
+Version 1 has two side-effect-free lookup methods, an explicit keyed watch
+method, an idempotent unwatch notification, and two key-only server
+invalidations:
 
 ```text
 v1.peer.by_key      {"public_key": "<44-character base64>"}  -> LookupResult
 v1.peer.by_address  {"address": "10.0.0.5"}                  -> LookupResult
+v1.peer.watch       {"public_key": "<44-character base64>"}  -> LookupResult
+v1.peer.unwatch     {"public_key": "<44-character base64>"}  -> client notification
 v1.peer.changed     {"public_key": "<44-character base64>"}  -> server notification
 v1.peer.removed     {"public_key": "<44-character base64>"}  -> server notification
 ```
 
-The server does not track which peer records a connection cares about.
-It may, however, apply a caller-specific group-link policy before answering
-lookups or emitting invalidations. The reference server sends
-`v1.peer.changed` / `v1.peer.removed` only for peers currently visible to that
-caller. Both notifications contain only the peer public key.
+The server tracks watched peer keys per connection and indexes those watches by
+key. It applies the caller-specific group-link policy when establishing a watch.
+The reference server sends `v1.peer.changed` / `v1.peer.removed` only to
+connections currently watching the changed key. Both notifications contain
+only the peer public key.
 
-A client decides locally whether a notification matters. If it currently holds
-that peer, it performs an ordinary `v1.peer.by_key` lookup for either
-notification. The lookup returns either the complete current record or the
-explicit `{"not_found":{}}` result that authoritatively means the caller no
-longer has a visible record for that peer. In particular, `peer.removed` is an
-invalidation hint rather than replacement state; confirming it by key makes remove/re-add and in-flight
-lookup races converge on the registry's current state.
+A retaining client establishes interest with `v1.peer.watch`. For either
+invalidation it performs an ordinary `v1.peer.by_key` refresh. That lookup
+returns either the complete current record or the explicit `{"not_found":{}}`
+result that authoritatively means the caller no longer has a visible record for
+that peer. In particular, `peer.removed` is an invalidation hint rather than
+replacement state; confirming it by key makes remove/re-add races converge on
+the registry's current state.
 
-This keeps notifications lightweight and makes the protocol stateless with
-respect to client interest. Reconnect recovery is equally simple: a client
-re-looks up the peer keys it still holds.
+`v1.peer.watch` atomically establishes the keyed subscription and samples the
+current visible record, so a registry change cannot slip between the initial
+snapshot and subscription. Reconnect recovery replays `v1.peer.watch` for the
+peer keys the client still holds.
 
 The wire shapes in this document are normative for `microtun-api`,
 `microtun-apiserver`, `microtun-std`, and `microtun-embassy`.
@@ -41,10 +46,11 @@ The wire shapes in this document are normative for `microtun-api`,
 The protocol is designed to provide:
 
 - bounded messages suitable for fixed-buffer clients;
-- side-effect-free peer lookup;
-- lightweight key-only change/removal notifications;
-- no per-connection peer subscription state on the server;
-- no per-connection held-peer subscription state;
+- side-effect-free ordinary peer lookup;
+- explicit keyed subscriptions for retained peer records;
+- lightweight key-only change/removal notifications delivered only to watchers;
+- server dispatch work proportional to the number of connections watching the
+  changed key rather than all connected clients;
 - a single authoritative removal path through `v1.peer.by_key` returning
   `{"not_found":{}}`;
 - reconnect recovery using only keys the client already retains;
@@ -59,7 +65,7 @@ The base protocol does not provide:
 - registry revisions, cursors, or replay logs;
 - batch lookup operations;
 - request-level authentication, TLS, or HTTP semantics;
-- a server-side held-peer subscription mechanism.
+- address- or prefix-level subscriptions for arbitrary route-topology changes.
 
 ### 1.1 Why notifications carry only a key
 
@@ -93,9 +99,9 @@ express protocol requirements.
   caller's authenticated tunnel session.
 - **Peer record**: a `PeerInfo` object describing one peer.
 - **Held peer**: a peer record the client currently retains locally.
-- **Peer invalidation**: a `v1.peer.changed` or `v1.peer.removed` notification naming one peer key.
-- **Relevant invalidation**: a notification the client chooses to act on. The
-  reference resolvers consider an invalidation relevant when its key is locally held.
+- **Watched peer**: a peer key for which the current connection successfully
+  completed `v1.peer.watch` and has not subsequently unwatched or disconnected.
+- **Peer invalidation**: a `v1.peer.changed` or `v1.peer.removed` notification naming one watched peer key.
 - **Authoritative miss**: a successful lookup whose result is exactly
   `{"not_found":{}}`; the requested target is absent from the caller's visible
   registry, whether because it is unconfigured or hidden by policy.
@@ -152,7 +158,7 @@ The supplied implementations use fixed receive buffers:
 
 | Direction | Traffic | Maximum frame buffer |
 | --- | --- | ---: |
-| Client to server | lookup requests | 256 bytes |
+| Client to server | lookup/watch requests and unwatch notifications | 256 bytes |
 | Server to client | lookup responses and peer invalidations | 1024 bytes |
 
 A complete newline-terminated frame MUST fit in the receiving buffer. An
@@ -307,7 +313,7 @@ be treated as a transient failure.
 
 ## 5. Lookup result semantics
 
-Both lookup methods return `LookupResult`.
+Both lookup methods and `v1.peer.watch` return `LookupResult`.
 
 | Response | Meaning | Required client behavior |
 | --- | --- | --- |
@@ -368,7 +374,35 @@ Behavior:
 A client accepting the positive response MUST verify that the returned record
 actually contains the queried address.
 
-### 6.3 `v1.peer.changed`
+### 6.3 `v1.peer.watch`
+
+**Direction:** client request -> server response.
+
+Params are identical to `v1.peer.by_key`. Result: `LookupResult`.
+
+For a valid, visible peer key, the server MUST establish interest in that key
+and sample the corresponding `LookupResult` as one atomic registry operation. A
+peer transition therefore cannot occur between the returned snapshot and watch
+registration without also producing a later invalidation for this connection.
+
+If the key is absent or hidden, the server returns `{"not_found":{}}` and MUST
+NOT establish a watch. An undecodable key is invalid params.
+
+Calling `v1.peer.watch` again for an already-watched key is idempotent and
+returns a fresh current snapshot.
+
+### 6.4 `v1.peer.unwatch`
+
+**Direction:** client notification -> server.
+
+Params are identical to `v1.peer.by_key`. There is no response.
+
+The server removes the key from this connection's interest set. Unwatching a
+key that is not currently watched is idempotent. Closing the connection removes
+all of its watches. A notification already being written may still arrive after
+`unwatch`; a client that no longer holds the key ignores that late hint.
+
+### 6.5 `v1.peer.changed`
 
 **Direction:** server notification -> client.
 
@@ -378,127 +412,129 @@ Params:
 {"public_key":"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo="}
 ```
 
-The reference server emits this notification when a peer is added or when its
-effective published record changes, including configuration changes to its
-endpoint, relay, addresses, or keepalive and authenticated endpoint changes.
+The reference server emits this notification to connections watching the named
+key when that peer is added or when its effective published record changes,
+including configuration changes to its endpoint, relay, addresses, or
+keepalive and authenticated endpoint changes.
 
-### 6.4 `v1.peer.removed`
+### 6.6 `v1.peer.removed`
 
 **Direction:** server notification -> client.
 
 Params are identical to `v1.peer.changed`.
 
-The reference server emits this notification when a peer disappears from the
-published registry.
+The reference server emits this notification to connections watching the named
+key when the peer disappears from the published registry.
 
 `peer.removed` is deliberately still an invalidation rather than authoritative
 replacement state. A remove may race a re-add or an in-flight lookup response;
 a current `v1.peer.by_key` lookup is the single source of truth.
 
-### 6.5 Common notification handling
+### 6.7 Common notification handling
 
 Both notifications carry only `public_key`; neither carries a result, peer
-record, revision, or replacement state.
+record, revision, or replacement state. A connection receives invalidations
+only for keys it has successfully watched.
 
 For either notification the client:
 
 1. decodes the key;
-2. decides locally whether the key is relevant;
-3. discards it if irrelevant;
-4. coalesces duplicate pending invalidations for the key if relevant;
-5. re-looks up the key with `v1.peer.by_key`;
-6. applies a valid `found` response as a complete replacement;
-7. treats an explicit `not_found` response as authoritative removal;
-8. treats every other failure as transient and retains the current record.
+2. coalesces duplicate pending invalidations for the key when useful;
+3. re-looks up the key with `v1.peer.by_key`;
+4. applies a valid `found` response as a complete replacement;
+5. treats an explicit `not_found` response as authoritative removal;
+6. treats every other failure as transient and retains the current record.
 
-## 7. Broadcast and reconciliation lifecycle
+## 7. Keyed subscription and reconciliation lifecycle
 
-### 7.1 No server-side interest state
+### 7.1 Server-side keyed interest
 
-The server maintains no per-connection set of watched peer keys. It may filter
-the invalidation stream by the authenticated caller's current group-link
-policy, but does not know which of those visible keys the client actually
-holds.
+Each API connection has an explicit set of watched peer keys. The reference
+server additionally maintains a reverse index from peer key to the connections
+watching it. A peer transition therefore wakes and queues work only for actual
+watchers of that key rather than every admitted API connection.
 
-This deliberately makes client interest a local concern. A client can change
-what it considers relevant without sending any control message to the server.
+The reference server coalesces multiple pending invalidations for the same key
+per connection. A later transition replaces an earlier queued kind; the
+notification remains only a hint, so the subsequent `v1.peer.by_key` refresh
+still determines the authoritative current state.
 
-### 7.2 Initial lookup and an in-flight broadcast
+### 7.2 Atomic watch and snapshot
 
-A change may race a lookup. For example:
+`v1.peer.watch(K)` establishes interest and samples the current record under the
+same registry critical section. This closes the usual lookup-then-subscribe
+race:
 
-1. the client sends `v1.peer.by_address(A)`;
-2. the server samples peer `K` as the current owner;
-3. `K` changes or is removed;
-4. the server broadcasts `v1.peer.changed(K)` or `v1.peer.removed(K)`;
-5. the lookup response for the older sample arrives.
+```text
+lookup K
+                    K changes
+subscribe K
+```
 
-Because the notification contains no peer state, it cannot overwrite anything. The
-client MUST ensure that a matching change received while a lookup is in flight
-is not lost merely because the client had not yet installed the lookup result.
+A successful watch instead guarantees either that its returned snapshot already
+reflects the transition or that a subsequent invalidation for `K` is queued.
 
-The reference clients solve this by queueing received change keys first. After
-a successful lookup is accepted and its key becomes locally held, a queued
-matching invalidation causes one `v1.peer.by_key` refresh.
+For address resolution, the client first performs side-effect-free
+`v1.peer.by_address(A)`. If that returns peer `K`, the client then calls
+`v1.peer.watch(K)` and treats the watch response, not the earlier address lookup,
+as the authoritative record it installs.
 
 Repeated invalidations for one key SHOULD be coalesced.
 
 ### 7.3 Local peer eviction
 
 When the core drops a dynamic peer, the resolver removes that key from its local
-held set and drops pending invalidations for it. No wire message is sent.
+held set, drops pending invalidations for it, and sends `v1.peer.unwatch(K)` on
+the current connection. The notification is idempotent.
 
-A later `v1.peer.changed` or `v1.peer.removed` for that key is simply irrelevant
-unless another lookup causes the client to hold it again.
+A later lookup may cause the client to watch and hold the key again.
 
 ### 7.4 Reconnection
 
-Broadcasts are not replayed. After a connection is lost, the client therefore
-re-looks up every dynamic peer key it still holds.
+Watches are scoped to one connection and are not replayed by the server. After
+a connection is lost, the client re-establishes every dynamic peer key it still
+holds with `v1.peer.watch`.
 
 For each retained key `K`:
 
 ```text
-call v1.peer.by_key(K)
+call v1.peer.watch(K)
 found      -> validate and replace local record
 not_found  -> authoritatively remove local record
 failure    -> keep old record and retry through normal reconnect flow
 ```
 
-This is sufficient to recover from notifications lost because of transport
-failure, server restart, or broadcast lag.
+This recovers changes missed because of transport failure or server restart.
 
-### 7.5 Broadcast lag and bounded queues
+The reference server closes keyed subscriptions when the group-link policy
+changes. Reconnect and re-watch then reconcile records that became hidden
+without requiring the server to enumerate newly-hidden keys. Removing the
+caller's own registry record also closes all of that caller's subscriptions.
 
-The reference server uses a bounded internal broadcast channel. If one API
-connection falls behind far enough that the server can no longer know which
-peer invalidations it missed, the server closes that connection.
+### 7.5 Bounded keyed queues
 
-It does not attempt to reconstruct a per-client set of interesting keys.
-Reconnect reconciliation (§7.4) restores correctness.
+The reference server keeps one coalescing pending-invalidations map per
+connection. Repeated changes to a hot watched key occupy one pending entry
+rather than growing a FIFO with duplicate hints. Work for a peer transition is
+indexed by that peer key and is not broadcast to unrelated connections.
 
-The reference server also closes connections when the group-link policy
-changes. That lets a client reconcile records that became hidden without the
-server naming those newly hidden keys in a removal notification.
-
-Allocation-free clients also have bounded notification queues. If that local
-queue overflows, the reference client likewise reconnects and reconciles its
-held keys instead of guessing which invalidations were lost.
+Allocation-free clients may still have bounded local notification queues. If a
+local queue overflows, the reference client reconnects and re-watches its held
+keys instead of guessing which invalidations were lost.
 
 ### 7.6 Address-resolution consequence
 
-The reference resolvers consider a broadcast relevant when it names a peer they
-already hold. This is intentionally simple, but it means a newly added or
-changed *unheld* peer can alter longest-prefix routing for an address without
-causing the client to fetch that peer.
+Keyed peer watches intentionally do not subscribe to arbitrary address or route
+topology changes. A newly added or changed *unheld* peer can therefore alter
+longest-prefix routing for an address without invalidating a peer the client
+already watches.
 
 For example, a client may hold a peer owning `10.0.0.0/24`; later an unrelated
-peer may acquire `10.0.0.5/32`. The client receives the new peer's change key,
-but if it discards all unheld keys it does not immediately discover the new
-more-specific route.
+peer may acquire `10.0.0.5/32`. The client does not watch that unrelated key and
+therefore does not immediately discover the new more-specific route.
 
 Deployments that require immediate reaction to arbitrary route-topology changes
-need a broader client relevance rule or a future coarse registry-change
+need an address/prefix subscription or a future coarse registry-change
 mechanism. That is outside the minimal v1 resolver behavior.
 
 ## 8. Errors
@@ -531,9 +567,12 @@ other than `v1.peer.changed` and `v1.peer.removed`.
 - Clients and servers MUST use the exact v1 method names defined in this
   document.
 - `v1.peer.by_key` and `v1.peer.by_address` MUST be side-effect free.
-- Version 1 MUST NOT require `v1.peer.watch` or `v1.peer.unwatch`.
-- The server MUST NOT require per-connection peer-interest state to decide who
-  receives peer invalidations.
+- A successful `v1.peer.watch` MUST atomically establish per-connection interest
+  in the visible key and return a current `LookupResult`.
+- `v1.peer.watch` returning `not_found` MUST leave that key unwatched.
+- `v1.peer.unwatch` MUST be an idempotent client notification.
+- The server MUST deliver peer invalidations only to connections currently
+  watching the named key.
 - `v1.peer.changed` and `v1.peer.removed` MUST carry only `public_key`.
 - `v1.peer.changed` identifies an observed add/modify transition;
   `v1.peer.removed` identifies an observed removal transition. Clients MUST
@@ -545,10 +584,10 @@ other than `v1.peer.changed` and `v1.peer.removed`.
   failures, never as authoritative misses.
 - A `found` result MUST carry one complete `PeerInfo` record.
 - A client MUST validate lookup results before installing them.
-- A client MUST tolerate either peer invalidation racing an in-flight lookup.
+- A client MUST tolerate either peer invalidation racing an in-flight refresh.
 - A client SHOULD coalesce repeated pending invalidations for one key.
-- A reconnecting client MUST reconcile the peer keys it still holds.
-- A server MAY close a connection that has fallen behind the broadcast stream.
+- A reconnecting client MUST re-watch the peer keys it still holds.
+- A server MAY coalesce multiple pending invalidations for the same watched key.
 - Senders MUST omit optional object fields rather than sending JSON `null`.
 - Clients MUST treat accepted peer records as complete replacements.
 - Clients MUST NOT add request-level identity claims that override the
@@ -586,19 +625,21 @@ An undecodable key or address receives invalid-params instead. Loss of caller
 admission and rate limiting are also distinct transient errors because neither
 says anything about whether the target exists.
 
-### 10.3 Broadcast cost
+### 10.3 Keyed dispatch cost
 
-Removing held-peer subscriptions trades server state for broadcast traffic.
-For each effective peer transition, a server may attempt one small key-only
-notification per connected admitted client for which that peer is visible.
+Explicit watches trade bounded server subscription state for substantially less
+fan-out. For each effective peer transition, the reference server indexes the
+changed key and queues one small key-only invalidation only for connections
+actually watching that key. Unrelated API connections are not woken for the
+transition.
 
-The expensive operation remains the client refresh. A client that filters to
-locally held keys performs at most one coalesced `v1.peer.by_key` per relevant
-invalidated key, plus reconnect reconciliation when necessary.
+The expensive operation remains the client refresh. A client performs at most
+one coalesced `v1.peer.by_key` per invalidated watched key, plus re-watch
+reconciliation when necessary.
 
 Servers SHOULD bound concurrent connections per authenticated peer and
-rate-limit lookup requests. Rate-limit rejection MUST be a JSON-RPC error, not
-an authoritative miss.
+rate-limit lookup/watch requests. Rate-limit rejection MUST be a JSON-RPC
+error, not an authoritative miss.
 
 Clients SHOULD jitter reconnect attempts and SHOULD offset the first refresh of
 a synchronized change burst so a fleet does not re-query in lockstep. The
@@ -612,24 +653,23 @@ pending_changes = coalescing queue
 
 connect to <peers-api-server-inner-address>:80 through the tunnel
 
-on successful initial lookup(query):
-    if result is found(peer) and peer passes local validation:
+on resolve by_key(K):
+    call v1.peer.watch(K)
+    if found(peer) and peer passes local validation:
         install peer
-        held_keys.add(peer.public_key)
-    if result is not_found:
-        if query was by_key(K):
-            held_keys.remove(K)
-    if pending_changes contains an installed key:
-        refresh that key
+        held_keys.add(K)
+
+on resolve by_address(A):
+    call v1.peer.by_address(A)
+    if found(peer K):
+        call v1.peer.watch(K)
+        install the watch response if valid
+        held_keys.add(K)
 
 on v1.peer.changed(K) or v1.peer.removed(K):
     queue/coalesce K
 
 while processing pending changes:
-    if K not in held_keys:
-        discard K
-        continue
-
     call v1.peer.by_key(K)
     if found(peer) and peer passes validation:
         replace local record for K
@@ -643,16 +683,17 @@ while processing pending changes:
 on local peer eviction K:
     held_keys.remove(K)
     discard queued K
-    send nothing to the server
+    send v1.peer.unwatch(K)
 
 on connection loss or local notification-queue overflow:
     reconnect with jitter
     for each K in held_keys:
-        call v1.peer.by_key(K)
+        call v1.peer.watch(K)
         apply found/not_found as above
 ```
 
 The central v1 invariant is intentionally small:
 
-> The server broadcasts a key-only change/removal hint; the client decides
-> whether it cares and uses lookup as the only source of peer state.
+> The client explicitly watches the peer keys it retains; the server dispatches
+> key-only invalidations only to those watchers, and lookup remains the only
+> source of authoritative peer state.

@@ -11,7 +11,10 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use microtun_api::PeerInfo;
@@ -165,6 +168,303 @@ pub enum RegistryEvent {
     LinksChanged,
 }
 
+/// Per-connection invalidation queue used by the Peers API.
+///
+/// The queue is keyed rather than event-count bounded: at most one pending
+/// invalidation exists for each watched peer. Repeated changes coalesce to the
+/// latest transition kind because both wire notifications are invalidations;
+/// the client's subsequent by-key lookup remains authoritative.
+#[derive(Debug)]
+struct KeyedDispatchQueue {
+    pending: Mutex<HashMap<[u8; 32], RegistryChangeKind>>,
+    closed: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl KeyedDispatchQueue {
+    fn new() -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn push(&self, change: RegistryChange) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(change.public_key, change.kind);
+        self.notify.notify_one();
+    }
+
+    fn remove(&self, public_key: [u8; 32]) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&public_key);
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    async fn recv(&self) -> Option<RegistryChange> {
+        loop {
+            // Create the waiter before inspecting state so a notification that
+            // races the checks below leaves a permit rather than being lost.
+            let notified = self.notify.notified();
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            let next = {
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let public_key = pending.keys().next().copied();
+                public_key.and_then(|public_key| {
+                    pending
+                        .remove(&public_key)
+                        .map(|kind| RegistryChange { public_key, kind })
+                })
+            };
+            if next.is_some() {
+                return next;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DispatchConnection {
+    caller: [u8; 32],
+    watched: HashSet<[u8; 32]>,
+    queue: Arc<KeyedDispatchQueue>,
+}
+
+#[derive(Debug, Default)]
+struct KeyedDispatchState {
+    next_id: u64,
+    connections: HashMap<u64, DispatchConnection>,
+    by_key: HashMap<[u8; 32], HashSet<u64>>,
+    by_caller: HashMap<[u8; 32], HashSet<u64>>,
+}
+
+/// Registry-owned subscriber index for remote Peers API connections.
+///
+/// The local in-process resolver still consumes the small global broadcast
+/// stream. Remote connections do not: a peer change touches only connections
+/// explicitly watching that public key.
+#[derive(Debug, Clone, Default)]
+struct KeyedDispatcher {
+    state: Arc<Mutex<KeyedDispatchState>>,
+}
+
+impl KeyedDispatcher {
+    fn subscribe(&self, caller: [u8; 32]) -> Arc<KeyedSubscription> {
+        let queue = Arc::new(KeyedDispatchQueue::new());
+        let id = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let id = state.next_id;
+            state.next_id = state.next_id.wrapping_add(1);
+            state.connections.insert(
+                id,
+                DispatchConnection {
+                    caller,
+                    watched: HashSet::new(),
+                    queue: Arc::clone(&queue),
+                },
+            );
+            state.by_caller.entry(caller).or_default().insert(id);
+            id
+        };
+        Arc::new(KeyedSubscription {
+            id,
+            dispatcher: self.clone(),
+            queue,
+        })
+    }
+
+    fn watch(&self, id: u64, public_key: [u8; 32]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(connection) = state.connections.get_mut(&id) else {
+            return;
+        };
+        if connection.queue.is_closed() || !connection.watched.insert(public_key) {
+            return;
+        }
+        state.by_key.entry(public_key).or_default().insert(id);
+    }
+
+    fn unwatch(&self, id: u64, public_key: [u8; 32]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(connection) = state.connections.get_mut(&id) else {
+            return;
+        };
+        if !connection.watched.remove(&public_key) {
+            return;
+        }
+        connection.queue.remove(public_key);
+        let remove_key = if let Some(subscribers) = state.by_key.get_mut(&public_key) {
+            subscribers.remove(&id);
+            subscribers.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            state.by_key.remove(&public_key);
+        }
+    }
+
+    fn remove(&self, id: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(connection) = state.connections.remove(&id) else {
+            return;
+        };
+        let remove_caller = if let Some(connections) = state.by_caller.get_mut(&connection.caller) {
+            connections.remove(&id);
+            connections.is_empty()
+        } else {
+            false
+        };
+        if remove_caller {
+            state.by_caller.remove(&connection.caller);
+        }
+        for public_key in connection.watched {
+            let remove_key = if let Some(subscribers) = state.by_key.get_mut(&public_key) {
+                subscribers.remove(&id);
+                subscribers.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                state.by_key.remove(&public_key);
+            }
+        }
+    }
+
+    fn dispatch_peer(&self, change: RegistryChange) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Removing an authenticated caller invalidates the connection itself,
+        // even if it never watched its own key. Unindex its watches immediately
+        // so a large publication does not keep visiting a connection that is
+        // already guaranteed to disconnect.
+        if change.kind == RegistryChangeKind::Removed {
+            let caller_connections: Vec<_> = state
+                .by_caller
+                .get(&change.public_key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
+            let mut closed_watches = Vec::with_capacity(caller_connections.len());
+            for id in caller_connections {
+                if let Some(connection) = state.connections.get_mut(&id) {
+                    connection.queue.close();
+                    closed_watches.push((id, core::mem::take(&mut connection.watched)));
+                }
+            }
+            for (id, watched) in closed_watches {
+                for public_key in watched {
+                    let remove_key = if let Some(subscribers) = state.by_key.get_mut(&public_key) {
+                        subscribers.remove(&id);
+                        subscribers.is_empty()
+                    } else {
+                        false
+                    };
+                    if remove_key {
+                        state.by_key.remove(&public_key);
+                    }
+                }
+            }
+        }
+
+        let Some(subscribers) = state.by_key.get(&change.public_key) else {
+            return;
+        };
+        for id in subscribers {
+            let Some(connection) = state.connections.get(id) else {
+                continue;
+            };
+            // A removed caller is disconnected, not sent an authoritative
+            // target invalidation on a no-longer-admitted session.
+            if change.kind == RegistryChangeKind::Removed && connection.caller == change.public_key
+            {
+                continue;
+            }
+            connection.queue.push(change);
+        }
+    }
+
+    fn close_all(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.by_key.clear();
+        for connection in state.connections.values_mut() {
+            connection.watched.clear();
+            connection.queue.close();
+        }
+    }
+}
+
+/// One remote Peers API connection's registration in the keyed dispatcher.
+///
+/// Dropping the last handle removes every indexed watch for the connection.
+#[derive(Debug)]
+pub(crate) struct KeyedSubscription {
+    id: u64,
+    dispatcher: KeyedDispatcher,
+    queue: Arc<KeyedDispatchQueue>,
+}
+
+impl KeyedSubscription {
+    pub(crate) fn watch(&self, public_key: [u8; 32]) {
+        self.dispatcher.watch(self.id, public_key);
+    }
+
+    pub(crate) fn unwatch(&self, public_key: [u8; 32]) {
+        self.dispatcher.unwatch(self.id, public_key);
+    }
+
+    pub(crate) async fn recv(&self) -> Option<RegistryChange> {
+        self.queue.recv().await
+    }
+}
+
+impl Drop for KeyedSubscription {
+    fn drop(&mut self) {
+        self.dispatcher.remove(self.id);
+    }
+}
+
 /// Compiled group-link visibility policy.
 ///
 /// Peers can always see themselves. Distinct peers can see one another only
@@ -310,6 +610,7 @@ impl<'a> PublishedView<'a> {
 pub struct SharedRegistry {
     current: Arc<RwLock<PublishedRegistry>>,
     changes: tokio::sync::broadcast::Sender<RegistryEvent>,
+    keyed: KeyedDispatcher,
 }
 
 impl SharedRegistry {
@@ -321,6 +622,7 @@ impl SharedRegistry {
                 observed_endpoints: HashMap::new(),
             })),
             changes,
+            keyed: KeyedDispatcher::default(),
         }
     }
 
@@ -337,8 +639,10 @@ impl SharedRegistry {
     /// Read one coherent view of the current config and runtime endpoint overlay.
     ///
     /// Lookups use this read lock so a returned [`PeerInfo`] is projected from one
-    /// published state. Change dispatch uses the matching write lock; no protocol
-    /// subscription state is mutated here.
+    /// published state. Change dispatch uses the matching write lock. A
+    /// `v1.peer.watch` handler may also insert its keyed subscription while this
+    /// read lock is held; that is what makes watch creation atomic with the
+    /// returned snapshot.
     ///
     /// `read` must not block or acquire the registry lock again.
     pub(crate) fn read<T>(&self, with: impl FnOnce(PublishedView<'_>) -> T) -> T {
@@ -376,16 +680,26 @@ impl SharedRegistry {
         }
         current.observed_endpoints.insert(public_key, endpoint);
         if before != Some(endpoint) {
-            let _ = self.changes.send(RegistryEvent::Peer(RegistryChange {
+            let change = RegistryChange {
                 public_key,
                 kind: RegistryChangeKind::Changed,
-            }));
+            };
+            let _ = self.changes.send(RegistryEvent::Peer(change));
+            self.keyed.dispatch_peer(change);
         }
     }
 
     /// Subscribe to peer invalidations and group-link policy changes.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RegistryEvent> {
         self.changes.subscribe()
+    }
+
+    /// Register one remote Peers API connection with the keyed dispatcher.
+    ///
+    /// The returned connection starts with an empty watch set. Peer changes do
+    /// not wake it until `v1.peer.watch` indexes a key.
+    pub(crate) fn subscribe_keyed(&self, caller: [u8; 32]) -> Arc<KeyedSubscription> {
+        self.keyed.subscribe(caller)
     }
 
     /// Publish a completely validated replacement registry and notify keys
@@ -458,9 +772,11 @@ impl SharedRegistry {
         // whose visibility changed in the same atomic configuration reload.
         if links_changed {
             let _ = self.changes.send(RegistryEvent::LinksChanged);
+            self.keyed.close_all();
         }
         for change in changes {
             let _ = self.changes.send(RegistryEvent::Peer(change));
+            self.keyed.dispatch_peer(change);
         }
     }
 }
@@ -706,6 +1022,8 @@ pub(crate) mod tests {
             .unwrap(),
         );
         let mut changes = shared.subscribe();
+        let keyed = shared.subscribe_keyed([0x01; 32]);
+        shared.read(|_| keyed.watch([0x02; 32]));
 
         shared.replace(
             Registry::build_with_links(
@@ -723,6 +1041,128 @@ pub(crate) mod tests {
                 kind: RegistryChangeKind::Removed,
             }) if public_key == [0x02; 32]
         ));
+        assert!(
+            keyed.queue.is_closed(),
+            "link-policy changes must close remote keyed subscriptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_dispatch_wakes_only_watchers_and_unwatch_removes_interest() {
+        let shared = SharedRegistry::new(
+            Registry::build(vec![
+                record(0x01, &["10.0.0.1/32"]),
+                record(0x02, &["10.0.0.2/32"]),
+                record(0x03, &["10.0.0.3/32"]),
+            ])
+            .unwrap(),
+        );
+        let a = shared.subscribe_keyed([0x01; 32]);
+        let b = shared.subscribe_keyed([0x02; 32]);
+        shared.read(|_| {
+            a.watch([0x03; 32]);
+            b.watch([0x02; 32]);
+        });
+
+        shared.keyed.dispatch_peer(RegistryChange {
+            public_key: [0x03; 32],
+            kind: RegistryChangeKind::Changed,
+        });
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), a.recv())
+                .await
+                .unwrap(),
+            Some(RegistryChange {
+                public_key: [0x03; 32],
+                kind: RegistryChangeKind::Changed,
+            })
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), b.recv())
+                .await
+                .is_err(),
+            "an unrelated keyed subscriber was woken"
+        );
+
+        a.unwatch([0x03; 32]);
+        shared.keyed.dispatch_peer(RegistryChange {
+            public_key: [0x03; 32],
+            kind: RegistryChangeKind::Removed,
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), a.recv())
+                .await
+                .is_err(),
+            "unwatch left the connection indexed"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_dispatch_coalesces_repeated_changes_per_key() {
+        let shared =
+            SharedRegistry::new(Registry::build(vec![record(0x01, &["10.0.0.1/32"])]).unwrap());
+        // Use a caller distinct from the watched key so a Removed transition
+        // tests coalescing rather than caller-deadmission closure.
+        let subscription = shared.subscribe_keyed([0x02; 32]);
+        shared.read(|_| subscription.watch([0x01; 32]));
+        shared.keyed.dispatch_peer(RegistryChange {
+            public_key: [0x01; 32],
+            kind: RegistryChangeKind::Changed,
+        });
+        shared.keyed.dispatch_peer(RegistryChange {
+            public_key: [0x01; 32],
+            kind: RegistryChangeKind::Removed,
+        });
+        assert_eq!(
+            subscription.recv().await,
+            Some(RegistryChange {
+                public_key: [0x01; 32],
+                kind: RegistryChangeKind::Removed,
+            })
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), subscription.recv())
+                .await
+                .is_err(),
+            "duplicate changes for one key were not coalesced"
+        );
+    }
+
+    #[tokio::test]
+    async fn unwatch_discards_a_pending_invalidation_for_that_key() {
+        let shared = SharedRegistry::new(
+            Registry::build(vec![
+                record(0x01, &["10.0.0.1/32"]),
+                record(0x02, &["10.0.0.2/32"]),
+            ])
+            .unwrap(),
+        );
+        let subscription = shared.subscribe_keyed([0x02; 32]);
+        shared.read(|_| subscription.watch([0x01; 32]));
+        shared.keyed.dispatch_peer(RegistryChange {
+            public_key: [0x01; 32],
+            kind: RegistryChangeKind::Changed,
+        });
+        subscription.unwatch([0x01; 32]);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), subscription.recv())
+                .await
+                .is_err(),
+            "unwatch left an already-queued invalidation behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_the_caller_closes_keyed_subscription_without_self_watch() {
+        let shared =
+            SharedRegistry::new(Registry::build(vec![record(0x01, &["10.0.0.1/32"])]).unwrap());
+        let subscription = shared.subscribe_keyed([0x01; 32]);
+        shared.keyed.dispatch_peer(RegistryChange {
+            public_key: [0x01; 32],
+            kind: RegistryChangeKind::Removed,
+        });
+        assert_eq!(subscription.recv().await, None);
     }
 
     #[test]

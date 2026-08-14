@@ -1,8 +1,10 @@
-//! Peers API lookups and change broadcasts.
+//! Peers API lookups and keyed peer invalidations.
 //!
 //! ```text
 //! v1.peer.by_key      {"public_key": "<44-char base64>"}  -> LookupResult
 //! v1.peer.by_address  {"address": "10.0.0.5"}             -> LookupResult
+//! v1.peer.watch       {"public_key": "<44-char base64>"}  -> LookupResult
+//! v1.peer.unwatch     {"public_key": "<44-char base64>"}  -> client notification
 //! v1.peer.changed     {"public_key": "<44-char base64>"}  -> server notification
 //! v1.peer.removed     {"public_key": "<44-char base64>"}  -> server notification
 //! ```
@@ -10,17 +12,16 @@
 //! A `LookupResult` is externally tagged: `{"found":{...}}` or
 //! `{"not_found":{}}`. Nothing else is an authoritative lookup result.
 //!
-//! Lookups are side-effect free. Config reloads and authenticated endpoint
-//! observations broadcast `v1.peer.changed` when a peer is added or its
-//! effective record changes, and `v1.peer.removed` when a peer disappears.
-//! Both notifications name only the public key; each client decides locally
-//! whether it cares and, if so, answers the invalidation with an ordinary
-//! `v1.peer.by_key`.
+//! Ordinary lookups are side-effect free. `v1.peer.watch` atomically registers
+//! a visible key in a server-side keyed dispatch index and returns its current
+//! record. Config reloads and authenticated endpoint observations dispatch
+//! `v1.peer.changed` / `v1.peer.removed` only to connections watching the
+//! changed key. A client confirms either invalidation with ordinary
+//! `v1.peer.by_key`, and `v1.peer.unwatch` drops interest.
 //!
-//! There is no per-connection watch state. If a connection falls behind the
-//! registry broadcast channel, the server closes it rather than guessing which
-//! keys matter. A reconnecting client reconciles the peer keys it still holds
-//! with ordinary by-key lookups.
+//! Each connection has a coalescing pending-key queue. Reconnect re-establishes
+//! watches for the peer keys the client still holds. Group-link changes and
+//! removal of the caller close subscriptions so reconnect can reconcile policy.
 //!
 //! Because notifications carry no peer record and only trigger a fresh lookup,
 //! they cannot directly install stale state. The server therefore owes no
@@ -103,7 +104,7 @@ use std::{
 
 use microtun_api::{
     ByAddressParams, KeyParams, LookupResult, METHOD_BY_ADDRESS, METHOD_BY_KEY, METHOD_CHANGED,
-    METHOD_REMOVED, PeerInfo, QUERY_FRAME_LEN, RECORD_FRAME_LEN,
+    METHOD_REMOVED, METHOD_UNWATCH, METHOD_WATCH, PeerInfo, QUERY_FRAME_LEN, RECORD_FRAME_LEN,
 };
 use microtun_core::key::{decode_key, encode_key};
 use microtun_jsonrpc::{
@@ -112,12 +113,12 @@ use microtun_jsonrpc::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::registry::{
-    KEY_PREFIX_LEN, PeerRecord, Registry, RegistryChangeKind, RegistryEvent, SharedRegistry,
+    KEY_PREFIX_LEN, KeyedSubscription, PeerRecord, Registry, RegistryChangeKind, SharedRegistry,
 };
 
 /// Maximum simultaneous Peers API TCP connections accepted from one
 /// configured, authenticated tunnel key. Multiple connections are useful for
-/// reconnect overlap, but an unbounded number multiplies broadcast and refresh
+/// reconnect overlap, but an unbounded number multiplies subscription and refresh
 /// work during registry churn.
 const MAX_CONNECTIONS_PER_PEER: usize = 4;
 /// Sustained Peers API request budget per configured, authenticated tunnel key.
@@ -428,12 +429,13 @@ impl AppState {
 
 /// The RPC dispatcher for one accepted connection.
 #[derive(Debug)]
-pub struct PeersApiHandler {
+pub(crate) struct PeersApiHandler {
     state: Arc<AppState>,
     peer_key: [u8; 32],
     /// The caller's key prefix for log lines. Connection identity is fixed at
     /// accept, so this is rendered once rather than per request.
     caller: String,
+    subscription: Arc<KeyedSubscription>,
 }
 
 /// What one lookup asks for. The two methods differ only in this.
@@ -463,12 +465,17 @@ enum Answer {
 }
 
 impl PeersApiHandler {
-    pub fn new(state: Arc<AppState>, peer_key: [u8; 32]) -> Self {
+    pub(crate) fn new(
+        state: Arc<AppState>,
+        peer_key: [u8; 32],
+        subscription: Arc<KeyedSubscription>,
+    ) -> Self {
         let caller = encode_key(&peer_key).as_str()[..KEY_PREFIX_LEN].to_string();
         Self {
             state,
             peer_key,
             caller,
+            subscription,
         }
     }
 
@@ -497,6 +504,31 @@ impl PeersApiHandler {
                 Some(record) => Answer::Record(published.info(record)),
                 None => Answer::Miss,
             }
+        })
+    }
+
+    /// Subscribe to one visible peer and return the snapshot protected by that
+    /// subscription.
+    ///
+    /// Registration happens while the shared registry read lock is held. A
+    /// registry writer therefore cannot publish and dispatch a later change in
+    /// the gap between the returned state and the watch becoming visible.
+    fn watch(&self, text: &str) -> Answer {
+        self.state.registry.read(|published| {
+            if admit(&self.state, published.config(), self.peer_key).is_none() {
+                return Answer::NotAdmitted;
+            }
+            let Ok(public_key) = decode_key(text) else {
+                return Answer::BadArgument;
+            };
+            let Some(record) = published.lookup_key_for(&self.peer_key, &public_key) else {
+                // If this was an idempotent re-watch of a key that has since
+                // disappeared, do not leave stale interest indexed forever.
+                self.subscription.unwatch(public_key);
+                return Answer::Miss;
+            };
+            self.subscription.watch(public_key);
+            Answer::Record(published.info(record))
         })
     }
 
@@ -565,8 +597,39 @@ impl Handler for PeersApiHandler {
                 let record = self.lookup(Lookup::Address(args.address));
                 self.respond(METHOD_BY_ADDRESS, record, responder)
             }
+            METHOD_WATCH => {
+                let Ok(args) = params.parse::<KeyParams<'_>>() else {
+                    return responder.invalid_params();
+                };
+                let record = self.watch(args.public_key);
+                self.respond(METHOD_WATCH, record, responder)
+            }
             _ => responder.method_not_found(),
         }
+    }
+
+    fn handle_notification(&mut self, method: &str, params: Params<'_>) {
+        if method != METHOD_UNWATCH {
+            return;
+        }
+        let Ok(args) = params.parse::<KeyParams<'_>>() else {
+            tracing::debug!("ignoring {method} with invalid params");
+            return;
+        };
+        let registry = self.state.registry.config_snapshot();
+        if admit(&self.state, &registry, self.peer_key).is_none() {
+            return;
+        }
+        let Ok(public_key) = decode_key(args.public_key) else {
+            tracing::debug!("ignoring {method} from {} with invalid key", self.caller);
+            return;
+        };
+        self.subscription.unwatch(public_key);
+        tracing::debug!(
+            "{METHOD_UNWATCH} from {} for {}",
+            self.caller,
+            encode_key(&public_key)
+        );
     }
 }
 
@@ -625,18 +688,19 @@ where
         return;
     };
     let registry = state.registry();
-    let mut changes = registry.subscribe();
+    let subscription = registry.subscribe_keyed(peer_key);
 
     let (reader, writer) = tokio::io::split(stream);
     let writer = SharedWriter::new(writer);
     let reader_writer = writer.clone();
     let reader_state = Arc::clone(&state);
+    let reader_subscription = Arc::clone(&subscription);
     let mut reader_task = tokio::spawn(async move {
         let mut connection: RpcConnection<_, _, _, QUERY_FRAME_LEN, RECORD_FRAME_LEN> =
             RpcConnection::new(
                 TokioIo::new(reader),
                 reader_writer,
-                PeersApiHandler::new(reader_state, peer_key),
+                PeersApiHandler::new(reader_state, peer_key, reader_subscription),
             );
         loop {
             connection.poll().await?;
@@ -656,16 +720,16 @@ where
                 }
                 return;
             }
-            change = changes.recv() => {
+            change = subscription.recv() => {
                 match change {
-                    Ok(RegistryEvent::Peer(change)) => {
+                    Some(change) => {
+                        // A caller removed by the same publication must not see
+                        // an authoritative target invalidation that happened to
+                        // be queued before its own removal was dispatched.
                         let current = registry.config_snapshot();
                         if current.lookup_key(&peer_key).is_none() {
                             reader_task.abort();
                             return;
-                        }
-                        if !current.are_linked(&peer_key, &change.public_key) {
-                            continue;
                         }
                         if send_peer_invalidation(&mut notifier, change.public_key, change.kind)
                             .await
@@ -675,23 +739,10 @@ where
                             return;
                         }
                     }
-                    Ok(RegistryEvent::LinksChanged) => {
-                        // A group-link change may revoke records already held by
-                        // this client. Closing avoids naming newly hidden keys;
-                        // reconnect reconciliation re-checks only keys the client
-                        // already knows about.
-                        reader_task.abort();
-                        return;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // The server no longer knows which peer keys this client
-                        // cares about. If a connection falls behind the broadcast
-                        // stream, close it so the client can reconnect and
-                        // reconcile the peers it still holds with by-key lookups.
-                        reader_task.abort();
-                        return;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    None => {
+                        // Link-policy changes and caller removal close the keyed
+                        // subscription. Reconnect replay re-establishes watches
+                        // only for records the client still holds.
                         reader_task.abort();
                         return;
                     }
@@ -701,7 +752,7 @@ where
     }
 }
 
-/// Broadcast that one peer key may no longer be current.
+/// Tell one watching connection that a peer key may no longer be current.
 ///
 /// Added/modified peers use `v1.peer.changed`; disappeared peers use
 /// `v1.peer.removed`. Both notifications are key-only invalidations. Interested
@@ -991,7 +1042,7 @@ Peers = gateway
     }
 
     #[tokio::test]
-    async fn hidden_peer_changes_are_not_broadcast() {
+    async fn hidden_peer_changes_are_not_dispatched() {
         let text = format!(
             "\
 [Server]
@@ -1024,12 +1075,18 @@ Peers = gateway
         let mut connection: RpcConnection<_, _, _, RECORD_FRAME_LEN, QUERY_FRAME_LEN> =
             RpcConnection::from_tokio(reader, writer, CaptureInvalidation(changed_tx));
 
-        // Make one request so the connection is known to be admitted and active.
-        let own: LookupResult = connection
-            .call(METHOD_BY_KEY, Some(&KeyParams { public_key: LAPTOP }))
+        // A hidden target is an authoritative miss and, importantly, does not
+        // get inserted into the keyed watch index.
+        let hidden: LookupResult = connection
+            .call(
+                METHOD_WATCH,
+                Some(&KeyParams {
+                    public_key: GATEWAY,
+                }),
+            )
             .await
-            .expect("self lookup completes");
-        assert!(found(own).is_some());
+            .expect("hidden watch completes");
+        assert!(found(hidden).is_none());
 
         let replacement = text.replace("198.51.100.20:51820", "198.51.100.99:51820");
         let loaded =
@@ -1135,7 +1192,42 @@ Peers = gateway
     }
 
     #[tokio::test]
-    async fn peer_changes_are_broadcast_and_relooked_up() {
+    async fn ordinary_by_key_lookup_does_not_register_interest() {
+        let state = app_state();
+        let (client, server) = tokio::io::duplex(8192);
+        tokio::spawn(serve_connection(server, Arc::clone(&state), LAPTOP_KEY));
+
+        let (reader, writer) = tokio::io::split(client);
+        let (changed_tx, _changed_rx) = mpsc::unbounded_channel();
+        let mut connection: RpcConnection<_, _, _, RECORD_FRAME_LEN, QUERY_FRAME_LEN> =
+            RpcConnection::from_tokio(reader, writer, CaptureInvalidation(changed_tx));
+
+        let hit: LookupResult = connection
+            .call(
+                METHOD_BY_KEY,
+                Some(&KeyParams {
+                    public_key: GATEWAY,
+                }),
+            )
+            .await
+            .expect("lookup completes");
+        assert!(found(hit).is_some());
+
+        let replacement = config_text().replace("198.51.100.20:51820", "198.51.100.99:51820");
+        let loaded =
+            config::parse(&replacement, Path::new("test.conf")).expect("replacement loads");
+        state.registry().replace(loaded.registry);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), connection.poll())
+                .await
+                .is_err(),
+            "side-effect-free by_key unexpectedly registered a watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_peer_changes_are_keyed_and_relooked_up() {
         let state = app_state();
         let (client, server) = tokio::io::duplex(8192);
         tokio::spawn(serve_connection(server, Arc::clone(&state), LAPTOP_KEY));
@@ -1147,13 +1239,13 @@ Peers = gateway
 
         let initial_peer: LookupResult = connection
             .call(
-                METHOD_BY_KEY,
+                METHOD_WATCH,
                 Some(&microtun_api::QueryParams::ByKey {
                     public_key: GATEWAY,
                 }),
             )
             .await
-            .expect("lookup completes");
+            .expect("watch completes");
         assert_eq!(
             found(initial_peer)
                 .as_ref()
@@ -1166,7 +1258,8 @@ Peers = gateway
             config::parse(&replacement, Path::new("test.conf")).expect("replacement loads");
         state.registry().replace(loaded.registry);
 
-        // This caller can see the gateway, so it receives the key-only invalidation.
+        // Only a connection that explicitly watched the gateway receives this
+        // key-only invalidation.
         connection.poll().await.expect("notification arrives");
         assert_eq!(
             changed_rx.recv().await.expect("captured changed key"),
@@ -1186,6 +1279,36 @@ Peers = gateway
         assert_eq!(
             found(refreshed).and_then(|peer| peer.endpoint.map(|text| text.as_str().to_string())),
             Some("198.51.100.99:51820".to_string())
+        );
+
+        connection
+            .notify(
+                METHOD_UNWATCH,
+                Some(&KeyParams {
+                    public_key: GATEWAY,
+                }),
+            )
+            .await
+            .expect("unwatch is sent");
+        // A following request is an ordering barrier: the server has consumed
+        // the unwatch before it can answer this lookup.
+        let _: LookupResult = connection
+            .call(
+                METHOD_BY_KEY,
+                Some(&microtun_api::QueryParams::ByKey { public_key: ABSENT }),
+            )
+            .await
+            .expect("lookup ordering barrier completes");
+
+        let replacement = replacement.replace("198.51.100.99:51820", "198.51.100.77:51820");
+        let loaded =
+            config::parse(&replacement, Path::new("test.conf")).expect("second replacement loads");
+        state.registry().replace(loaded.registry);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), connection.poll())
+                .await
+                .is_err(),
+            "unwatched keys must not receive later notifications"
         );
     }
 
@@ -1240,13 +1363,13 @@ Peers = gateway
 
         let hit: LookupResult = connection
             .call(
-                METHOD_BY_KEY,
+                METHOD_WATCH,
                 Some(&KeyParams {
                     public_key: GATEWAY,
                 }),
             )
             .await
-            .expect("lookup completes");
+            .expect("watch completes");
         assert!(found(hit).is_some());
 
         // Drop the gateway while preserving the same unrestricted policy.
@@ -1314,6 +1437,7 @@ Peers = gateway
                 METHOD_BY_ADDRESS,
                 serde_json::json!({ "address": "10.0.0.1" }),
             ),
+            (METHOD_WATCH, serde_json::json!({ "public_key": GATEWAY })),
         ] {
             let result: Result<LookupResult, _> =
                 call(&state, ABSENT_KEY, method, Some(&params)).await;
@@ -1329,7 +1453,7 @@ Peers = gateway
         }
 
         // One refusal per refused connection.
-        assert_eq!(state.refused(), 2);
+        assert_eq!(state.refused(), 3);
         assert_eq!(state.known_count(), 1);
     }
 
@@ -1339,7 +1463,8 @@ Peers = gateway
     async fn a_caller_removed_mid_connection_never_sees_a_miss() {
         let state = app_state();
         let registry = state.registry();
-        let handler = PeersApiHandler::new(Arc::clone(&state), LAPTOP_KEY);
+        let subscription = registry.subscribe_keyed(LAPTOP_KEY);
+        let handler = PeersApiHandler::new(Arc::clone(&state), LAPTOP_KEY, subscription);
 
         // Drop the laptop — the caller itself — from the registry.
         let without_laptop = format!(
@@ -1365,6 +1490,7 @@ Addresses = 10.0.0.1/32, 10.5.0.0/24
             handler.lookup(Lookup::Key(GATEWAY)),
             Answer::NotAdmitted
         ));
+        assert!(matches!(handler.watch(GATEWAY), Answer::NotAdmitted));
     }
 
     #[tokio::test]
