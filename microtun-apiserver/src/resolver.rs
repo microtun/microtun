@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 use crate::registry::Registry;
 use crate::{
     config::{self, Loaded},
-    registry::SharedRegistry,
+    registry::{RegistryEvent, SharedRegistry},
 };
 
 /// How quickly a changed file becomes visible to resolver and RPC requests.
@@ -140,7 +140,7 @@ pub async fn task(
             }
             change = changes.recv() => {
                 match change {
-                    Ok(change) if held.contains(&change.public_key) => {
+                    Ok(RegistryEvent::Peer(change)) if held.contains(&change.public_key) => {
                         if send_update(
                             &events,
                             &registry,
@@ -153,7 +153,7 @@ pub async fn task(
                             return;
                         }
                     }
-                    Ok(_) => {}
+                    Ok(RegistryEvent::Peer(_)) | Ok(RegistryEvent::LinksChanged) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         for public_key in held.iter().copied().collect::<Vec<_>>() {
                             if send_update(
@@ -249,8 +249,8 @@ fn resolve(registry: &Registry, query: ResolveQuery, local_public_key: [u8; 32])
 
 /// Project a served registry record into the API server's own tunnel view.
 ///
-/// `Relay = @server` is meaningful to remote clients: they should deliver
-/// traffic for this peer through us. Locally, however, we *are* that relay, so
+/// A peer may name this server's public key as its `Relay`, telling remote
+/// clients to deliver traffic through us. Locally, however, we *are* that relay, so
 /// the peer must be treated as directly reachable. Its endpoint can then be
 /// learned from authenticated inbound traffic, as required by the relay
 /// forwarding path.
@@ -437,7 +437,7 @@ mod tests {
     fn server_local_resolver_strips_self_relay() {
         let text = format!(
             "[Server]\nPrivateKey = {SERVER_PRIVATE}\nAddresses = 10.0.0.1/32\n\n\
-             [Peer.client]\nPublicKey = {PEER_A}\nAddresses = 10.0.0.2/32\nRelay = @server\n"
+             [Peer.client]\nPublicKey = {PEER_A}\nAddresses = 10.0.0.2/32\nRelay = @self\n"
         );
         let loaded = loaded(&text);
 

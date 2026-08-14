@@ -186,7 +186,10 @@ from the file while it runs.
 microtun-apiserver /etc/microtun/apiserver.conf
 ```
 
-See `microtun-apiserver/apiserver.example.conf`.
+See `microtun-apiserver/apiserver.example.conf`. Optional `[Group.name]` and
+`[Link.name]` sections can restrict peer discovery: groups define membership,
+while a link names one group for an internal mesh or two groups for mutual
+cross-group visibility.
 
 Then start a client. It needs `CAP_NET_ADMIN` for the TUN device and
 `CAP_NET_RAW` to pin lookups to the tunnel interface.

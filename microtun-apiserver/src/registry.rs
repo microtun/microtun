@@ -1,10 +1,12 @@
-//! Peer records and the two indexes the API is defined over.
+//! Peer records, lookup indexes, and the compiled group-link policy.
 //!
 //! Configured records contain only validated peer data. The published registry
 //! also carries a small runtime overlay of direct endpoints learned from
 //! authenticated tunnel traffic. RPC and local-resolver projections combine the
 //! two on read, with learned endpoints taking precedence over configured
-//! `Endpoint` values. No result is pre-rendered or cached.
+//! `Endpoint` values. RPC lookups additionally apply the authenticated caller's
+//! group-link policy while the server's local tunnel resolver intentionally sees
+//! the full registry. No result is pre-rendered or cached.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -129,6 +131,7 @@ pub struct Registry {
     /// Longest-prefix-match index from tunnel prefix to owning peer.
     routes: PrefixTrie<usize, 0>,
     route_count: usize,
+    links: LinkPolicy,
 }
 
 impl Default for Registry {
@@ -151,6 +154,89 @@ pub enum RegistryChangeKind {
 pub struct RegistryChange {
     pub public_key: [u8; 32],
     pub kind: RegistryChangeKind,
+}
+
+/// One atomically published registry event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryEvent {
+    Peer(RegistryChange),
+    /// Link-policy changes close RPC connections so clients reconcile without the
+    /// server disclosing which previously-held keys just became invisible.
+    LinksChanged,
+}
+
+/// Compiled group-link visibility policy.
+///
+/// Peers can always see themselves. Distinct peers can see one another only
+/// when their groups are joined by an explicit link. A one-group link is
+/// represented as a self-link; a two-group link is stored symmetrically.
+/// An empty restricted policy therefore denies all cross-peer visibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkPolicy {
+    restricted: bool,
+    group_links: Vec<HashSet<usize>>,
+    memberships: HashMap<[u8; 32], Vec<usize>>,
+}
+
+impl LinkPolicy {
+    pub fn allow_all() -> Self {
+        Self {
+            restricted: false,
+            group_links: Vec::new(),
+            memberships: HashMap::new(),
+        }
+    }
+
+    pub fn deny_all() -> Self {
+        Self {
+            restricted: true,
+            group_links: Vec::new(),
+            memberships: HashMap::new(),
+        }
+    }
+
+    pub fn from_groups_and_links(
+        groups: Vec<HashSet<[u8; 32]>>,
+        links: Vec<(usize, usize)>,
+    ) -> Self {
+        let mut memberships: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+        for (index, members) in groups.iter().enumerate() {
+            for key in members {
+                memberships.entry(*key).or_default().push(index);
+            }
+        }
+
+        let mut group_links = vec![HashSet::new(); groups.len()];
+        for (a, b) in links {
+            group_links[a].insert(b);
+            group_links[b].insert(a);
+        }
+
+        Self {
+            restricted: true,
+            group_links,
+            memberships,
+        }
+    }
+
+    pub fn are_linked(&self, a: &[u8; 32], b: &[u8; 32]) -> bool {
+        if a == b || !self.restricted {
+            return true;
+        }
+
+        let Some(a_groups) = self.memberships.get(a) else {
+            return false;
+        };
+        let Some(b_groups) = self.memberships.get(b) else {
+            return false;
+        };
+
+        a_groups.iter().any(|&a_group| {
+            b_groups
+                .iter()
+                .any(|b_group| self.group_links[a_group].contains(b_group))
+        })
+    }
 }
 
 /// The published registry.
@@ -190,6 +276,24 @@ impl<'a> PublishedView<'a> {
         self.registry.lookup_address(address)
     }
 
+    pub(crate) fn lookup_key_for(
+        self,
+        caller: &[u8; 32],
+        public_key: &[u8; 32],
+    ) -> Option<&'a PeerRecord> {
+        self.lookup_key(public_key)
+            .filter(|record| self.registry.are_linked(caller, &record.public_key))
+    }
+
+    pub(crate) fn lookup_address_for(
+        self,
+        caller: &[u8; 32],
+        address: IpAddr,
+    ) -> Option<&'a PeerRecord> {
+        self.lookup_address(address)
+            .filter(|record| self.registry.are_linked(caller, &record.public_key))
+    }
+
     pub(crate) fn effective_endpoint(self, record: &PeerRecord) -> Option<SocketAddr> {
         self.observed_endpoints
             .get(&record.public_key)
@@ -205,7 +309,7 @@ impl<'a> PublishedView<'a> {
 #[derive(Debug, Clone)]
 pub struct SharedRegistry {
     current: Arc<RwLock<PublishedRegistry>>,
-    changes: tokio::sync::broadcast::Sender<RegistryChange>,
+    changes: tokio::sync::broadcast::Sender<RegistryEvent>,
 }
 
 impl SharedRegistry {
@@ -272,15 +376,15 @@ impl SharedRegistry {
         }
         current.observed_endpoints.insert(public_key, endpoint);
         if before != Some(endpoint) {
-            let _ = self.changes.send(RegistryChange {
+            let _ = self.changes.send(RegistryEvent::Peer(RegistryChange {
                 public_key,
                 kind: RegistryChangeKind::Changed,
-            });
+            }));
         }
     }
 
-    /// Subscribe to peer-level registry changes.
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RegistryChange> {
+    /// Subscribe to peer invalidations and group-link policy changes.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RegistryEvent> {
         self.changes.subscribe()
     }
 
@@ -304,6 +408,7 @@ impl SharedRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old_registry = Arc::clone(&current.registry);
         let old_observed = current.observed_endpoints.clone();
+        let links_changed = old_registry.links != registry.links;
 
         current
             .observed_endpoints
@@ -348,8 +453,14 @@ impl SharedRegistry {
         // change. If the observation is later invalidated, fallback must use the
         // newest configuration rather than the snapshot from when it was learned.
         current.registry = Arc::new(registry);
+        // Link-policy changes are ordered before peer invalidations. RPC consumers
+        // close on this event, so they cannot receive a removal/addition key
+        // whose visibility changed in the same atomic configuration reload.
+        if links_changed {
+            let _ = self.changes.send(RegistryEvent::LinksChanged);
+        }
         for change in changes {
-            let _ = self.changes.send(change);
+            let _ = self.changes.send(RegistryEvent::Peer(change));
         }
     }
 }
@@ -357,6 +468,10 @@ impl SharedRegistry {
 impl Registry {
     /// Index a set of records, rejecting collisions.
     pub fn build(records: Vec<PeerRecord>) -> Result<Self, String> {
+        Self::build_with_links(records, LinkPolicy::allow_all())
+    }
+
+    pub fn build_with_links(records: Vec<PeerRecord>, links: LinkPolicy) -> Result<Self, String> {
         let mut peers: Vec<PeerRecord> = Vec::with_capacity(records.len());
         let mut by_key: HashMap<[u8; 32], usize> = HashMap::new();
         // The API server is allocator-backed through `microtun-std`, so the
@@ -398,6 +513,7 @@ impl Registry {
             by_key,
             routes,
             route_count,
+            links,
         })
     }
 
@@ -411,6 +527,10 @@ impl Registry {
     /// Longest prefix wins, matching the route cache on the client side.
     pub fn lookup_address(&self, address: IpAddr) -> Option<&PeerRecord> {
         self.routes.lookup(address).map(|&index| &self.peers[index])
+    }
+
+    pub fn are_linked(&self, a: &[u8; 32], b: &[u8; 32]) -> bool {
+        self.links.are_linked(a, b)
     }
 
     /// Number of configured peers.
@@ -547,8 +667,10 @@ pub(crate) mod tests {
         );
 
         let mut observed = Vec::new();
-        while let Ok(change) = changes.try_recv() {
-            observed.push((change.public_key[0], change.kind));
+        while let Ok(event) = changes.try_recv() {
+            if let RegistryEvent::Peer(change) = event {
+                observed.push((change.public_key[0], change.kind));
+            }
         }
         observed.sort_unstable_by_key(|(key, _)| *key);
         assert_eq!(
@@ -571,6 +693,35 @@ pub(crate) mod tests {
         assert!(matches!(
             changes.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn link_policy_change_is_broadcast_before_peer_keys() {
+        let shared = SharedRegistry::new(
+            Registry::build(vec![
+                record(0x01, &["10.0.0.1/32"]),
+                record(0x02, &["10.0.0.2/32"]),
+            ])
+            .unwrap(),
+        );
+        let mut changes = shared.subscribe();
+
+        shared.replace(
+            Registry::build_with_links(
+                vec![record(0x01, &["10.0.0.1/32"])],
+                LinkPolicy::from_groups_and_links(Vec::new(), Vec::new()),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(changes.try_recv().unwrap(), RegistryEvent::LinksChanged);
+        assert!(matches!(
+            changes.try_recv().unwrap(),
+            RegistryEvent::Peer(RegistryChange {
+                public_key,
+                kind: RegistryChangeKind::Removed,
+            }) if public_key == [0x02; 32]
         ));
     }
 
@@ -626,7 +777,9 @@ pub(crate) mod tests {
             published.effective_endpoint(record)
         });
         assert_eq!(effective, Some(roamed));
-        let change = changes.try_recv().unwrap();
+        let RegistryEvent::Peer(change) = changes.try_recv().unwrap() else {
+            panic!("expected peer change");
+        };
         assert_eq!(change.public_key, key);
         assert_eq!(change.kind, RegistryChangeKind::Changed);
     }

@@ -1,8 +1,9 @@
 //! microtun Peers API server.
 //!
 //! Answers the two resolver lookups from a `wg.conf`-shaped configuration file
-//! listing every peer in the network — an `[Server]` section for this
-//! server, then one named `[Peer.name]` section per peer:
+//! listing every peer in the network — a `[Server]` section for this server,
+//! one named `[Peer.name]` section per peer, optional `[Group.name]` membership
+//! sections, and `[Link.name]` relationship sections:
 //!
 //! ```bash
 //! microtun-apiserver /etc/microtun/apiserver.conf

@@ -15,17 +15,18 @@ v1.peer.changed     {"public_key": "<44-character base64>"}  -> server notificat
 v1.peer.removed     {"public_key": "<44-character base64>"}  -> server notification
 ```
 
-The server does not track which peer records a connection cares about. 
-Instead it broadcasts `v1.peer.changed` when a peer is added or its effective 
-record changes, and `v1.peer.removed` when a peer disappears. Both 
-notifications contain only the peer public key.
+The server does not track which peer records a connection cares about.
+It may, however, apply a caller-specific group-link policy before answering
+lookups or emitting invalidations. The reference server sends
+`v1.peer.changed` / `v1.peer.removed` only for peers currently visible to that
+caller. Both notifications contain only the peer public key.
 
 A client decides locally whether a notification matters. If it currently holds
 that peer, it performs an ordinary `v1.peer.by_key` lookup for either
 notification. The lookup returns either the complete current record or the
-explicit `{"not_found":{}}` result that authoritatively means the peer no
-longer exists. In particular, `peer.removed` is an invalidation hint rather
-than replacement state; confirming it by key makes remove/re-add and in-flight
+explicit `{"not_found":{}}` result that authoritatively means the caller no
+longer has a visible record for that peer. In particular, `peer.removed` is an
+invalidation hint rather than replacement state; confirming it by key makes remove/re-add and in-flight
 lookup races converge on the registry's current state.
 
 This keeps notifications lightweight and makes the protocol stateless with
@@ -43,7 +44,7 @@ The protocol is designed to provide:
 - side-effect-free peer lookup;
 - lightweight key-only change/removal notifications;
 - no per-connection peer subscription state on the server;
-- client-side filtering of irrelevant peer changes;
+- no per-connection held-peer subscription state;
 - a single authoritative removal path through `v1.peer.by_key` returning
   `{"not_found":{}}`;
 - reconnect recovery using only keys the client already retains;
@@ -58,7 +59,7 @@ The base protocol does not provide:
 - registry revisions, cursors, or replay logs;
 - batch lookup operations;
 - request-level authentication, TLS, or HTTP semantics;
-- a server-side subscription or interest-filtering mechanism.
+- a server-side held-peer subscription mechanism.
 
 ### 1.1 Why notifications carry only a key
 
@@ -96,7 +97,8 @@ express protocol requirements.
 - **Relevant invalidation**: a notification the client chooses to act on. The
   reference resolvers consider an invalidation relevant when its key is locally held.
 - **Authoritative miss**: a successful lookup whose result is exactly
-  `{"not_found":{}}`.
+  `{"not_found":{}}`; the requested target is absent from the caller's visible
+  registry, whether because it is unconfigured or hidden by policy.
 - **Authoritative removal**: an authoritative miss from a by-key refresh for a
   peer the client still holds.
 - **Transient failure**: a JSON-RPC error, malformed response, timeout,
@@ -334,9 +336,10 @@ Result: `LookupResult`.
 Behavior:
 
 1. Decode the public key.
-2. Look up exactly that key in the current published registry.
-3. Return `{"found": <PeerInfo>}` when present.
-4. Return `{"not_found":{}}` when the key is valid but absent.
+2. Look up exactly that key in the current published registry and apply the
+   caller's group-link policy.
+3. Return `{"found": <PeerInfo>}` when present and visible.
+4. Return `{"not_found":{}}` when the key is valid but absent or hidden.
 5. Return invalid-params for an undecodable key.
 
 A positive response MUST name the key that was requested.
@@ -357,8 +360,9 @@ Behavior:
 
 1. Parse the address.
 2. Perform longest-prefix match over the published peer prefixes.
-3. Return the owning peer as `{"found": <PeerInfo>}`.
-4. Return `{"not_found":{}}` when no peer owns the address.
+3. Apply the caller's group-link policy and return the owning peer as
+   `{"found": <PeerInfo>}` only when it is visible.
+4. Return `{"not_found":{}}` when no visible peer owns the address.
 5. Return invalid-params for an undecodable address.
 
 A client accepting the positive response MUST verify that the returned record
@@ -411,9 +415,10 @@ For either notification the client:
 
 ### 7.1 No server-side interest state
 
-The server maintains no per-connection set of watched peer keys. Every admitted
-connection receives the same peer-invalidation stream for the registry changes
-it is able to keep up with.
+The server maintains no per-connection set of watched peer keys. It may filter
+the invalidation stream by the authenticated caller's current group-link
+policy, but does not know which of those visible keys the client actually
+holds.
 
 This deliberately makes client interest a local concern. A client can change
 what it considers relevant without sending any control message to the server.
@@ -471,6 +476,10 @@ peer invalidations it missed, the server closes that connection.
 
 It does not attempt to reconstruct a per-client set of interesting keys.
 Reconnect reconciliation (§7.4) restores correctness.
+
+The reference server also closes connections when the group-link policy
+changes. That lets a client reconcile records that became hidden without the
+server naming those newly hidden keys in a removal notification.
 
 Allocation-free clients also have bounded notification queues. If that local
 queue overflows, the reference client likewise reconnects and reconciles its
@@ -569,7 +578,9 @@ lookup path.
 The API intentionally returns the same `{"not_found":{}}` result for:
 
 - a valid but unknown peer key;
-- a valid address no configured prefix contains.
+- a valid address no configured prefix contains;
+- a configured peer hidden from the authenticated caller;
+- a valid address whose owning peer is hidden from the caller.
 
 An undecodable key or address receives invalid-params instead. Loss of caller
 admission and rate limiting are also distinct transient errors because neither
@@ -577,9 +588,9 @@ says anything about whether the target exists.
 
 ### 10.3 Broadcast cost
 
-Removing server-side subscriptions trades server state for broadcast traffic.
-For each effective peer transition, the server attempts one small key-only
-notification per connected admitted client.
+Removing held-peer subscriptions trades server state for broadcast traffic.
+For each effective peer transition, a server may attempt one small key-only
+notification per connected admitted client for which that peer is visible.
 
 The expensive operation remains the client refresh. A client that filters to
 locally held keys performs at most one coalesced `v1.peer.by_key` per relevant

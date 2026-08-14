@@ -1,20 +1,26 @@
 //! Loading `apiserver.conf` into a served [`Registry`].
 //!
 //! The file is a WireGuard `wg.conf` in shape: one `[Server]` section for
-//! the Peers API server's own identity, then one named `[Peer.name]` section per
-//! peer.
+//! the Peers API server's own identity, then named `[Peer.name]` sections and
+//! optional `[Group.name]` membership sections and `[Link.name]` relationship sections.
 //! Sections and keys are matched without regard to case, as `wg` matches
 //! them. Peer names are case-insensitive local configuration aliases: a
-//! `Relay` may name a peer, and the alias is resolved to that peer's public key
-//! before records are served to clients. The reserved alias `@server` selects
-//! the Peers API server's own `[Server]` record.
+//! `Relay` may name a peer, or use the special `@self` alias for the API server
+//! itself; aliases are resolved to public keys before records are served to clients.
+//! Groups list member peers; links connect
+//! one group internally or two groups mutually.
 //!
 //! The one deliberate departure from `wg.conf` is `Addresses`, which stands in
 //! for both `Address` and `AllowedIPs`: in either kind of section it is the
 //! set of tunnel prefixes that peer owns, and it is what a by-address lookup
 //! is answered from.
 
-use std::{fmt, net::SocketAddr, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    net::SocketAddr,
+    path::Path,
+};
 
 use microtun_core::{
     IpCidr, MAX_PEER_ADDRESSES,
@@ -23,7 +29,7 @@ use microtun_core::{
     public_key as derive_public_key,
 };
 
-use crate::registry::{KEY_PREFIX_LEN, PeerRecord, Registry};
+use crate::registry::{KEY_PREFIX_LEN, LinkPolicy, PeerRecord, Registry};
 
 /// Settings from the `[Server]` section.
 #[derive(Clone)]
@@ -97,7 +103,8 @@ impl std::error::Error for ConfigError {}
 
 const INTERFACE_SECTION: &str = "Server";
 const PEER_SECTION: &str = "Peer";
-const SERVER_RELAY_ALIAS: &str = "@server";
+const GROUP_SECTION: &str = "Group";
+const LINK_SECTION: &str = "Link";
 const INTERFACE_KEYS: &[&str] = &[
     "PrivateKey",
     "ListenPort",
@@ -113,7 +120,10 @@ const PEER_KEYS: &[&str] = &[
     "Relay",
     "PersistentKeepalive",
 ];
+const GROUP_KEYS: &[&str] = &["Peers"];
+const LINK_KEYS: &[&str] = &["Groups"];
 const DEFAULT_LISTEN_PORT: u16 = 51820;
+const SELF_RELAY_ALIAS: &str = "@self";
 
 // ---------------------------------------------------------------------------
 // INI
@@ -241,6 +251,22 @@ fn peer_section_name(section: &Section) -> Option<&str> {
         .then_some(name.trim())
 }
 
+/// Return the alias from a `[Group.alias]` section header.
+fn group_section_name(section: &Section) -> Option<&str> {
+    let (kind, name) = section.name.split_once('.')?;
+    kind.trim()
+        .eq_ignore_ascii_case(GROUP_SECTION)
+        .then_some(name.trim())
+}
+
+/// Return the alias from a `[Link.alias]` section header.
+fn link_section_name(section: &Section) -> Option<&str> {
+    let (kind, name) = section.name.split_once('.')?;
+    kind.trim()
+        .eq_ignore_ascii_case(LINK_SECTION)
+        .then_some(name.trim())
+}
+
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
@@ -259,6 +285,8 @@ pub fn parse(text: &str, path: &Path) -> Result<Loaded, ConfigError> {
 
     let mut server: Option<ServerOptions> = None;
     let mut drafts: Vec<Draft> = Vec::new();
+    let mut groups: Vec<GroupDraft> = Vec::new();
+    let mut link_drafts: Vec<LinkDraft> = Vec::new();
 
     for section in &sections {
         if section.is(INTERFACE_SECTION) {
@@ -286,15 +314,6 @@ pub fn parse(text: &str, path: &Path) -> Result<Loaded, ConfigError> {
                     "peer section name is empty; use a header such as [Peer.my-relay]",
                 ));
             }
-            if name.eq_ignore_ascii_case(SERVER_RELAY_ALIAS) {
-                return Err(ConfigError::at(
-                    path,
-                    section.line,
-                    format!(
-                        "peer name `{name}` is reserved; `{SERVER_RELAY_ALIAS}` names the [Server] record in `Relay`"
-                    ),
-                ));
-            }
             if drafts.iter().any(|draft| {
                 draft
                     .name
@@ -309,12 +328,62 @@ pub fn parse(text: &str, path: &Path) -> Result<Loaded, ConfigError> {
                 ));
             }
             drafts.push(peer_draft(section, name, path)?);
+        } else if section.is(GROUP_SECTION) {
+            return Err(ConfigError::at(
+                path,
+                section.line,
+                "group sections must be named, for example [Group.users]",
+            ));
+        } else if let Some(name) = group_section_name(section) {
+            if name.is_empty() {
+                return Err(ConfigError::at(
+                    path,
+                    section.line,
+                    "group section name is empty; use a header such as [Group.users]",
+                ));
+            }
+            if groups
+                .iter()
+                .any(|group| group.name.eq_ignore_ascii_case(name))
+            {
+                return Err(ConfigError::at(
+                    path,
+                    section.line,
+                    format!("duplicate group name `{name}`"),
+                ));
+            }
+            groups.push(group_draft(section, name, path)?);
+        } else if section.is(LINK_SECTION) {
+            return Err(ConfigError::at(
+                path,
+                section.line,
+                "link sections must be named, for example [Link.clients-devices]",
+            ));
+        } else if let Some(name) = link_section_name(section) {
+            if name.is_empty() {
+                return Err(ConfigError::at(
+                    path,
+                    section.line,
+                    "link section name is empty; use a header such as [Link.clients-devices]",
+                ));
+            }
+            if link_drafts
+                .iter()
+                .any(|link| link.name.eq_ignore_ascii_case(name))
+            {
+                return Err(ConfigError::at(
+                    path,
+                    section.line,
+                    format!("duplicate link name `{name}`"),
+                ));
+            }
+            link_drafts.push(link_draft(section, name, path)?);
         } else {
             return Err(ConfigError::at(
                 path,
                 section.line,
                 format!(
-                    "unknown section [{}]; expected [Server] or [Peer.name]",
+                    "unknown section [{}]; expected [Server], [Peer.name], [Group.name], or [Link.name]",
                     section.name
                 ),
             ));
@@ -329,16 +398,18 @@ pub fn parse(text: &str, path: &Path) -> Result<Loaded, ConfigError> {
         )
     })?;
 
-    let records = resolve(drafts, path)?;
-    let registry = Registry::build(records).map_err(|message| ConfigError::file(path, message))?;
+    let records = resolve(&drafts, path)?;
+    let links = compile_links(&drafts, &groups, &link_drafts, path)?;
+    validate_relay_links(&drafts, &records, &links, path)?;
+    let registry = Registry::build_with_links(records, links)
+        .map_err(|message| ConfigError::file(path, message))?;
 
     Ok(Loaded { options, registry })
 }
 
 /// A peer parsed but not yet relay-resolved.
 struct Draft {
-    /// The local alias from `[Peer.name]`; the Server record is selected by
-    /// the reserved `@server` relay alias instead.
+    /// The local alias from `[Peer.name]`; the Server record is unnamed.
     name: Option<String>,
     /// The line its section header is on.
     line: usize,
@@ -348,6 +419,45 @@ struct Draft {
     relay: Option<Entry>,
     persistent_keepalive: Option<u16>,
     addresses: Vec<IpCidr>,
+}
+
+#[derive(Debug, Clone)]
+struct GroupDraft {
+    name: String,
+    peers: Vec<Entry>,
+}
+
+#[derive(Debug, Clone)]
+struct LinkDraft {
+    name: String,
+    groups: Entry,
+}
+
+fn group_draft(section: &Section, name: &str, path: &Path) -> Result<GroupDraft, ConfigError> {
+    reject_unknown(section, GROUP_KEYS, path)?;
+    let peers: Vec<Entry> = section.all("Peers").cloned().collect();
+    if peers.is_empty() {
+        return Err(ConfigError::at(
+            path,
+            section.line,
+            format!("[Group.{name}] has no `Peers`"),
+        ));
+    }
+    Ok(GroupDraft {
+        name: name.to_string(),
+        peers,
+    })
+}
+
+fn link_draft(section: &Section, name: &str, path: &Path) -> Result<LinkDraft, ConfigError> {
+    reject_unknown(section, LINK_KEYS, path)?;
+    let groups = field(section, "Groups", path)?.ok_or_else(|| {
+        ConfigError::at(path, section.line, format!("[Link.{name}] has no `Groups`"))
+    })?;
+    Ok(LinkDraft {
+        name: name.to_string(),
+        groups: groups.clone(),
+    })
 }
 
 fn interface_section(
@@ -577,22 +687,234 @@ fn peer_addresses(section: &Section, path: &Path) -> Result<Vec<IpCidr>, ConfigE
     Ok(addresses)
 }
 
+// ---------------------------------------------------------------------------
+// Group links
+// ---------------------------------------------------------------------------
+
+fn compile_links(
+    drafts: &[Draft],
+    groups: &[GroupDraft],
+    links: &[LinkDraft],
+    path: &Path,
+) -> Result<LinkPolicy, ConfigError> {
+    // Visibility is default-deny: without groups and links, each configured
+    // peer can resolve only itself. Groups plus explicit links grant visibility
+    // between distinct peers.
+    if groups.is_empty() && links.is_empty() {
+        return Ok(LinkPolicy::deny_all());
+    }
+    if groups.is_empty() {
+        let first = &links[0];
+        return Err(ConfigError::at(
+            path,
+            first.groups.line,
+            format!(
+                "[Link.{}] cannot be used without any [Group.name] sections",
+                first.name
+            ),
+        ));
+    }
+
+    let peer_names: HashMap<String, [u8; 32]> = drafts
+        .iter()
+        .filter_map(|draft| {
+            draft
+                .name
+                .as_ref()
+                .map(|name| (name.to_ascii_lowercase(), draft.public_key))
+        })
+        .collect();
+    let configured_keys: HashSet<[u8; 32]> = drafts.iter().map(|draft| draft.public_key).collect();
+    let group_names: HashMap<String, usize> = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| (group.name.to_ascii_lowercase(), index))
+        .collect();
+
+    let mut members = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut group_members = HashSet::new();
+        for entry in &group.peers {
+            for token in list_tokens(entry, "Peers", path)? {
+                if let Some(key) = peer_names.get(&token.to_ascii_lowercase()) {
+                    group_members.insert(*key);
+                    continue;
+                }
+                if let Ok(key) = decode_key(token) {
+                    if configured_keys.contains(&key) {
+                        group_members.insert(key);
+                        continue;
+                    }
+                    return Err(ConfigError::at(
+                        path,
+                        entry.line,
+                        format!("group peer `{token}` is a public key with no configured peer"),
+                    ));
+                }
+                if group_names.contains_key(&token.to_ascii_lowercase()) {
+                    return Err(ConfigError::at(
+                        path,
+                        entry.line,
+                        format!(
+                            "`Peers` in [Group.{}] may only name peers; `{token}` is another group",
+                            group.name
+                        ),
+                    ));
+                }
+                return Err(ConfigError::at(
+                    path,
+                    entry.line,
+                    format!(
+                        "unknown peer `{token}` in [Group.{}]; expected a [Peer.name] alias or configured public key",
+                        group.name
+                    ),
+                ));
+            }
+        }
+        members.push(group_members);
+    }
+
+    let mut compiled_links = Vec::with_capacity(links.len());
+    let mut seen_links: HashMap<(usize, usize), (&str, usize)> = HashMap::new();
+    for link in links {
+        let names: Vec<&str> = list_tokens(&link.groups, "Groups", path)?.collect();
+        if names.len() > 2 {
+            return Err(ConfigError::at(
+                path,
+                link.groups.line,
+                format!(
+                    "[Link.{}] `Groups` must name one group (an internal mesh) or two groups (a mutual link)",
+                    link.name
+                ),
+            ));
+        }
+
+        let mut indexes = Vec::with_capacity(names.len());
+        for token in names {
+            let Some(&index) = group_names.get(&token.to_ascii_lowercase()) else {
+                return Err(ConfigError::at(
+                    path,
+                    link.groups.line,
+                    format!("unknown group `{token}` in [Link.{}] `Groups`", link.name),
+                ));
+            };
+            indexes.push(index);
+        }
+
+        let (a, b) = match indexes.as_slice() {
+            [a] => (*a, *a),
+            [a, b] if a != b => ((*a).min(*b), (*a).max(*b)),
+            [a, _] => {
+                return Err(ConfigError::at(
+                    path,
+                    link.groups.line,
+                    format!(
+                        "[Link.{}] names the same group twice; use `Groups = {}` for an internal mesh",
+                        link.name, groups[*a].name
+                    ),
+                ));
+            }
+            [] => unreachable!("list_tokens rejects an empty value"),
+            _ => unreachable!("links are limited to at most two groups"),
+        };
+
+        if let Some((first_name, first_line)) =
+            seen_links.insert((a, b), (link.name.as_str(), link.groups.line))
+        {
+            return Err(ConfigError::at(
+                path,
+                link.groups.line,
+                format!(
+                    "[Link.{}] duplicates the relationship already declared by [Link.{first_name}] on line {first_line}",
+                    link.name
+                ),
+            ));
+        }
+        compiled_links.push((a, b));
+    }
+
+    Ok(LinkPolicy::from_groups_and_links(members, compiled_links))
+}
+
+fn list_tokens<'a>(
+    entry: &'a Entry,
+    field_name: &str,
+    path: &Path,
+) -> Result<impl Iterator<Item = &'a str>, ConfigError> {
+    if entry.value.split(',').all(|token| token.trim().is_empty()) {
+        return Err(ConfigError::at(
+            path,
+            entry.line,
+            format!("`{field_name}` may not be empty"),
+        ));
+    }
+    Ok(entry
+        .value
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty()))
+}
+
+/// A relayed peer that is accessible to another peer must not point at a relay
+/// inaccessible to that same peer, because the client needs to resolve the
+/// relay key in the record it has just received.
+fn validate_relay_links(
+    drafts: &[Draft],
+    records: &[PeerRecord],
+    links: &LinkPolicy,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    for caller in drafts {
+        for target in records {
+            let Some(relay) = target.relay else {
+                continue;
+            };
+            if caller.public_key != target.public_key
+                && links.are_linked(&caller.public_key, &target.public_key)
+                && !links.are_linked(&caller.public_key, &relay)
+            {
+                let target_draft = drafts
+                    .iter()
+                    .find(|draft| draft.public_key == target.public_key)
+                    .expect("records are built from drafts");
+                let line = target_draft
+                    .relay
+                    .as_ref()
+                    .map(|entry| entry.line)
+                    .unwrap_or(target_draft.line);
+                return Err(ConfigError::at(
+                    path,
+                    line,
+                    format!(
+                        "link policy lets {} access relayed peer {} but not its relay {}; add a [Link.name] relationship that includes the relay",
+                        draft_label(caller),
+                        target.key_prefix(),
+                        &encode_key(&relay).as_str()[..KEY_PREFIX_LEN],
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Turn drafts into records, resolving `Relay` references.
-fn resolve(drafts: Vec<Draft>, path: &Path) -> Result<Vec<PeerRecord>, ConfigError> {
+fn resolve(drafts: &[Draft], path: &Path) -> Result<Vec<PeerRecord>, ConfigError> {
     let mut records = Vec::with_capacity(drafts.len());
 
-    for draft in &drafts {
+    for draft in drafts {
         let relay = match &draft.relay {
             None => None,
             Some(entry) => {
-                // `@server` is a reserved alias for the unnamed [Server]
-                // record. Otherwise prefer a local `[Peer.name]` alias. Public
-                // keys remain valid for compatibility.
-                let relay = if entry.value.eq_ignore_ascii_case(SERVER_RELAY_ALIAS) {
+                // `@self` is the short spelling for the unnamed `[Server]`
+                // record. Otherwise prefer a local `[Peer.name]` alias; a
+                // public key can also name any configured record, including
+                // `[Server]` when it acts as a relay.
+                let relay = if entry.value.eq_ignore_ascii_case(SELF_RELAY_ALIAS) {
                     drafts
                         .iter()
                         .find(|candidate| candidate.name.is_none())
-                        .expect("[Server] draft exists after configuration validation")
+                        .expect("a parsed configuration has exactly one [Server] draft")
                         .public_key
                 } else {
                     drafts
@@ -611,8 +933,8 @@ fn resolve(drafts: Vec<Draft>, path: &Path) -> Result<Vec<PeerRecord>, ConfigErr
                                 path,
                                 entry.line,
                                 format!(
-                                    "`Relay` names `{}`, but no [Peer.{}] section exists; use a \
-                                     configured peer name or a public key in base64",
+                                    "`Relay` names `{}`, but no [Peer.{}] section exists; use \
+                                     `{SELF_RELAY_ALIAS}`, a configured peer name, or a public key in base64",
                                     entry.value, entry.value
                                 ),
                             )
@@ -677,7 +999,7 @@ fn resolve(drafts: Vec<Draft>, path: &Path) -> Result<Vec<PeerRecord>, ConfigErr
     // Not fatal: a peer with neither an endpoint nor a relay is exactly how a
     // roaming client behind NAT is configured. It is worth saying once, since
     // it is also what a forgotten `Endpoint` looks like.
-    for draft in &drafts {
+    for draft in drafts {
         if draft.endpoint.is_none() && draft.relay.is_none() {
             tracing::debug!(
                 "peer {} (line {}) has neither `Endpoint` nor `Relay`; \
@@ -829,6 +1151,190 @@ Relay = GATEWAY
     }
 
     #[test]
+    fn links_are_symmetric_without_device_mesh() {
+        let text = format!(
+            "\
+[Server]
+PrivateKey = {SERVER_PRIVATE}
+Addresses = 10.0.0.1/32
+
+[Peer.alice]
+PublicKey = {KEY_A}
+Addresses = 10.0.0.2/32
+
+[Peer.device-001]
+PublicKey = {KEY_B}
+Addresses = 10.0.0.3/32
+
+[Peer.device-002]
+PublicKey = {KEY_C}
+Addresses = 10.0.0.4/32
+
+[Group.clients]
+Peers = alice
+
+[Group.devices]
+Peers = device-001, device-002
+
+[Link.clients]
+Groups = clients
+
+[Link.clients-devices]
+Groups = clients, devices
+"
+        );
+        let loaded = load_text(&text).expect("loads");
+
+        // Self-access is implicit.
+        assert!(loaded.registry.are_linked(&[0xAA; 32], &[0xAA; 32]));
+        assert!(loaded.registry.are_linked(&[0xBB; 32], &[0xBB; 32]));
+
+        // A two-group link creates mutual visibility.
+        assert!(loaded.registry.are_linked(&[0xAA; 32], &[0xBB; 32]));
+        assert!(loaded.registry.are_linked(&[0xBB; 32], &[0xAA; 32]));
+        assert!(loaded.registry.are_linked(&[0xAA; 32], &[0xCC; 32]));
+        assert!(loaded.registry.are_linked(&[0xCC; 32], &[0xAA; 32]));
+
+        // Devices do not see one another because there is no one-group devices link.
+        assert!(!loaded.registry.are_linked(&[0xBB; 32], &[0xCC; 32]));
+        assert!(!loaded.registry.are_linked(&[0xCC; 32], &[0xBB; 32]));
+
+        // The unnamed server record is outside the groups and therefore hidden.
+        assert!(!loaded.registry.are_linked(&[0xAA; 32], &server_public()));
+    }
+
+    #[test]
+    fn one_group_link_creates_an_internal_mesh() {
+        let text = format!(
+            "{}[Peer.a]\nPublicKey = {KEY_A}\nAddresses = 10.0.0.2/32\n\n\
+             [Peer.b]\nPublicKey = {KEY_B}\nAddresses = 10.0.0.3/32\n\n\
+             [Group.clients]\nPeers = a, b\n\n\
+             [Link.client-mesh]\nGroups = clients\n",
+            valid_interface()
+        );
+        let loaded = load_text(&text).expect("loads");
+        assert!(loaded.registry.are_linked(&[0xAA; 32], &[0xBB; 32]));
+        assert!(loaded.registry.are_linked(&[0xBB; 32], &[0xAA; 32]));
+    }
+
+    #[test]
+    fn peer_and_group_names_use_separate_namespaces() {
+        let text = format!(
+            "{}[Peer.clients]\nPublicKey = {KEY_A}\nAddresses = 10.0.0.2/32\n\n\
+             [Peer.other]\nPublicKey = {KEY_B}\nAddresses = 10.0.0.3/32\n\n\
+             [Group.clients]\nPeers = clients, other\n\n\
+             [Link.clients]\nGroups = clients\n",
+            valid_interface()
+        );
+        let loaded = load_text(&text).expect("loads");
+        assert!(loaded.registry.are_linked(&[0xAA; 32], &[0xBB; 32]));
+    }
+
+    #[test]
+    fn groups_without_links_are_isolated() {
+        let text = format!(
+            "{}[Peer.a]\nPublicKey = {KEY_A}\nAddresses = 10.0.0.2/32\n\n\
+             [Peer.b]\nPublicKey = {KEY_B}\nAddresses = 10.0.0.3/32\n\n\
+             [Group.a]\nPeers = a\n\n\
+             [Group.b]\nPeers = b\n",
+            valid_interface()
+        );
+        let loaded = load_text(&text).expect("loads");
+        assert!(loaded.registry.are_linked(&[0xAA; 32], &[0xAA; 32]));
+        assert!(!loaded.registry.are_linked(&[0xAA; 32], &[0xBB; 32]));
+    }
+
+    #[test]
+    fn no_groups_denies_cross_peer_visibility() {
+        let text = format!(
+            "{}[Peer.a]\nPublicKey = {KEY_A}\nAddresses = 10.0.0.2/32\n\n\
+             [Peer.b]\nPublicKey = {KEY_B}\nAddresses = 10.0.0.3/32\n",
+            valid_interface()
+        );
+        let loaded = load_text(&text).expect("loads");
+        assert!(loaded.registry.are_linked(&[0xAA; 32], &[0xAA; 32]));
+        assert!(loaded.registry.are_linked(&[0xBB; 32], &[0xBB; 32]));
+        assert!(!loaded.registry.are_linked(&[0xAA; 32], &[0xBB; 32]));
+        assert!(!loaded.registry.are_linked(&[0xBB; 32], &[0xAA; 32]));
+    }
+
+    #[test]
+    fn group_peers_must_name_peers_not_groups() {
+        let text = format!(
+            "{}[Peer.a]\nPublicKey = {KEY_A}\nAddresses = 10.0.0.2/32\n\n\
+             [Group.first]\nPeers = a\n\n\
+             [Group.second]\nPeers = first\n",
+            valid_interface()
+        );
+        assert!(error_of(&text).contains("may only name peers"));
+    }
+
+    #[test]
+    fn link_must_name_existing_groups() {
+        let text = format!(
+            "{}[Peer.a]\nPublicKey = {KEY_A}\nAddresses = 10.0.0.2/32\n\n\
+             [Group.clients]\nPeers = a\n\n\
+             [Link.clients-devices]\nGroups = clients, devices\n",
+            valid_interface()
+        );
+        assert!(error_of(&text).contains("unknown group `devices`"));
+    }
+
+    #[test]
+    fn link_must_name_one_or_two_groups() {
+        let text = format!(
+            "{}[Peer.a]\nPublicKey = {KEY_A}\nAddresses = 10.0.0.2/32\n\n\
+             [Group.a]\nPeers = a\n\n\
+             [Group.b]\nPeers = a\n\n\
+             [Group.c]\nPeers = a\n\n\
+             [Link.too-many]\nGroups = a, b, c\n",
+            valid_interface()
+        );
+        assert!(error_of(&text).contains("must name one group"));
+    }
+
+    #[test]
+    fn duplicate_or_reversed_links_are_rejected() {
+        let text = format!(
+            "{}[Peer.a]\nPublicKey = {KEY_A}\nAddresses = 10.0.0.2/32\n\n\
+             [Peer.b]\nPublicKey = {KEY_B}\nAddresses = 10.0.0.3/32\n\n\
+             [Group.a]\nPeers = a\n\n\
+             [Group.b]\nPeers = b\n\n\
+             [Link.first]\nGroups = a, b\n\n\
+             [Link.second]\nGroups = b, a\n",
+            valid_interface()
+        );
+        assert!(error_of(&text).contains("duplicates the relationship"));
+    }
+
+    #[test]
+    fn same_group_twice_is_rejected_in_favor_of_one_group_link() {
+        let text = format!(
+            "{}[Peer.a]\nPublicKey = {KEY_A}\nAddresses = 10.0.0.2/32\n\n\
+             [Group.clients]\nPeers = a\n\n\
+             [Link.clients]\nGroups = clients, clients\n",
+            valid_interface()
+        );
+        assert!(error_of(&text).contains("names the same group twice"));
+    }
+
+    #[test]
+    fn link_policy_requires_an_accessible_relay_for_every_accessible_relayed_peer() {
+        let text = format!(
+            "{}\
+[Peer.gateway]\nPublicKey = {KEY_A}\nEndpoint = 198.51.100.10:51820\nAddresses = 10.0.0.2/32\n\n\
+[Peer.client]\nPublicKey = {KEY_B}\nAddresses = 10.0.0.3/32\nRelay = gateway\n\n\
+[Peer.viewer]\nPublicKey = {KEY_C}\nAddresses = 10.0.0.4/32\n\n\
+[Group.viewers]\nPeers = viewer\n\n\
+[Group.clients]\nPeers = client\n\n\
+[Group.relays]\nPeers = gateway\n\n\
+[Link.viewer-client]\nGroups = viewers, clients\n",
+            valid_interface()
+        );
+        assert!(error_of(&text).contains("but not its relay"));
+    }
+
+    #[test]
     fn relay_forwarding_defaults_off_and_parses_booleans() {
         let disabled = load_text(&valid_interface()).expect("loads");
         assert!(!disabled.options.relay_forwarding);
@@ -873,28 +1379,7 @@ Relay = GATEWAY
     }
 
     #[test]
-    fn a_peer_can_relay_through_the_api_server_alias() {
-        for alias in ["@server", "@SERVER"] {
-            let text = format!(
-                "\
-[Server]
-PrivateKey = {SERVER_PRIVATE}
-Addresses = 10.0.0.1/32
-
-[Peer.client]
-PublicKey = {KEY_B}
-Addresses = 10.0.0.2/32
-Relay = {alias}
-"
-            );
-            let loaded = load_text(&text).expect("loads");
-            let peer = loaded.registry.lookup_key(&[0xBB; 32]).unwrap();
-            assert_eq!(peer.relay, Some(server_public()));
-        }
-    }
-
-    #[test]
-    fn a_peer_can_still_relay_through_the_api_server_public_key() {
+    fn a_peer_can_relay_through_the_api_server_public_key() {
         let server = encode_key(&server_public());
         let text = format!(
             "\
@@ -911,6 +1396,27 @@ Relay = {server}
         let loaded = load_text(&text).expect("loads");
         let peer = loaded.registry.lookup_key(&[0xBB; 32]).unwrap();
         assert_eq!(peer.relay, Some(server_public()));
+    }
+
+    #[test]
+    fn self_relay_alias_resolves_to_the_api_server_public_key() {
+        for alias in ["@self", "@SELF"] {
+            let text = format!(
+                "\
+[Server]
+PrivateKey = {SERVER_PRIVATE}
+Addresses = 10.0.0.1/32
+
+[Peer.client]
+PublicKey = {KEY_B}
+Addresses = 10.0.0.2/32
+Relay = {alias}
+"
+            );
+            let loaded = load_text(&text).expect("loads");
+            let peer = loaded.registry.lookup_key(&[0xBB; 32]).unwrap();
+            assert_eq!(peer.relay, Some(server_public()));
+        }
     }
 
     #[test]
@@ -936,14 +1442,6 @@ Relay = {server}
                 valid_interface()
             ))
             .contains("name is empty")
-        );
-
-        assert!(
-            error_of(&format!(
-                "{}[Peer.@SERVER]\nPublicKey = {KEY_A}\nAddresses = 10.0.0.1/32\n",
-                valid_interface()
-            ))
-            .contains("is reserved")
         );
 
         let duplicate_name = format!(
