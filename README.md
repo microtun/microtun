@@ -127,7 +127,6 @@ firmware image exercises it:
 
 ```bash
 cd examples/nucleo-h753zi
-# Replace the example firmware values in .cargo/config.toml, then:
 cargo build
 ```
 
@@ -143,23 +142,19 @@ SNTP, microtun/WireGuard, Peers API resolver, and an interactive shell on
 TCP/23 over the tunnel. It is deliberately excluded from the Cargo workspace;
 build it from that directory.
 
-The firmware configuration is injected at compile time by `build.rs`. The two
-WireGuard keys plus the API endpoint, API tunnel address, local tunnel address,
-and NTP settings are defined in the `[env]` table in
-`examples/nucleo-h753zi/.cargo/config.toml`. Replace the example values there
-for real firmware. Keys use normal WireGuard base64, so values from `wg genkey`
-/ `wg pubkey` can be pasted directly into the Cargo config.
+Device-specific configuration is provisioned separately from the firmware. The
+last 128 KiB internal-flash erase sector is reserved for provisioning, with the
+portable 4 KiB MTUN record stored at `0x081e0000`. `provision.x` asserts at link
+time that the firmware image does not grow into the reserved sector. The sample
+`examples/nucleo-h753zi/provision.example.json` contains the WireGuard key, API
+endpoint/key/tunnel address, local tunnel CIDR, and NTP settings.
 
-`build.rs` validates keys, endpoint/address syntax, CIDRs, ports, and numeric settings and
-generates typed constants included directly by `src/main.rs`. `MICROTUN_API_SERVER` is a
-single `host:port` endpoint. The build embeds the host text without resolving it; at boot
-the STM32 parses a literal IPv4 address locally or resolves a hostname through the outer
-DHCP/DNS stack. `MICROTUN_API_SERVER_TUNNEL_ADDR`
-is a single IPv4 address and is routed internally as a `/32`; `MICROTUN_TUNNEL_ADDR`
-is specified as a single IPv4 CIDR. The Peers API, WireGuard listener, TELNET shell, and
-local SNTP client ports are fixed at 80, 51820, 23, and 49152 respectively. These
-configuration values are compiled into the firmware; do not commit real production
-keys to a shared repository.
+Provision the board from the repository root with:
+
+```bash
+cargo run -p microtun-provision -- flash path/to/device.json \
+  --target stm32 --chip STM32H753ZITx --address 0x081e0000 --probe 0483:374e
+```
 
 ### ESP32-C3 Embassy/Wi-Fi example
 
@@ -173,8 +168,17 @@ or other ESP chip feature sets.
 ESP Wi-Fi itself requires an allocator, so this firmware installs the heaps required
 by `esp-radio`. The example also enables `microtun-embassy/alloc`, reusing that
 allocator to move microtun's large bounded core state off the async task stack while
-retaining Embassy's smaller active-table limits. See
-`examples/esp32-c3/README.md` for toolchain, configuration, and flash instructions.
+retaining Embassy's smaller active-table limits. Device-specific settings are stored
+in one dedicated 4 KiB `microtun` flash partition at `0x003f0000`. The partition
+contains the same versioned header + JSON provisioning record consumed by the STM32
+example.
+
+The `microtun-provision` package exposes a `no_std` library that owns the schema, JSON
+decoding, record header, CRC validation, and CIDR validation, plus a host CLI behind
+its default `cli` feature. Embedded examples depend on it with
+`default-features = false`; the CLI builds/inspects records and programs either target
+through `espflash` or `probe-rs`. See each example README for target-specific flash
+instructions.
 
 ## Running
 

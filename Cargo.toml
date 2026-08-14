@@ -8,6 +8,7 @@ members = [
     "microtun-linux",
     "microtun-apiserver",
     "microtun-jsonrpc",
+    "microtun-provision",
 ]
 exclude = ["examples/nucleo-h753zi", "examples/esp32-c3"]
 

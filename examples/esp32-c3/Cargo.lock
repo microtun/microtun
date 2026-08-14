@@ -184,6 +184,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1001,6 +1016,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-storage"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cf2b3f00c9f94b27c62a4f5296b19470c3a083c687c8146e554a459f9bee596"
+dependencies = [
+ "document-features",
+ "embedded-storage",
+ "esp-hal",
+ "esp-hal-procmacros",
+ "esp-metadata-generated",
+ "esp-rom-sys",
+ "esp-sync",
+]
+
+[[package]]
 name = "esp-sync"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1517,13 +1547,13 @@ dependencies = [
 name = "microtun-esp32-c3"
 version = "0.1.0"
 dependencies = [
- "base64",
  "embassy-executor",
  "embassy-net",
  "embassy-net-driver-channel",
  "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-io-async 0.7.0",
+ "embedded-storage",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
@@ -1531,9 +1561,11 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "esp-storage",
  "heapless 0.9.3",
  "log",
  "microtun-embassy",
+ "microtun-provision",
  "rand_core 0.6.4",
  "sntpc",
  "sntpc-net-embassy",
@@ -1547,6 +1579,17 @@ dependencies = [
  "embedded-io-async 0.7.0",
  "heapless 0.9.3",
  "maybe-async",
+ "serde",
+ "serde-json-core",
+]
+
+[[package]]
+name = "microtun-provision"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "crc",
+ "heapless 0.9.3",
  "serde",
  "serde-json-core",
 ]

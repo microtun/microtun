@@ -17,6 +17,7 @@ use embassy_net_driver_channel::Device as TunnelDevice;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{Duration as EmbassyDuration, Instant as EmbassyInstant, Timer, with_timeout};
 use embedded_io_async::Write as _;
+use embedded_storage::nor_flash::ReadNorFlash as _;
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
@@ -28,6 +29,7 @@ use esp_hal::{
 use esp_radio::wifi::{
     Config as WifiConfig, ControllerConfig, Interface, WifiController, sta::StationConfig,
 };
+use esp_storage::FlashStorage;
 use heapless::String;
 use log::{info, warn};
 use microtun_embassy::{
@@ -41,6 +43,7 @@ use microtun_embassy::{
     },
     new_tunnel, resolver_task,
 };
+use microtun_provision::{ProvisionRecord, RECORD_SIZE, decode_record, parse_ipv4_cidr};
 use rand_core::RngCore as _;
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
 use sntpc_net_embassy::UdpSocketWrapper;
@@ -48,12 +51,11 @@ use static_cell::StaticCell;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-mod config {
-    include!(concat!(env!("OUT_DIR"), "/generated.rs"));
-}
-
-const SSID: &str = env!("SSID");
-const PASSWORD: &str = env!("PASSWORD");
+const LISTEN_PORT: u16 = 51820;
+const PEERS_API_PORT: u16 = 80;
+const TELNET_PORT: u16 = 23;
+const NTP_LOCAL_PORT: u16 = 49152;
+const PROVISION_ADDRESS: u32 = 0x003f_0000;
 
 type OuterDevice = Interface;
 type InnerDevice = TunnelDevice<'static, { microtun_embassy::MTU }>;
@@ -91,7 +93,7 @@ async fn wifi_connection_task(mut controller: WifiController<'static>) -> ! {
     info!("Wi-Fi connection task started");
 
     loop {
-        info!("connecting to Wi-Fi SSID {}", SSID);
+        info!("connecting to provisioned Wi-Fi network");
         match controller.connect_async().await {
             Ok(connected) => {
                 info!("Wi-Fi station connected: {:?}", connected);
@@ -133,20 +135,24 @@ async fn tunnel_task(runner: TunnelRunner<'static, HardwareRng>, outer_stack: St
 }
 
 #[embassy_executor::task]
-async fn peers_resolver_task(inner_stack: Stack<'static>, local_public_key: [u8; 32]) -> ! {
+async fn peers_resolver_task(
+    inner_stack: Stack<'static>,
+    local_public_key: [u8; 32],
+    api_server_tunnel_addr: [u8; 4],
+) -> ! {
     let mut rx = [0u8; RESOLVER_TCP_BUFFER];
     let mut tx = [0u8; RESOLVER_TCP_BUFFER];
 
     let cfg = ResolverConfig {
         server: IpEndpoint::new(
             Ipv4Address::new(
-                config::API_SERVER_TUNNEL_ADDR[0],
-                config::API_SERVER_TUNNEL_ADDR[1],
-                config::API_SERVER_TUNNEL_ADDR[2],
-                config::API_SERVER_TUNNEL_ADDR[3],
+                api_server_tunnel_addr[0],
+                api_server_tunnel_addr[1],
+                api_server_tunnel_addr[2],
+                api_server_tunnel_addr[3],
             )
             .into(),
-            config::PEERS_API_PORT,
+            PEERS_API_PORT,
         ),
         jitter_seed: microtun_embassy::peers_api::Jitter::seed_from_key(&local_public_key),
     };
@@ -179,12 +185,9 @@ async fn telnet_task(
         let mut socket = TcpSocket::new(inner_stack, &mut rx, &mut tx);
         socket.set_keep_alive(Some(TCP_KEEP_ALIVE));
         socket.set_timeout(Some(TCP_IDLE_TIMEOUT));
-        info!(
-            "telnet shell listening on inner port {}",
-            config::TELNET_PORT
-        );
+        info!("telnet shell listening on inner port {}", TELNET_PORT);
 
-        if let Err(error) = socket.accept(config::TELNET_PORT).await {
+        if let Err(error) = socket.accept(TELNET_PORT).await {
             warn!("telnet accept failed: {:?}", error);
             continue;
         }
@@ -203,6 +206,13 @@ async fn main(spawner: Spawner) -> ! {
 
     let hal_config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(hal_config);
+
+    let provision = {
+        let mut flash = FlashStorage::new(peripherals.FLASH);
+        load_provisioning(&mut flash)
+    };
+    info!("loaded provisioning for tunnel {}", provision.config.tunnel_address);
+    let config = provision.config;
 
     // reclaimed bootloader ram
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
@@ -223,10 +233,14 @@ async fn main(spawner: Spawner) -> ! {
     let outer_seed = rng.next_u64();
     let inner_seed = rng.next_u64();
 
+    let wifi = config
+        .wifi
+        .as_ref()
+        .expect("ESP32-C3 provisioning requires a wifi object");
     let station_config = WifiConfig::Station(
         StationConfig::default()
-            .with_ssid(SSID)
-            .with_password(PASSWORD.into()),
+            .with_ssid(wifi.ssid.as_str())
+            .with_password(wifi.password.as_str().into()),
     );
     let wifi_interface = Interface::station();
     let wifi_controller = WifiController::new(
@@ -250,24 +264,29 @@ async fn main(spawner: Spawner) -> ! {
     outer_stack.wait_config_up().await;
     info!("Wi-Fi DHCP lease acquired");
 
-    let (unix_secs, unix_nanos) = sync_time_from_ntp(outer_stack).await;
+    let (unix_secs, unix_nanos) =
+        sync_time_from_ntp(outer_stack, config.ntp.host.as_str(), config.ntp.port).await;
     let wall_clock = WallClock::new(unix_secs, unix_nanos);
-    let api_server_outer_ip = resolve_api_server_host(outer_stack).await;
+    let api_server_outer_ip =
+        resolve_api_server_host(outer_stack, config.api_server.host.as_str()).await;
 
     static TUNNEL_STATE: StaticCell<TunnelState<TUNNEL_QUEUE_DEPTH, TUNNEL_QUEUE_DEPTH>> =
         StaticCell::new();
     let (channel_runner, tunnel_device) =
         new_tunnel(TUNNEL_STATE.init(TunnelState::<TUNNEL_QUEUE_DEPTH, TUNNEL_QUEUE_DEPTH>::new()));
 
+    let (local_tunnel_ipv4, local_tunnel_prefix_len) =
+        parse_ipv4_cidr(config.tunnel_address.as_str()).expect("validated local tunnel address");
+    let local_tunnel_octets = local_tunnel_ipv4.octets();
     let inner_cfg = embassy_net::Config::ipv4_static(StaticConfigV4 {
         address: Ipv4Cidr::new(
             Ipv4Address::new(
-                config::LOCAL_TUNNEL_IPV4[0],
-                config::LOCAL_TUNNEL_IPV4[1],
-                config::LOCAL_TUNNEL_IPV4[2],
-                config::LOCAL_TUNNEL_IPV4[3],
+                local_tunnel_octets[0],
+                local_tunnel_octets[1],
+                local_tunnel_octets[2],
+                local_tunnel_octets[3],
             ),
-            config::LOCAL_TUNNEL_PREFIX_LEN,
+            local_tunnel_prefix_len,
         ),
         gateway: None,
         dns_servers: Default::default(),
@@ -282,16 +301,18 @@ async fn main(spawner: Spawner) -> ! {
     );
     spawner.spawn(inner_net_task(inner_runner).unwrap());
 
-    let api_inner: IpCidr =
-        parse_ip_cidr(config::API_SERVER_TUNNEL_CIDR).expect("valid API server tunnel host CIDR");
-    let api_server_public_key =
-        decode_key(config::API_SERVER_PUBLIC_KEY).expect("valid API server public key");
+    let api_inner: IpCidr = parse_ip_cidr(config.api_server.tunnel_address.as_str())
+        .expect("validated API server tunnel host CIDR");
+    let (api_server_tunnel_ipv4, _) = parse_ipv4_cidr(config.api_server.tunnel_address.as_str())
+        .expect("validated API server tunnel host CIDR");
+    let api_server_public_key = decode_key(config.api_server.public_key.as_str())
+        .expect("validated API server public key");
     let api_routes = [api_inner];
     let pinned = [PinnedPeer {
         public_key: api_server_public_key,
         endpoint: Some(SocketAddr::from((
             api_server_outer_ip.octets(),
-            config::API_SERVER_PORT,
+            config.api_server.port,
         ))),
         relay: None,
         addresses: &api_routes,
@@ -300,14 +321,15 @@ async fn main(spawner: Spawner) -> ! {
     }];
 
     let mut private_key = [0u8; 32];
-    decode_key_into(config::PRIVATE_KEY, &mut private_key).expect("valid device private key");
+    decode_key_into(config.private_key.as_str(), &mut private_key)
+        .expect("validated device private key");
 
     let now = Instant::from_millis(EmbassyInstant::now().as_millis());
     let mut tunnel = TunnelRunner::new(
         TunnelConfig::new(private_key, &pinned),
         rng,
         channel_runner,
-        config::LISTEN_PORT,
+        LISTEN_PORT,
         now,
     )
     .expect("create microtun runner");
@@ -317,10 +339,34 @@ async fn main(spawner: Spawner) -> ! {
     info!("microtun tunnel ready; telnet is only on the inner stack");
 
     spawner.spawn(tunnel_task(tunnel, outer_stack).unwrap());
-    spawner.spawn(peers_resolver_task(inner_stack, local_public_key).unwrap());
+    spawner
+        .spawn(
+            peers_resolver_task(
+                inner_stack,
+                local_public_key,
+                api_server_tunnel_ipv4.octets(),
+            )
+            .unwrap(),
+        );
     spawner.spawn(telnet_task(inner_stack, local_public_key, wall_clock).unwrap());
 
     core::future::pending().await
+}
+
+static PROVISION_RECORD_BUFFER: StaticCell<[u8; RECORD_SIZE]> = StaticCell::new();
+
+fn load_provisioning(flash: &mut FlashStorage<'_>) -> ProvisionRecord {
+    let record = PROVISION_RECORD_BUFFER.init([0u8; RECORD_SIZE]);
+    if let Err(error) = flash.read(PROVISION_ADDRESS, record) {
+        panic!("failed to read provisioning record: {:?}", error);
+    }
+
+    decode_record(record).unwrap_or_else(|error| {
+        panic!(
+            "device is not provisioned or record is invalid ({:?})",
+            error
+        )
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -384,17 +430,17 @@ impl NtpTimestampGenerator for BootTimestampGenerator {
     }
 }
 
-async fn resolve_api_server_host(stack: Stack<'static>) -> Ipv4Address {
-    if let Ok(address) = config::API_SERVER_HOST.parse::<core::net::Ipv4Addr>() {
+async fn resolve_api_server_host(stack: Stack<'static>, host: &str) -> Ipv4Address {
+    if let Ok(address) = host.parse::<core::net::Ipv4Addr>() {
         let octets = address.octets();
         return Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]);
     }
 
     loop {
-        info!("resolving API server host {}", config::API_SERVER_HOST);
+        info!("resolving API server host {}", host);
         let addresses = match with_timeout(
             EmbassyDuration::from_secs(5),
-            stack.dns_query(config::API_SERVER_HOST, DnsQueryType::A),
+            stack.dns_query(host, DnsQueryType::A),
         )
         .await
         {
@@ -417,7 +463,7 @@ async fn resolve_api_server_host(stack: Stack<'static>) -> Ipv4Address {
         }) {
             info!(
                 "API server {} resolved to {}",
-                config::API_SERVER_HOST,
+                host,
                 address
             );
             return address;
@@ -428,12 +474,12 @@ async fn resolve_api_server_host(stack: Stack<'static>) -> Ipv4Address {
     }
 }
 
-async fn sync_time_from_ntp(stack: Stack<'static>) -> (u64, u32) {
+async fn sync_time_from_ntp(stack: Stack<'static>, host: &str, port: u16) -> (u64, u32) {
     loop {
-        info!("resolving NTP server {}", config::NTP_SERVER);
+        info!("resolving NTP server {}", host);
         let addresses = match with_timeout(
             EmbassyDuration::from_secs(5),
-            stack.dns_query(config::NTP_SERVER, DnsQueryType::A),
+            stack.dns_query(host, DnsQueryType::A),
         )
         .await
         {
@@ -464,13 +510,13 @@ async fn sync_time_from_ntp(stack: Stack<'static>) -> (u64, u32) {
         let mut rx = [0u8; NTP_PACKET_BUFFER];
         let mut tx = [0u8; NTP_PACKET_BUFFER];
         let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx, &mut tx_meta, &mut tx);
-        if let Err(error) = socket.bind(config::NTP_LOCAL_PORT) {
+        if let Err(error) = socket.bind(NTP_LOCAL_PORT) {
             warn!("NTP UDP bind failed: {:?}", error);
             Timer::after_secs(2).await;
             continue;
         }
 
-        let server = SocketAddr::new(IpAddr::V4(server_ip), config::NTP_PORT);
+        let server = SocketAddr::new(IpAddr::V4(server_ip), port);
         let wrapper = UdpSocketWrapper::new(socket);
         let context = NtpContext::new(BootTimestampGenerator::new());
         let result = match with_timeout(
@@ -496,7 +542,7 @@ async fn sync_time_from_ntp(stack: Stack<'static>) -> (u64, u32) {
         let unix_nanos = ((u64::from(result.sec_fraction()) * 1_000_000_000) >> 32) as u32;
         info!(
             "time synchronized from {}: unix={} stratum={} rtt={}us",
-            config::NTP_SERVER,
+            host,
             unix_secs,
             result.stratum(),
             result.roundtrip()

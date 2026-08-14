@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "wifi": {
+    "ssid": "YOUR_WIFI_SSID",
+    "password": "YOUR_WIFI_PASSWORD"
+  },
+  "private_key": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+  "tunnel_address": "100.64.0.3/10",
+  "api_server": {
+    "host": "console.microtun.dev",
+    "port": 51820,
+    "public_key": "e06Qm75//kTEZaIgA31gjuNYl9Me+XLwf3SJLLD3PxM=",
+    "tunnel_address": "100.64.0.1/32"
+  },
+  "ntp": {
+    "host": "time.google.com",
+    "port": 123
+  }
+}

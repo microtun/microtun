@@ -6,22 +6,8 @@ runner = "probe-rs run --chip STM32H753ZITx"
 rustflags = [
     "-C", "link-arg=-Tlink.x",
     "-C", "link-arg=-Tdefmt.x",
+    "-C", "link-arg=-Tmicrotun.x",
 ]
 
 [env]
 DEFMT_LOG = "debug"
-
-# Compile-time firmware configuration. Replace the example keys/endpoint for real firmware.
-
-# Local device configuration.
-MICROTUN_PRIVATE_KEY = "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM="
-MICROTUN_TUNNEL_ADDR = "100.64.0.3/10"
-
-# API server configuration. The hostname is resolved by the STM32 at runtime.
-MICROTUN_API_SERVER = "console.microtun.dev:51820"
-MICROTUN_API_SERVER_PUBLIC_KEY = "e06Qm75//kTEZaIgA31gjuNYl9Me+XLwf3SJLLD3PxM="
-MICROTUN_API_SERVER_TUNNEL_ADDR = "100.64.0.1"
-
-# Optional: If not set, the firmware will use the default NTP server.
-# MICROTUN_NTP_SERVER = "time.google.com"
-# MICROTUN_NTP_PORT = "123"
