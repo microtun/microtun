@@ -1,5 +1,3 @@
-use core::fmt;
-
 /// Re-export of the transport error kind from `embedded-io` /
 /// `embedded-io-async` (they share the same type). Tokio transport errors are
 /// normalized to this kind by the optional Tokio adapter.
@@ -15,7 +13,8 @@ type ErrMsg = alloc::string::String;
 type ErrMsg = heapless::String<MAX_ERR_MSG_LEN>;
 
 /// An `error` object received in a response from the remote endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("remote error {code}: {message}")]
 pub struct RemoteError {
     /// JSON-RPC error code (see [`crate::codes`] for the standard ones).
     pub code: i32,
@@ -42,27 +41,25 @@ impl RemoteError {
     }
 }
 
-impl fmt::Display for RemoteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "remote error {}: {}", self.code, self.message)
-    }
-}
-
 /// Errors produced by this crate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// Transport error from the underlying `Read`/`Write`.
+    #[error("i/o error: {0:?}")]
     Io(IoErrorKind),
     /// The transport reached end-of-stream.
+    #[error("end of stream")]
     Eof,
     /// A buffer was too small: the incoming frame exceeded the receive
     /// buffer, or a serialized message exceeded the transmit buffer.
+    #[error("buffer overflow")]
     Overflow,
     /// Malformed JSON / JSON-RPC data was received (or, from
     /// [`crate::Params::parse`], the params did not match the expected type).
     ///
     /// This is the `-32700` case: the bytes are not JSON the receiver can
     /// parse at all, or they are a batch, which this crate does not support.
+    #[error("malformed message")]
     Parse,
     /// Well-formed JSON that is not a well-formed JSON-RPC envelope: a
     /// missing or wrong `jsonrpc` version, an `id` that is not a signed
@@ -72,23 +69,12 @@ pub enum Error {
     /// Distinct from [`Error::Parse`] because the two map to different
     /// JSON-RPC error codes — `-32600` here, `-32700` there — and a caller
     /// cannot fix a fault it is told the wrong name for.
+    #[error("invalid request envelope")]
     InvalidRequest,
     /// A request expected params but the message contained none.
+    #[error("missing params")]
     MissingParams,
     /// The remote endpoint answered one of our requests with an error object.
-    Remote(RemoteError),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(k) => write!(f, "i/o error: {:?}", k),
-            Error::Eof => f.write_str("end of stream"),
-            Error::Overflow => f.write_str("buffer overflow"),
-            Error::Parse => f.write_str("malformed message"),
-            Error::InvalidRequest => f.write_str("invalid request envelope"),
-            Error::MissingParams => f.write_str("missing params"),
-            Error::Remote(e) => e.fmt(f),
-        }
-    }
+    #[error(transparent)]
+    Remote(#[from] RemoteError),
 }

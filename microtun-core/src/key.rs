@@ -86,17 +86,10 @@ impl fmt::Debug for KeyBase64 {
 /// a character outside the alphabet, a non-canonical tail — are all the same
 /// answer to the caller, and a decoder that reports which character it
 /// disliked is a decoder that describes the key it was given.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[error("not a base64-encoded 32-byte key")]
 pub struct InvalidKey;
-
-impl fmt::Display for InvalidKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("not a base64-encoded 32-byte key")
-    }
-}
-
-impl core::error::Error for InvalidKey {}
 
 /// Encode a key the way WireGuard writes one.
 pub fn encode_key(key: &[u8; 32]) -> KeyBase64 {

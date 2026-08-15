@@ -5,7 +5,7 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use microtun_provision::{RECORD_SIZE, decode_json, decode_record, encode_record};
+use microtun_device_config::{RECORD_SIZE, decode_ini, decode_record, encode_record};
 
 #[derive(Parser)]
 #[command(
@@ -56,8 +56,8 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
-    let json = read_config(&cli.config)?;
-    let record = make_record(&json)?;
+    let ini = read_config(&cli.config)?;
+    let record = make_record(&ini)?;
 
     match cli.target {
         Target::Esp32 => {
@@ -82,14 +82,14 @@ fn run(cli: Cli) -> Result<(), String> {
 }
 
 fn read_config(path: &Path) -> Result<Vec<u8>, String> {
-    let json = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    decode_json(&json).map_err(|error| format!("{}: {error}", path.display()))?;
-    Ok(json)
+    let ini = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    decode_ini(&ini).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(ini)
 }
 
-fn make_record(json: &[u8]) -> Result<Vec<u8>, String> {
+fn make_record(ini: &[u8]) -> Result<Vec<u8>, String> {
     let mut record = vec![0xff; RECORD_SIZE];
-    encode_record(json, &mut record).map_err(|error| error.to_string())?;
+    encode_record(ini, &mut record).map_err(|error| error.to_string())?;
     Ok(record)
 }
 

@@ -38,8 +38,10 @@ host you would simply configure all peers.
 | `microtun-api` | The Peers API wire format: methods, parameters, and record decoding, plus an optional typed client. | `no_std`, no alloc |
 | `microtun-embassy` | Runs the engine on [Embassy](https://embassy.dev). Exposes the tunnel as an `embassy-net` device, so firmware gets normal sockets over the VPN. Optional `alloc` forwards to the core for heap-backed state. | `no_std`, alloc optional |
 | `microtun-std` | Runs the engine on Tokio, with a stateful Peers API resolver. Does not create an OS tunnel interface; the application supplies the device. | host |
-| `microtun-linux` | Linux daemon (`microtun`). TUN setup, WireGuard-style INI config with `[Interface]` and `[ApiServer]` sections, logging. | host binary |
-| `microtun-apiserver` | The Peers API server. Reads a `wg.conf`-style file listing the network's peers. | host binary |
+| `microtun-device-config` | Portable device configuration: provisioning INI schema/validation, versioned 4 KiB record encode/decode, CRC32, and CIDR parsing. | `no_std`, no alloc |
+| `microtun-provision` | Host CLI that validates device configuration, builds provisioning records, and flashes/verifies ESP32 or STM32 targets. | host binary |
+| `microtun-linux` | Linux daemon (`microtun`). TUN setup, the same device configuration INI schema from `microtun-device-config`, logging. | host binary |
+| `microtun-apiserver` | The Peers API server. Reads a device-config-compatible INI extended with peer sections, using its own config types. | host binary |
 
 `microtun-core` is deliberately free of I/O. You give it packets, timer ticks
 and resolver answers; it writes its output straight into a sink you provide.
@@ -91,17 +93,68 @@ Peer, session, replay-window and route capacities are const generics, fixed at
 compile time. The core orders them as `P, S, REPLAY_WORDS, RT`, keeping the
 per-session replay storage next to the session capacity. On allocation-free
 builds the route trie derives its fixed backing storage directly from `RT`, so
-there is no separate trie-node capacity to tune. One replay word tracks 64
-counters and one word is reserved for recycling, so `REPLAY_WORDS = 128` gives
-the reference-compatible 8,128
-counter trailing window. At that setting an established session slot is roughly
-1.2 KiB. A reasonable starting point for an ESP32-C3 is
-`P = 8, S = 8, REPLAY_WORDS = 128, RT = 16`.
+there is no separate trie-node capacity to tune.
+
+**A session slot is not one per peer.** A peer can hold four at once —
+`current`, `previous`, `next` and `handshake` — and holding two of them is
+ordinary steady state rather than a transient: a rotation parks the outgoing
+session in `previous` until it reaches `Reject-After-Time`, which against the
+whitepaper's 120-second rekey and 180-second lifetime is a third of every
+cycle. Size `S` at `4 × P`, or `2 × P` as a workable minimum. Sizing `S == P`
+has two failure modes, and the second is the expensive one:
+
+* the slot allocator falls through to evicting the least-recently-active
+  *established* session, so a live peer has to handshake again — which needs a
+  slot, which evicts another peer;
+* `Under-Load-Free-Slots` is an absolute count of free slots, so a pool with
+  no headroom never has that many free and the engine is permanently "under
+  load", answering every initiation with a cookie challenge forever.
+
+One replay word tracks 64 counters and one word is reserved for recycling, so
+`REPLAY_WORDS = 128` gives the reference-compatible 8,128-counter trailing
+window at roughly 1.2 KiB per session slot. That window exists for multi-core
+senders that genuinely reorder that far; a constrained device on a single link
+does not, and `REPLAY_WORDS = 32` still accepts packets 1,984 counters behind
+the high-water mark at roughly 0.4 KiB per slot. **If the memory for a larger
+pool is not there, take it from `REPLAY_WORDS` rather than from `S`.** The
+shipped ESP32-C3 and Nucleo profile is `P = 8, S = 32, REPLAY_WORDS = 32,
+RT = 8` — four times the session capacity of an eight-slot, 128-word pool for
+about 2 KiB more RAM.
+
+Runtime policy is separate from these capacities and lives in `CoreConfig`,
+and it is the embedding's to choose rather than the core's. `microtun-core` is
+sans-IO: it does not know whether it is driving a microcontroller or a hub,
+and it cannot know, because the peer-table capacity that most policy should
+scale against is a const generic chosen by the shell. So the core publishes
+storage ceilings (`MAX_CORE_*`) and a `CoreConfig::validate_against_limits()`
+check, and each shell injects its own profile:
+
+* `microtun-embassy` — `runner::embedded_core_config()`
+* `microtun-std` — `runner::host_core_config()`
+
+Both are applied automatically unless you supply a `CoreConfig` of your own,
+in which case yours is kept untouched. Start from one and adjust rather than
+restating it. `CoreConfig::default()` is deliberately conservative and varies
+only in *storage* sizing between the `alloc` and allocation-free backends; a
+firmware that forwards `microtun-core/alloc` purely to move tables off its
+task stacks does not thereby acquire host-scale policy.
 
 With the `alloc` feature the same limits still apply, but storage moves to the
 heap and a `Core` value becomes pointer-sized. Hosts use this by default.
 Heap-capable firmware can opt into it as well when task-stack pressure matters;
 allocator-free firmware keeps the inline backend.
+
+## Tunnel MTU
+
+`MAX_UDP_SIZE` and `MAX_INNER_SIZE` are buffer and accept bounds — they do not
+subtract the outer IP and UDP headers, so an inner packet at `MAX_INNER_SIZE`
+becomes a 1,516-byte IPv4 datagram and fragments on an ordinary path. Validate
+a configured MTU against `RECOMMENDED_MAX_MTU` (1,408), or against
+`RECOMMENDED_MAX_RELAYED_MTU` (1,328) anywhere a peer might be reached through
+a relay: a relayed packet pays the transport overhead twice plus the envelope
+header, and exceeding that budget is not a fragmentation problem but a silent
+drop with no ICMP notification generated. Both shells default to 1,280, the
+IPv6 minimum link MTU, which is inside every one of these.
 
 ## Building
 
@@ -137,22 +190,20 @@ requirement and nothing notices until someone tries to flash a board.
 ### STM32H753ZI board example
 
 `examples/nucleo-h753zi` is a standalone Embassy firmware example for the
-NUCLEO-H753ZI onboard wired Ethernet, boot-time STM32 RTC synchronization via
-SNTP, microtun/WireGuard, Peers API resolver, and an interactive shell on
-TCP/23 over the tunnel. It is deliberately excluded from the Cargo workspace;
-build it from that directory.
+NUCLEO-H753ZI onboard wired Ethernet, optional boot-time STM32 RTC synchronization
+via SNTP when `[NTP]` is provisioned, microtun/WireGuard, Peers API resolver, and an
+interactive shell on TCP/23 over the tunnel. It is deliberately excluded from the
+Cargo workspace; build it from that directory.
 
 Device-specific configuration is provisioned separately from the firmware. The
 last 128 KiB internal-flash erase sector is reserved for provisioning, with the
 portable 4 KiB MTUN record stored at `0x081e0000`. `provision.x` asserts at link
-time that the firmware image does not grow into the reserved sector. The sample
-`examples/nucleo-h753zi/provision.example.json` contains the WireGuard key, API
-endpoint/key/tunnel address, local tunnel CIDR, and NTP settings.
+time that the firmware image does not grow into the reserved sector.
 
 Provision the board from the repository root with:
 
 ```bash
-cargo run -p microtun-provision -- flash path/to/device.json \
+cargo run -p microtun-provision -- path/to/device.conf \
   --target stm32 --chip STM32H753ZITx --address 0x081e0000 --probe 0483:374e
 ```
 
@@ -160,25 +211,26 @@ cargo run -p microtun-provision -- flash path/to/device.json \
 
 `examples/esp32-c3` is the RISC-V ESP32-C3 equivalent of the STM32 demo. It uses
 the current Espressif `esp-radio` + `esp-rtos` Embassy integration, Wi-Fi station
-mode with DHCP/DNS, boot-time SNTP, the same pinned Peers API configuration, and
-the same TCP/23 shell reachable only through the inner microtun stack. The example
-is intentionally pinned to `riscv32imc-unknown-none-elf`; it does not carry Xtensa
-or other ESP chip feature sets.
+mode with DHCP/DNS, optional boot-time SNTP when `[NTP]` is provisioned, the same
+pinned Peers API configuration, and the same TCP/23 shell reachable only through the
+inner microtun stack. The example is intentionally pinned to
+`riscv32imc-unknown-none-elf`; it does not carry Xtensa or other ESP chip feature sets.
 
 ESP Wi-Fi itself requires an allocator, so this firmware installs the heaps required
 by `esp-radio`. The example also enables `microtun-embassy/alloc`, reusing that
 allocator to move microtun's large bounded core state off the async task stack while
 retaining Embassy's smaller active-table limits. Device-specific settings are stored
 in one dedicated 4 KiB `microtun` flash partition at `0x003f0000`. The partition
-contains the same versioned header + JSON provisioning record consumed by the STM32
+contains the same versioned header + INI provisioning record consumed by the STM32
 example.
 
-The `microtun-provision` package exposes a `no_std` library that owns the schema, JSON
-decoding, record header, CRC validation, and CIDR validation, plus a host CLI behind
-its default `cli` feature. Embedded examples depend on it with
-`default-features = false`; the CLI builds/inspects records and programs either target
-through `espflash` or `probe-rs`. See each example README for target-specific flash
-instructions.
+The `microtun-device-config` crate is the reusable `no_std` layer that owns the
+schema, INI decoding, record header, CRC validation, and CIDR validation. Embedded
+examples and `microtun-linux` depend on it directly. The separate
+`microtun-provision` crate is a host-only CLI that validates and builds those records,
+then programs and verifies either target through `espflash` or `probe-rs`. See
+`microtun-provision/README.md` for target-specific configuration, chip, address, and
+flash instructions.
 
 ## Running
 
@@ -190,19 +242,26 @@ from the file while it runs.
 microtun-apiserver /etc/microtun/apiserver.conf
 ```
 
-See `microtun-apiserver/apiserver.example.conf`. Optional `[Group.name]` and
-`[Link.name]` sections can restrict peer discovery: groups define membership,
-while a link names one group for an internal mesh or two groups for mutual
-cross-group visibility.
+See `microtun-apiserver/apiserver.example.conf`. Its base `[Microtun]`, `[Tunnel]`,
+`[ApiServer]`, optional `[WiFi]`, and optional `[NTP]` sections keep the same shape
+as device configs, but the API server owns and validates its config
+types itself. The server-specific extension is repeated `[Peer]` sections. Every
+configured peer can resolve every other configured peer by key or tunnel address.
 
 Then start a client. It needs `CAP_NET_ADMIN` for the TUN device and
-`CAP_NET_RAW` to pin lookups to the tunnel interface.
+`CAP_NET_RAW` to pin lookups to the tunnel interface. The Linux TUN device name
+is a CLI option rather than part of the configuration file; when omitted it
+defaults to `microtun0`.
 
 ```bash
 microtun /etc/microtun/microtun.conf
+# Override the default interface name when needed:
+microtun --interface mtun7 /etc/microtun/microtun.conf
+# Equivalent short form:
+microtun -i mtun7 /etc/microtun/microtun.conf
 ```
 
-See `microtun-linux/config.example.conf`.
+See `microtun-linux/config.example.conf`. The Linux daemon accepts the same `[Microtun]`, `[Tunnel]`, `[ApiServer]`, optional `[WiFi]`, and optional `[NTP]` schema validated by `microtun-device-config`; Linux ignores the Wi-Fi and NTP sections.
 
 ## Feature flags
 

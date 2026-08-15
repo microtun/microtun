@@ -643,7 +643,7 @@ mod tests {
 
     const RECORD: &str = concat!(
         r#"{"public_key":"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=","#,
-        r#""endpoint":"203.0.113.5:51820","addresses":["10.1.2.3/32"]}"#,
+        r#""endpoint":"203.0.113.5:51820","address":"10.1.2.3/32"}"#,
     );
 
     #[derive(Clone, Copy, Debug)]
@@ -767,7 +767,7 @@ mod tests {
         };
         assert_eq!(peer.public_key, [0xAA; 32]);
         assert_eq!(peer.endpoint, Some("203.0.113.5:51820".parse().unwrap()));
-        assert_eq!(peer.addresses.len(), 1);
+        assert_eq!(peer.address, "10.1.2.3/32".parse().unwrap());
     }
 
     #[tokio::test]

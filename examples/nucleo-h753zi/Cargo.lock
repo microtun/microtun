@@ -986,6 +986,7 @@ dependencies = [
  "rand",
  "serde",
  "serde-json-core",
+ "thiserror",
 ]
 
 [[package]]
@@ -1004,9 +1005,24 @@ dependencies = [
  "maybe-async",
  "rand_core 0.6.4",
  "subtle",
+ "thiserror",
  "x25519-dalek",
  "zerocopy",
  "zeroize",
+]
+
+[[package]]
+name = "microtun-device-config"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "cidr",
+ "crc",
+ "heapless",
+ "microtun-ini",
+ "serde",
+ "thiserror",
+ "wary",
 ]
 
 [[package]]
@@ -1029,6 +1045,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "microtun-ini"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "microtun-jsonrpc"
 version = "0.1.0"
 dependencies = [
@@ -1037,6 +1061,7 @@ dependencies = [
  "maybe-async",
  "serde",
  "serde-json-core",
+ "thiserror",
 ]
 
 [[package]]
@@ -1056,23 +1081,12 @@ dependencies = [
  "embassy-time",
  "embedded-io-async 0.7.0",
  "heapless",
+ "microtun-device-config",
  "microtun-embassy",
- "microtun-provision",
  "panic-probe",
  "sntpc",
  "sntpc-net-embassy",
  "static_cell",
-]
-
-[[package]]
-name = "microtun-provision"
-version = "0.1.0"
-dependencies = [
- "base64",
- "crc",
- "heapless",
- "serde",
- "serde-json-core",
 ]
 
 [[package]]
@@ -1618,6 +1632,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de437e2a6208b014ab52972a27e59b33fa2920d3e00fe05026167a1c509d19cc"
 dependencies = [
  "vcell",
+]
+
+[[package]]
+name = "wary"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68a39c75c1896ecfd70f6a65d612f62f6a78a9c3e20cbd61f6cbe29fc4d15c70"
+dependencies = [
+ "thiserror",
+ "wary_derive",
+]
+
+[[package]]
+name = "wary_derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e19843817912346ac6e4c1a9c880f8ec02a4fc222c9564117d5a1b815f756a78"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

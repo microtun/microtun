@@ -85,7 +85,7 @@
 //!   derives its fixed storage directly from this value
 //!
 //! A sensible ESP32-C3 starting point is `MAX_PEERS = 8`,
-//! `MAX_SESSIONS = 8`, `REPLAY_WORDS = 128`, and `MAX_ROUTES = 16`.
+//! `MAX_SESSIONS = 8`, `REPLAY_WORDS = 128`, and `MAX_ROUTES = 8`.
 //!
 //! ## Session indices
 //!
@@ -202,61 +202,74 @@ pub const MAX_CORE_RATE_LIMIT_ENTRIES: usize = constants::MAX_RATE_LIMIT_ENTRIES
 /// Maximum recently capacity-evicted peer identities retained by [`CoreConfig`].
 pub const MAX_CORE_PEER_EVICTION_GHOSTS: usize = constants::MAX_PEER_EVICTION_GHOSTS;
 
-/// Maximum outer UDP payload the engine will produce or accept.
+/// Peer-table slots [`CoreConfig::default`] reserves for peers that
+/// authenticate, keeping unauthenticated lazy-cache installs from filling the
+/// table. See [`CoreConfig::lazy_peer_reserve`].
 ///
-/// Sized for a 1500-byte physical MTU with outer IPv4/UDP headroom — the
-/// classic WireGuard wire budget. This is independent of the *inner* tunnel
-/// MTU (which defaults to 1280 in the shells); the whole outer datagram is
-/// kept ≤ `MAX_UDP_SIZE`.
+/// This is a starting point, not guidance: the useful reserve is a fraction
+/// of the peer table, and the peer table is a const generic chosen by the
+/// embedding. It is exported only so an embedding that keeps the default can
+/// check it against the capacity it picked, which [`Core::new`] validates but
+/// not until the engine is being built.
+pub const DEFAULT_CORE_LAZY_PEER_RESERVE: usize = constants::DEFAULT_LAZY_PEER_RESERVE;
+
+/// Maximum outer UDP *payload* the engine will produce or accept.
+///
+/// This is a buffer and accept bound, not wire guidance. It is the size of
+/// the staging buffers and the length above which an inbound datagram is
+/// rejected outright; it deliberately does **not** subtract the outer IP and
+/// UDP headers, so a datagram at this size is 1528 bytes on an IPv4 path and
+/// 1548 on an IPv6 one. Use [`RECOMMENDED_MAX_MTU`] to size a tunnel.
 pub const MAX_UDP_SIZE: usize = 1500;
+
+/// Outer IPv4 + UDP header overhead (20 + 8).
+pub const OUTER_IPV4_UDP_OVERHEAD: usize = 28;
+
+/// Outer IPv6 + UDP header overhead (40 + 8).
+pub const OUTER_IPV6_UDP_OVERHEAD: usize = 48;
 
 /// Maximum *inner* IP packet (plaintext) length the engine will encapsulate:
 /// `MAX_UDP_SIZE` minus the 32-byte transport overhead (16 header + 16 tag),
 /// rounded down to the 16-byte padding granularity of §5.4.6.
+///
+/// **This is a buffer ceiling, not a supported tunnel MTU.** An inner packet
+/// this large produces a 1,488-byte UDP payload, which is a 1,516-byte IPv4
+/// datagram and fragments on any ordinary 1500-byte path. Configuration
+/// layers must validate an operator-supplied MTU against
+/// [`RECOMMENDED_MAX_MTU`] (or [`relay::MAX_RELAY_INNER_IP_SIZE`] where
+/// relayed peers are possible), never against this.
 pub const MAX_INNER_SIZE: usize = (MAX_UDP_SIZE - messages::DATA_OVERHEAD) & !15;
 
-/// Maximum tunnel address prefixes carried by one peer without `alloc`.
+/// Largest tunnel MTU that never fragments on an ordinary 1500-byte path.
 ///
-/// Allocator-backed peers have no separate per-peer cap. Resolver answers are
-/// canonicalized and deduplicated at the core boundary, and their unique
-/// prefixes must fit the route-cache ceiling.
-pub const MAX_PEER_ADDRESSES: usize = 4;
+/// Derived for an IPv6 outer header, which also covers IPv4: an inner packet
+/// of this size becomes `MAX_INNER_SIZE`-style padded plaintext plus the
+/// 32-byte transport overhead, and the resulting datagram still fits inside
+/// 1500 bytes with either outer header. Shells default to 1280 (the IPv6
+/// minimum link MTU) and this is the ceiling they should refuse to exceed.
+pub const RECOMMENDED_MAX_MTU: usize =
+    (MAX_UDP_SIZE - OUTER_IPV6_UDP_OVERHEAD - messages::DATA_OVERHEAD) & !15;
 
-/// The tunnel address list carried by a peer record.
+/// Largest tunnel MTU that is also safe for peers reached through a relay.
 ///
-/// A `heapless::Vec` inline in the peer entry by default; a heap `Vec` under
-/// `alloc`. Build one with [`push_peer_address`] to stay backend-agnostic.
-#[cfg(feature = "alloc")]
-pub type PeerAddresses = alloc::vec::Vec<IpCidr>;
-
-/// The tunnel address list carried by a peer record.
+/// A relayed packet carries a complete inner WireGuard datagram inside a
+/// relay envelope inside an outer transport message, so it pays the 32-byte
+/// transport overhead twice plus the 36-byte envelope header, with 16-byte
+/// padding applied at both levels.
 ///
-/// A `heapless::Vec` inline in the peer entry by default; a heap `Vec` under
-/// `alloc`. Build one with [`push_peer_address`] to stay backend-agnostic.
-#[cfg(not(feature = "alloc"))]
-pub type PeerAddresses = heapless::Vec<IpCidr, MAX_PEER_ADDRESSES>;
-
-/// Append one canonical prefix to a [`PeerAddresses`]. Duplicate prefixes are
-/// ignored. Without `alloc`, the unique set is bounded by
-/// [`MAX_PEER_ADDRESSES`].
-pub fn push_peer_address(addresses: &mut PeerAddresses, cidr: IpCidr) -> Result<(), Error> {
-    // No canonicalization step here any more: `IpCidr` cannot represent a
-    // prefix with host bits set, so the value arrived canonical and equal
-    // prefixes compare equal. Text that may carry host bits is normalized once,
-    // at the parse boundary, by `ip::parse_ip_cidr`.
-    if addresses.contains(&cidr) {
-        return Ok(());
-    }
-    #[cfg(feature = "alloc")]
-    {
-        addresses.push(cidr);
-        Ok(())
-    }
-    #[cfg(not(feature = "alloc"))]
-    {
-        addresses.push(cidr).map_err(|_| Error::TooManyAddresses)
-    }
-}
+/// Note this is stricter than [`relay::MAX_RELAY_INNER_IP_SIZE`], which is
+/// derived from the un-headroomed [`MAX_UDP_SIZE`] buffer bound and so
+/// describes what the engine will *encapsulate*, not what will survive a
+/// 1500-byte path. Exceeding the relay limit is worse than fragmenting: the
+/// send path returns [`Error::PacketTooLarge`] and the packet is dropped with
+/// no ICMP notification generated, which is a path-MTU black hole rather than
+/// a visible failure.
+pub const RECOMMENDED_MAX_RELAYED_MTU: usize = {
+    let outer_payload = MAX_UDP_SIZE - OUTER_IPV6_UDP_OVERHEAD;
+    let relay_plaintext = (outer_payload - messages::DATA_OVERHEAD) & !15;
+    let inner_datagram = relay_plaintext - relay::ENVELOPE_HEADER_LEN;
+    (inner_datagram - messages::DATA_OVERHEAD) & !15
+};
 
 // ---------------------------------------------------------------------------
 // Embedding interface
@@ -439,12 +452,6 @@ struct EvictedPeerGhost {
     expires: Instant,
 }
 
-/// Maximum number of authenticated unknown-peer initiations retained while
-/// their `by-key` resolver lookups are in flight. Overflow is intentionally
-/// lossy: the resolver lookup still proceeds, and normal WireGuard
-/// retransmission remains the fallback.
-const MAX_PENDING_INITIATIONS: usize = 4;
-
 /// Authenticated responder-side Noise state held only until the matching
 /// unknown-peer resolver lookup completes.
 struct PendingInitiation {
@@ -470,6 +477,35 @@ impl core::fmt::Debug for PendingInitiation {
 /// to 8,128 counters behind the high-water mark. `MAX_ROUTES` sizes both
 /// the route slots and, on allocation-free builds, the prefix-trie storage
 /// needed to index them.
+///
+/// # Sizing `MAX_SESSIONS` against `MAX_PEERS`
+///
+/// A session slot is not "one per peer". [`peer::PeerSessions`] can hold four
+/// at once — `current`, `previous`, `next` and `handshake` — and two of those
+/// are ordinary steady state, because a rotation moves the outgoing session
+/// to `previous` and `previous` is only reclaimed when it reaches
+/// [`constants::REJECT_AFTER_TIME`]. With the whitepaper's 120-second rekey
+/// against a 180-second lifetime, every continuously-active peer holds two
+/// slots for a third of every cycle, plus a third slot for the rekey round
+/// trip.
+///
+/// Sizing the pool at `MAX_SESSIONS == MAX_PEERS` therefore has two failure
+/// modes, and the second is the expensive one:
+///
+/// * `alloc_slot` falls through to evicting the least-recently-active
+///   *established* session, so a live peer loses its session and has to
+///   handshake again — which needs a slot, which evicts another peer.
+/// * [`constants::DEFAULT_UNDER_LOAD_FREE_SLOTS`] is an absolute count of free slots.
+///   A pool with no headroom never has that many free, so the engine is
+///   permanently "under load" and answers every single initiation with a
+///   cookie challenge, forever, for no security benefit.
+///
+/// Size the pool at four times `MAX_PEERS` to cover the worst case, or twice
+/// as a workable minimum. If the memory is not there, spend it by *shrinking
+/// `REPLAY_WORDS` rather than the pool*: 32 words still accepts packets 1,984
+/// counters behind the high-water mark, which is far beyond what a single
+/// constrained link reorders, and it cuts a session slot from roughly 1.2 KiB
+/// to roughly 0.4 KiB.
 pub struct Core<
     RNG,
     RP,
@@ -516,7 +552,7 @@ pub struct Core<
     /// embeddings call after every single packet — does not have to walk the
     /// peer table, the slot pool, the parked packets and the resolver table.
     timers: TimerCache,
-    pending: PendingPool<2>,
+    pending: PendingPool<MAX_PENDING_PACKETS>,
     #[cfg(not(feature = "alloc"))]
     pending_initiations: [Option<PendingInitiation>; MAX_PENDING_INITIATIONS],
     #[cfg(feature = "alloc")]
@@ -562,7 +598,15 @@ pub struct Core<
     peer_evictions: IntervalBudget,
     /// Recently capacity-evicted identities, used to reject immediate
     /// re-admission and break cache-thrashing cycles.
+    ///
+    /// Heap-backed under `alloc` for the same reason as the peer and slot
+    /// pools: the host ceiling is large enough that keeping it inline would
+    /// put kilobytes back into the `Core` value. Both backends present the
+    /// same indexable, `MAX_PEER_EVICTION_GHOSTS`-long surface.
+    #[cfg(not(feature = "alloc"))]
     evicted_peer_ghosts: [Option<EvictedPeerGhost>; MAX_PEER_EVICTION_GHOSTS],
+    #[cfg(feature = "alloc")]
+    evicted_peer_ghosts: alloc::vec::Vec<Option<EvictedPeerGhost>>,
     firewall: Firewall<MAX_FIREWALL_FLOWS, MAX_PEERS>,
 
     wall: Option<WallClock>,
@@ -657,7 +701,7 @@ impl<
     }
 
     /// Build an engine from `config`. Fails if the pinned peers do not fit
-    /// the peer table, per-peer address capacity, or route cache, or if a
+    /// the peer table or route cache, or if a
     /// runtime implementation limit exceeds its fixed storage ceiling.
     pub fn new(
         config: Config<'_>,
@@ -671,23 +715,11 @@ impl<
             pinned,
             core_config,
         } = config;
-        if core_config.rate_limit_entries > MAX_RATE_LIMIT_ENTRIES
-            || core_config.firewall_flow_entries > MAX_FIREWALL_FLOWS
-            || core_config.firewall_flow_entries == 0
-            || core_config.firewall_flows_per_peer == 0
-            || core_config.firewall_flows_per_peer > core_config.firewall_flow_entries
-            || core_config.max_inflight_resolves > MAX_INFLIGHT_RESOLVES
-            || core_config.peer_eviction_ghost_entries > MAX_PEER_EVICTION_GHOSTS
-            || core_config.lazy_peer_reserve > MAX_PEERS
-        {
+        core_config.validate_against_limits()?;
+        // The only bound that depends on this engine's capacities rather than
+        // on the storage backend, so it cannot live in the shared check.
+        if core_config.lazy_peer_reserve > MAX_PEERS {
             return Err(Error::InvalidCapacity);
-        }
-        if core_config.resolve_timeout.as_millis() == 0
-            || core_config.resolve_outbound_timeout.as_millis() == 0
-            || core_config.peer_eviction_interval.as_millis() == 0
-            || core_config.peer_eviction_burst == 0
-        {
-            return Err(Error::InvalidCoreConfig);
         }
         info!(
             "core init: peers={} sessions={} routes={} pinned={}",
@@ -696,6 +728,26 @@ impl<
             MAX_ROUTES,
             pinned.len()
         );
+        // Not an error — a deployment may knowingly run a peer table it never
+        // fills — but it is silent and expensive when it is a mistake, so say
+        // it once at init rather than leaving it to be inferred from
+        // permanently-cookied handshakes in the field. See the type-level
+        // documentation for the arithmetic.
+        if MAX_SESSIONS < MAX_PEERS.saturating_mul(2) {
+            warn!(
+                "session pool has little headroom over the peer table (sessions={} peers={}); \
+                 active peers hold up to four slots each, and a pool this size can pin the \
+                 engine into permanent under-load",
+                MAX_SESSIONS, MAX_PEERS
+            );
+        }
+        if MAX_SESSIONS <= core_config.under_load_free_slots.saturating_add(MAX_PEERS) {
+            warn!(
+                "session pool cannot hold one slot per peer plus the under-load reserve \
+                 (sessions={} peers={} reserve={}); cookies will be engaged on every handshake",
+                MAX_SESSIONS, MAX_PEERS, core_config.under_load_free_slots
+            );
+        }
         if s_priv.iter().all(|byte| *byte == 0) {
             error!("core init failed: static private key is all zeroes");
             return Err(Error::InvalidPrivateKey);
@@ -704,13 +756,6 @@ impl<
         if pinned.len() > MAX_PEERS {
             error!("core init failed: pinned peer table overflow");
             return Err(Error::PeerTableFull);
-        }
-        #[cfg(not(feature = "alloc"))]
-        if pinned
-            .iter()
-            .any(|peer| peer.addresses.len() > MAX_PEER_ADDRESSES)
-        {
-            return Err(Error::TooManyAddresses);
         }
         for (i, peer) in pinned.iter().enumerate() {
             let previous_peers = &pinned[..i];
@@ -751,23 +796,17 @@ impl<
                     return Err(Error::InvalidPinnedConfiguration);
                 }
             }
-            for cidr in peer.addresses {
-                if cidr.network_length() == 0 {
-                    error!("core init failed: pinned peer {} owns a default route", i);
+            if peer.address.network_length() == 0 {
+                error!("core init failed: pinned peer {} owns a default route", i);
+                return Err(Error::InvalidPinnedConfiguration);
+            }
+            for previous in previous_peers {
+                if crate::routing::cidrs_overlap(&previous.address, &peer.address) {
+                    error!(
+                        "core init failed: pinned peer {} overlaps another pinned CIDR",
+                        i
+                    );
                     return Err(Error::InvalidPinnedConfiguration);
-                }
-                for previous in previous_peers {
-                    if previous
-                        .addresses
-                        .iter()
-                        .any(|other| crate::routing::cidrs_overlap(other, cidr))
-                    {
-                        error!(
-                            "core init failed: pinned peer {} overlaps another pinned CIDR",
-                            i
-                        );
-                        return Err(Error::InvalidPinnedConfiguration);
-                    }
                 }
             }
         }
@@ -836,7 +875,10 @@ impl<
                 core_config.peer_eviction_burst,
                 now,
             ),
+            #[cfg(not(feature = "alloc"))]
             evicted_peer_ghosts: [None; MAX_PEER_EVICTION_GHOSTS],
+            #[cfg(feature = "alloc")]
+            evicted_peer_ghosts: alloc::vec![None; MAX_PEER_EVICTION_GHOSTS],
             firewall: Firewall::with_limits_and_timeouts(
                 core_config.firewall_flow_entries,
                 core_config.firewall_flows_per_peer,
@@ -863,10 +905,6 @@ impl<
         };
 
         for (i, p) in pinned.iter().enumerate() {
-            let mut addresses = PeerAddresses::new();
-            for address in p.addresses.iter().copied() {
-                crate::push_peer_address(&mut addresses, address)?;
-            }
             core.install_peer(
                 i as PeerIdx,
                 PeerEntry::new(
@@ -877,13 +915,11 @@ impl<
                     p.relay,
                     p.inbound_policy,
                     p.persistent_keepalive,
-                    addresses,
+                    p.address,
                     now,
                 ),
             )?;
-            for cidr in p.addresses {
-                core.routes.insert(*cidr, i as PeerIdx, true, now)?;
-            }
+            core.routes.insert(p.address, i as PeerIdx, true, now)?;
         }
         info!("core initialized with {} pinned peers", pinned.len());
         Ok(core)
@@ -1011,11 +1047,6 @@ impl<
     /// Access the relay policy owned by this core.
     pub fn relay_policy(&self) -> &RP {
         &self.relay_policy
-    }
-
-    /// Mutably access the relay policy owned by this core.
-    pub fn relay_policy_mut(&mut self) -> &mut RP {
-        &mut self.relay_policy
     }
 
     // -----------------------------------------------------------------------
@@ -1327,9 +1358,8 @@ impl<
         sess.n_send = next_send;
 
         let hit_msg_rekey = sess.n_send >= REKEY_AFTER_MESSAGES && !sess.rekey_triggered;
-        let hit_time_rekey = sess.role == Role::Initiator
-            && now.saturating_since(sess.created) >= REKEY_AFTER_TIME
-            && !sess.rekey_triggered;
+        let hit_time_rekey =
+            sess.role == Role::Initiator && now >= sess.rekey_deadline() && !sess.rekey_triggered;
         if hit_msg_rekey || hit_time_rekey {
             sess.rekey_triggered = true;
         }
@@ -1762,6 +1792,10 @@ impl<
             };
         let mut sess = Session::new(keys, Role::Responder, local_index, consumed.sender, now);
         sess.peer = pidx;
+        // Only the initiator acts on this, but a responder session becomes an
+        // initiator session on the next rotation, so sample it here too and
+        // keep the two paths identical.
+        sess.rekey_after = rekey_after_time(&mut self.rng);
 
         // Validate the peer-owned transition before changing the global wire
         // index or slot. Once those tables are committed, the remaining peer
@@ -1860,6 +1894,7 @@ impl<
 
         let mut sess = Session::new(keys, Role::Initiator, local_index, remote_index, now);
         sess.peer = pidx;
+        sess.rekey_after = rekey_after_time(&mut self.rng);
 
         // Rotate: current → previous (freeing any old previous), new → current.
         // The transition validates its precondition before mutating peer state.
@@ -3002,6 +3037,23 @@ fn handshake_retry_deadline<R: rand_core::RngCore>(rng: &mut R, now: Instant) ->
     now + REKEY_TIMEOUT + rekey_timeout_jitter(rng)
 }
 
+/// Sample this session's rekey age, uniform over
+/// `[REKEY_AFTER_TIME - REKEY_AFTER_TIME_JITTER_MAX, REKEY_AFTER_TIME]`.
+///
+/// Subtracting rather than adding matters: the whitepaper's timers leave
+/// exactly `REJECT_AFTER_TIME - REKEY_AFTER_TIME` for a rekey to complete
+/// before the session is refused, and that margin must not shrink. A session
+/// that rekeys early simply spends slightly more of its life in the
+/// overlapping `current`/`previous` state, which the pool is sized for.
+fn rekey_after_time<R: rand_core::RngCore>(rng: &mut R) -> Duration {
+    let spread_ms = REKEY_AFTER_TIME_JITTER_MAX
+        .as_millis()
+        .min(REKEY_AFTER_TIME.as_millis())
+        .saturating_add(1);
+    let offset_ms = u64::from(rng.next_u32()) % spread_ms;
+    Duration::from_millis(REKEY_AFTER_TIME.as_millis().saturating_sub(offset_ms))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3154,7 +3206,7 @@ mod tests {
     /// Peer-table capacity: small enough that eviction is reachable, large enough
     /// for the three-node relay topology.
     const PEERS: usize = 4;
-    /// Session-slot capacity. Kept well clear of `UNDER_LOAD_FREE_SLOTS` so that
+    /// Session-slot capacity. Kept well clear of `DEFAULT_UNDER_LOAD_FREE_SLOTS` so that
     /// `under_load` is driven purely by the handshake rate in the cookie test and
     /// never trips accidentally elsewhere.
     const SESSIONS: usize = 8;
@@ -3423,7 +3475,7 @@ mod tests {
     fn node(
         seed: u8,
         addr: SocketAddr,
-        peers: &[PinnedPeer<'_>],
+        peers: &[PinnedPeer],
         policy: StaticRelayPolicy,
         now: Instant,
     ) -> Node {
@@ -3433,7 +3485,7 @@ mod tests {
     fn node_with_core_config(
         seed: u8,
         addr: SocketAddr,
-        peers: &[PinnedPeer<'_>],
+        peers: &[PinnedPeer],
         policy: StaticRelayPolicy,
         now: Instant,
         core_config: CoreConfig,
@@ -3459,55 +3511,116 @@ mod tests {
         node
     }
 
-    fn pinned<'a>(
+    fn pinned(
         public_key: [u8; 32],
         endpoint: Option<SocketAddr>,
         relay: Option<[u8; 32]>,
-        addresses: &'a [IpCidr],
+        address: IpCidr,
         inbound_policy: InboundPolicy,
-    ) -> PinnedPeer<'a> {
+    ) -> PinnedPeer {
         PinnedPeer {
             public_key,
             endpoint,
             relay,
-            addresses,
+            address,
             inbound_policy,
             persistent_keepalive: None,
         }
     }
 
-    fn pinned_with_keepalive<'a>(
+    fn relay_net(relay_policy: StaticRelayPolicy) -> Net {
+        let (_, a_pub) = keypair(30);
+        let (_, r_pub) = keypair(31);
+        let (_, b_pub) = keypair(32);
+        let a_nets = [net4(10, 0, 0, 1, 32)];
+        let r_nets = [net4(10, 0, 0, 9, 32)];
+        let b_nets = [net4(10, 0, 0, 2, 32)];
+
+        // A and B are only reachable through R; R is directly reachable by both.
+        let a = node(
+            30,
+            outer(1),
+            &[
+                pinned(
+                    r_pub,
+                    Some(outer(9)),
+                    None,
+                    r_nets[0],
+                    InboundPolicy::AllowAll,
+                ),
+                pinned(b_pub, None, Some(r_pub), b_nets[0], InboundPolicy::AllowAll),
+            ],
+            StaticRelayPolicy::DenyAll,
+            T0,
+        );
+        let r = node(
+            31,
+            outer(9),
+            &[
+                pinned(
+                    a_pub,
+                    Some(outer(1)),
+                    None,
+                    a_nets[0],
+                    InboundPolicy::AllowAll,
+                ),
+                pinned(
+                    b_pub,
+                    Some(outer(2)),
+                    None,
+                    b_nets[0],
+                    InboundPolicy::AllowAll,
+                ),
+            ],
+            relay_policy,
+            T0,
+        );
+        let b = node(
+            32,
+            outer(2),
+            &[
+                pinned(
+                    r_pub,
+                    Some(outer(9)),
+                    None,
+                    r_nets[0],
+                    InboundPolicy::AllowAll,
+                ),
+                pinned(a_pub, None, Some(r_pub), a_nets[0], InboundPolicy::AllowAll),
+            ],
+            StaticRelayPolicy::DenyAll,
+            T0,
+        );
+
+        Net {
+            nodes: vec![a, r, b],
+        }
+    }
+
+    fn pinned_with_keepalive(
         public_key: [u8; 32],
         endpoint: Option<SocketAddr>,
         relay: Option<[u8; 32]>,
-        addresses: &'a [IpCidr],
+        address: IpCidr,
         inbound_policy: InboundPolicy,
         interval: Duration,
-    ) -> PinnedPeer<'a> {
-        let mut peer = pinned(public_key, endpoint, relay, addresses, inbound_policy);
+    ) -> PinnedPeer {
+        let mut peer = pinned(public_key, endpoint, relay, address, inbound_policy);
         peer.persistent_keepalive = Some(interval);
         peer
-    }
-
-    fn addresses(nets: &[IpCidr]) -> PeerAddresses {
-        let mut out = PeerAddresses::new();
-        for net in nets {
-            push_peer_address(&mut out, *net).expect("address fits");
-        }
-        out
     }
 
     fn resolved(
         public_key: [u8; 32],
         endpoint: Option<SocketAddr>,
         relay: Option<[u8; 32]>,
-        nets: &[IpCidr],
+        address: IpCidr,
     ) -> ResolvedPeer {
         ResolvedPeer {
             public_key,
             endpoint,
             relay,
-            addresses: addresses(nets),
+            address,
             inbound_policy: InboundPolicy::AllowAll,
             persistent_keepalive: None,
         }
@@ -3550,10 +3663,8 @@ mod tests {
     async fn handshake_completes_and_data_flows_in_both_directions() {
         let (_, a_pub) = keypair(1);
         let (_, b_pub) = keypair(2);
-        let a_v6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
-        let b_v6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
-        let a_nets = [net4(10, 0, 0, 1, 32), net6(a_v6, 128)];
-        let b_nets = [net4(10, 0, 0, 2, 32), net6(b_v6, 128)];
+        let a_nets = [net4(10, 0, 0, 1, 32)];
+        let b_nets = [net4(10, 0, 0, 2, 32)];
 
         let a = node(
             1,
@@ -3562,7 +3673,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -3575,7 +3686,7 @@ mod tests {
                 a_pub,
                 Some(outer(1)),
                 None,
-                &a_nets,
+                a_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -3707,21 +3818,6 @@ mod tests {
             "an inner source outside the peer's prefixes was delivered"
         );
 
-        // --- IPv6 rides the same session and the same trie -------------------
-        net.nodes[0].sink.clear();
-        net.nodes[1].sink.clear();
-        let v6_packet = ipv6(a_v6, b_v6, IPPROTO_UDP, &udp(9, 9, b"v6"));
-        net.nodes[0]
-            .send_inner(T0, &v6_packet)
-            .await
-            .expect("v6 routed");
-        let (_, v6_datagram) = net.nodes[0].sink.expect_one_outer();
-        net.nodes[1]
-            .receive_outer(T0, outer(1), &v6_datagram)
-            .await
-            .expect("v6 accepted");
-        assert_eq!(net.nodes[1].sink.inner, vec![(a_pub, v6_packet)]);
-
         // --- The largest packet the engine will encapsulate -------------------
         assert_eq!(crate::MAX_UDP_SIZE, 1500);
         assert_eq!(crate::MAX_INNER_SIZE, 1456);
@@ -3754,6 +3850,51 @@ mod tests {
         assert!(net.nodes[1].sink.events.is_empty());
     }
 
+    #[maybe_async::test(not(feature = "async"), async(feature = "async", tokio::test))]
+    async fn ipv6_data_flows_with_single_address_per_peer() {
+        let (_, a_pub) = keypair(1);
+        let (_, b_pub) = keypair(2);
+        let a_v6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let b_v6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+
+        let a = node(
+            1,
+            outer(1),
+            &[pinned(
+                b_pub,
+                Some(outer(2)),
+                None,
+                net6(b_v6, 128),
+                InboundPolicy::AllowAll,
+            )],
+            StaticRelayPolicy::DenyAll,
+            T0,
+        );
+        let b = node(
+            2,
+            outer(2),
+            &[pinned(
+                a_pub,
+                Some(outer(1)),
+                None,
+                net6(a_v6, 128),
+                InboundPolicy::AllowAll,
+            )],
+            StaticRelayPolicy::DenyAll,
+            T0,
+        );
+        let mut net = Net { nodes: vec![a, b] };
+
+        let packet = ipv6(a_v6, b_v6, IPPROTO_UDP, &udp(9, 9, b"v6"));
+        net.nodes[0]
+            .send_inner(T0, &packet)
+            .await
+            .expect("v6 routed");
+        net.pump(T0).await;
+
+        assert_eq!(net.nodes[1].sink.inner, vec![(a_pub, packet)]);
+    }
+
     // ---------------------------------------------------------------------------
     // 2. Protocol timers
     // ---------------------------------------------------------------------------
@@ -3772,7 +3913,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -3785,7 +3926,7 @@ mod tests {
                 a_pub,
                 Some(outer(1)),
                 None,
-                &a_nets,
+                a_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -3876,7 +4017,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -3889,7 +4030,7 @@ mod tests {
                 a_pub,
                 Some(outer(1)),
                 None,
-                &a_nets,
+                a_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -3970,7 +4111,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
                 InboundPolicy::AllowAll,
                 interval,
             )],
@@ -3984,7 +4125,7 @@ mod tests {
                 a_pub,
                 Some(outer(1)),
                 None,
-                &a_nets,
+                a_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -4038,7 +4179,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -4051,7 +4192,7 @@ mod tests {
                 a_pub,
                 Some(outer(1)),
                 None,
-                &a_nets,
+                a_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -4093,6 +4234,49 @@ mod tests {
         assert_eq!(net.nodes[0].sink.outer_types(), vec![messages::MSG_DATA]);
     }
 
+    /// A fleet that bootstraps together must not then rekey together.
+    ///
+    /// The offset is subtracted, never added: `REJECT_AFTER_TIME -
+    /// REKEY_AFTER_TIME` is the whole budget a rekey has to complete in
+    /// before the session stops being usable, and jitter must not spend any
+    /// of it.
+    #[test]
+    fn rekey_ages_are_spread_below_the_whitepaper_deadline() {
+        let mut rng = ChaCha20Rng::seed_from_u64(0xFEED);
+        let floor = Duration::from_millis(
+            REKEY_AFTER_TIME
+                .as_millis()
+                .saturating_sub(REKEY_AFTER_TIME_JITTER_MAX.as_millis()),
+        );
+
+        let samples: std::vec::Vec<Duration> =
+            (0..256).map(|_| rekey_after_time(&mut rng)).collect();
+        for sample in &samples {
+            assert!(
+                *sample >= floor && *sample <= REKEY_AFTER_TIME,
+                "rekey age {sample:?} escaped [{floor:?}, {REKEY_AFTER_TIME:?}]"
+            );
+        }
+        let distinct = samples
+            .iter()
+            .filter(|sample| **sample != samples[0])
+            .count();
+        assert!(
+            distinct > 200,
+            "the whole point is that co-bootstrapped sessions differ; got {distinct} of 256"
+        );
+
+        // A session that never had a value sampled falls back to the
+        // unjittered constant rather than to something shorter.
+        let keys = noise::TransportKeys {
+            send: [1; 32],
+            recv: [2; 32],
+        };
+        let session = Session::<8>::new(keys, Role::Initiator, 1, 2, T0);
+        assert_eq!(session.rekey_after, REKEY_AFTER_TIME);
+        assert_eq!(session.rekey_deadline(), T0 + REKEY_AFTER_TIME);
+    }
+
     // ---------------------------------------------------------------------------
     // 3. Dynamic peers: resolution by destination address
     // ---------------------------------------------------------------------------
@@ -4114,7 +4298,7 @@ mod tests {
                 a_pub,
                 Some(outer(1)),
                 None,
-                &a_nets,
+                a_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -4159,7 +4343,7 @@ mod tests {
                     b_pub,
                     Some(outer(2)),
                     None,
-                    &b_nets,
+                    b_nets[0],
                 ))),
             )
             .await
@@ -4204,7 +4388,7 @@ mod tests {
                 updated_at,
                 ResolverEvent::PeerUpdated(PeerUpdate::new(
                     b_pub,
-                    ResolveOutcome::Found(resolved(b_pub, Some(outer(4)), None, &b_nets)),
+                    ResolveOutcome::Found(resolved(b_pub, Some(outer(4)), None, b_nets[0])),
                 )),
             )
             .await
@@ -4231,7 +4415,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
             ))),
         )
         .await
@@ -4245,7 +4429,7 @@ mod tests {
             T0 + Duration::from_secs(1),
             ResolverEvent::PeerUpdated(PeerUpdate::new(
                 b_pub,
-                ResolveOutcome::Found(resolved(b_pub, Some(outer(4)), None, &b_nets)),
+                ResolveOutcome::Found(resolved(b_pub, Some(outer(4)), None, b_nets[0])),
             )),
         )
         .await
@@ -4258,7 +4442,7 @@ mod tests {
             T0 + Duration::from_secs(2),
             ResolverEvent::PeerUpdated(PeerUpdate::new(
                 b_pub,
-                ResolveOutcome::Found(resolved(b_pub, None, None, &b_nets)),
+                ResolveOutcome::Found(resolved(b_pub, None, None, b_nets[0])),
             )),
         )
         .await
@@ -4275,323 +4459,6 @@ mod tests {
         assert_eq!(a.next_peer_evicted(), Some(b_pub));
         assert!(a.next_peer_evicted().is_none());
         a.core.assert_peer_index_consistent();
-    }
-
-    /// A held-peer update that cannot be installed must change *nothing*.
-    ///
-    /// The failure mode this pins down is a peer left describing one answer's
-    /// endpoint and a previous answer's addresses: a record that never existed
-    /// on the Peers API server, and which nothing would later correct.
-    #[maybe_async::test(not(feature = "async"), async(feature = "async", tokio::test))]
-    async fn a_watched_update_that_does_not_fit_changes_nothing() {
-        let (_, b_pub) = keypair(21);
-        let (_, filler_pub) = keypair(22);
-
-        // Pin seven of the eight route slots. Pinned peers are never eviction
-        // victims, so the eighth is the only one that can ever be reclaimed.
-        let filler_nets = [
-            net4(10, 9, 1, 0, 24),
-            net4(10, 9, 2, 0, 24),
-            net4(10, 9, 3, 0, 24),
-            net4(10, 9, 4, 0, 24),
-        ];
-        let more_nets = [
-            net4(10, 9, 5, 0, 24),
-            net4(10, 9, 6, 0, 24),
-            net4(10, 9, 7, 0, 24),
-        ];
-        let (_, other_pub) = keypair(23);
-        let mut a = node(
-            20,
-            outer(1),
-            &[
-                pinned(
-                    filler_pub,
-                    Some(outer(9)),
-                    None,
-                    &filler_nets,
-                    InboundPolicy::AllowAll,
-                ),
-                pinned(
-                    other_pub,
-                    Some(outer(10)),
-                    None,
-                    &more_nets,
-                    InboundPolicy::AllowAll,
-                ),
-            ],
-            StaticRelayPolicy::DenyAll,
-            T0,
-        );
-
-        // Install a dynamic peer in the one remaining slot.
-        let b_nets = [net4(10, 0, 0, 21, 32)];
-        let packet = ipv4(tun(1), tun(21), IPPROTO_UDP, &udp(7, 7, b"install"));
-        a.send_inner(T0, &packet).await.expect("lookup queued");
-        let request = a.next_resolve_request().expect("by-address lookup queued");
-        a.resolve_completed(
-            T0,
-            request.complete(ResolveOutcome::Found(resolved(
-                b_pub,
-                Some(outer(2)),
-                None,
-                &b_nets,
-            ))),
-        )
-        .await
-        .expect("dynamic peer installed");
-        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(2)));
-
-        // A held-peer update that both moves the endpoint and grows the address
-        // set past the remaining capacity. There is no eligible victim: every
-        // other peer is pinned.
-        let grown = [
-            net4(10, 0, 1, 0, 24),
-            net4(10, 0, 2, 0, 24),
-            net4(10, 0, 3, 0, 24),
-            net4(10, 0, 4, 0, 24),
-        ];
-        let at = T0 + Duration::from_secs(1);
-        a.resolver_event_completed(
-            at,
-            ResolverEvent::PeerUpdated(PeerUpdate::new(
-                b_pub,
-                ResolveOutcome::Found(resolved(b_pub, Some(outer(4)), None, &grown)),
-            )),
-        )
-        .await
-        .expect("the rejected update is not an error");
-
-        // Neither half of the answer was applied. Previously the endpoint moved
-        // while the addresses stayed behind.
-        assert_eq!(
-            stored_direct_endpoint(&a.core, &b_pub),
-            Some(outer(2)),
-            "metadata must not be applied when the address set could not be"
-        );
-        assert!(
-            a.core.find_peer(&b_pub).is_some(),
-            "a rejected update is not an authoritative removal"
-        );
-        a.core.assert_peer_index_consistent();
-    }
-
-    /// A by-key lookup can finish after another lookup has already installed
-    /// the same peer. If the late answer does not fit, it must not partially
-    /// replace metadata on the now-existing peer.
-    #[maybe_async::test(not(feature = "async"), async(feature = "async", tokio::test))]
-    async fn by_key_install_race_that_does_not_fit_keeps_the_previous_complete_record() {
-        let (_, b_pub) = keypair(120);
-        let filler_pub = keypair(121).1;
-        let other_pub = keypair(122).1;
-        let filler_nets = [
-            net4(10, 101, 1, 0, 24),
-            net4(10, 101, 2, 0, 24),
-            net4(10, 101, 3, 0, 24),
-            net4(10, 101, 4, 0, 24),
-        ];
-        let other_nets = [
-            net4(10, 102, 1, 0, 24),
-            net4(10, 102, 2, 0, 24),
-            net4(10, 102, 3, 0, 24),
-        ];
-        let mut a = node(
-            123,
-            outer(1),
-            &[
-                pinned(
-                    filler_pub,
-                    Some(outer(9)),
-                    None,
-                    &filler_nets,
-                    InboundPolicy::AllowAll,
-                ),
-                pinned(
-                    other_pub,
-                    Some(outer(10)),
-                    None,
-                    &other_nets,
-                    InboundPolicy::AllowAll,
-                ),
-            ],
-            StaticRelayPolicy::DenyAll,
-            T0,
-        );
-
-        // Start a by-key install first, but leave it in flight.
-        let _ = a.core.request_peer_install(b_pub, T0);
-        let by_key = a.next_resolve_request().expect("by-key lookup queued");
-        assert_eq!(by_key.query(), ResolveQuery::ByPublicKey(b_pub));
-
-        // A by-address lookup for the same identity completes first and fills
-        // the one route slot left after the pinned peers.
-        let old_nets = [net4(10, 103, 0, 21, 32)];
-        let packet = ipv4(
-            tun(1),
-            Ipv4Addr::new(10, 103, 0, 21),
-            IPPROTO_UDP,
-            &udp(7, 7, b"race"),
-        );
-        a.send_inner(T0, &packet)
-            .await
-            .expect("by-address lookup queued");
-        let by_address = a
-            .next_resolve_request()
-            .expect("by-address lookup emitted independently");
-        a.resolve_completed(
-            T0,
-            by_address.complete(ResolveOutcome::Found(resolved(
-                b_pub,
-                Some(outer(2)),
-                None,
-                &old_nets,
-            ))),
-        )
-        .await
-        .expect("first answer installs the peer");
-        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(2)));
-        assert_eq!(a.core.routes.available_slots(), 0);
-
-        // The older by-key lookup now returns a different complete record that
-        // needs more route slots. Every possible victim is pinned, so this
-        // replacement must fail before touching endpoint or addresses.
-        let grown = [
-            net4(10, 104, 1, 0, 24),
-            net4(10, 104, 2, 0, 24),
-            net4(10, 104, 3, 0, 24),
-            net4(10, 104, 4, 0, 24),
-        ];
-        a.resolve_completed(
-            T0 + Duration::from_secs(1),
-            by_key.complete(ResolveOutcome::Found(resolved(
-                b_pub,
-                Some(outer(4)),
-                None,
-                &grown,
-            ))),
-        )
-        .await
-        .expect("capacity rejection is not surfaced as a core error");
-
-        let pidx = a.core.find_peer(&b_pub).expect("existing peer retained");
-        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(2)));
-        assert_eq!(
-            a.core
-                .routes
-                .lookup_readonly(&IpAddr::V4(Ipv4Addr::new(10, 103, 0, 21))),
-            Some(pidx),
-            "the previous route remains installed"
-        );
-        assert!(
-            a.core
-                .routes
-                .lookup_readonly(&IpAddr::V4(Ipv4Addr::new(10, 104, 1, 1)))
-                .is_none(),
-            "none of the rejected route set was committed"
-        );
-    }
-
-    /// The inverse race is possible too: a by-address lookup can finish after
-    /// a by-key install has populated the peer. Its replacement must use the
-    /// same atomic commit path.
-    #[maybe_async::test(not(feature = "async"), async(feature = "async", tokio::test))]
-    async fn outbound_lookup_race_that_does_not_fit_keeps_the_previous_complete_record() {
-        let b_pub = keypair(124).1;
-        let filler_pub = keypair(125).1;
-        let other_pub = keypair(126).1;
-        let filler_nets = [
-            net4(10, 105, 1, 0, 24),
-            net4(10, 105, 2, 0, 24),
-            net4(10, 105, 3, 0, 24),
-            net4(10, 105, 4, 0, 24),
-        ];
-        let other_nets = [
-            net4(10, 106, 1, 0, 24),
-            net4(10, 106, 2, 0, 24),
-            net4(10, 106, 3, 0, 24),
-        ];
-        let mut a = node(
-            127,
-            outer(1),
-            &[
-                pinned(
-                    filler_pub,
-                    Some(outer(9)),
-                    None,
-                    &filler_nets,
-                    InboundPolicy::AllowAll,
-                ),
-                pinned(
-                    other_pub,
-                    Some(outer(10)),
-                    None,
-                    &other_nets,
-                    InboundPolicy::AllowAll,
-                ),
-            ],
-            StaticRelayPolicy::DenyAll,
-            T0,
-        );
-
-        // Leave the by-address lookup outstanding.
-        let target = Ipv4Addr::new(10, 108, 0, 99);
-        let packet = ipv4(tun(1), target, IPPROTO_UDP, &udp(7, 7, b"race"));
-        a.send_inner(T0, &packet)
-            .await
-            .expect("by-address lookup queued");
-        let by_address = a.next_resolve_request().expect("by-address lookup emitted");
-        assert_eq!(
-            by_address.query(),
-            ResolveQuery::ByDstAddress(IpAddr::V4(target))
-        );
-
-        // While it is in flight, a by-key install for that identity wins the
-        // race and occupies the final route slot.
-        let _ = a.core.request_peer_install(b_pub, T0);
-        let by_key = a.next_resolve_request().expect("by-key lookup emitted");
-        let old_nets = [net4(10, 107, 0, 1, 32)];
-        a.resolve_completed(
-            T0,
-            by_key.complete(ResolveOutcome::Found(resolved(
-                b_pub,
-                Some(outer(2)),
-                None,
-                &old_nets,
-            ))),
-        )
-        .await
-        .expect("by-key answer installs the peer");
-        assert_eq!(a.core.routes.available_slots(), 0);
-
-        // The by-address answer covers its query, but its complete route set
-        // cannot fit. Endpoint and old routes must therefore remain together.
-        let grown = [
-            net4(10, 108, 0, 99, 32),
-            net4(10, 108, 1, 0, 24),
-            net4(10, 108, 2, 0, 24),
-            net4(10, 108, 3, 0, 24),
-        ];
-        a.resolve_completed(
-            T0 + Duration::from_secs(1),
-            by_address.complete(ResolveOutcome::Found(resolved(
-                b_pub,
-                Some(outer(4)),
-                None,
-                &grown,
-            ))),
-        )
-        .await
-        .expect("capacity rejection is handled locally");
-
-        let pidx = a.core.find_peer(&b_pub).expect("existing peer retained");
-        assert_eq!(stored_direct_endpoint(&a.core, &b_pub), Some(outer(2)));
-        assert_eq!(
-            a.core
-                .routes
-                .lookup_readonly(&IpAddr::V4(Ipv4Addr::new(10, 107, 0, 1))),
-            Some(pidx)
-        );
-        assert!(a.core.routes.lookup_readonly(&IpAddr::V4(target)).is_none());
     }
 
     /// ...and the reconciliation it could not complete is still owed.
@@ -4614,7 +4481,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
             ))),
         )
         .await
@@ -4627,7 +4494,7 @@ mod tests {
             at,
             ResolverEvent::PeerUpdated(PeerUpdate::new(
                 b_pub,
-                ResolveOutcome::Found(resolved(b_pub, Some(outer(4)), Some(b_pub), &b_nets)),
+                ResolveOutcome::Found(resolved(b_pub, Some(outer(4)), Some(b_pub), b_nets[0])),
             )),
         )
         .await
@@ -4657,7 +4524,7 @@ mod tests {
                 b_pub,
                 Some(outer(5)),
                 None,
-                &b_nets,
+                b_nets[0],
             ))),
         )
         .await
@@ -4690,7 +4557,7 @@ mod tests {
                 pinned_pub,
                 Some(outer(9)),
                 None,
-                &pinned_nets,
+                pinned_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -4702,7 +4569,7 @@ mod tests {
         assert!(
             a.core
                 .upsert_peer(
-                    &resolved(other_pub, Some(outer(2)), None, &[net4(10, 0, 0, 2, 32)]),
+                    &resolved(other_pub, Some(outer(2)), None, net4(10, 0, 0, 2, 32)),
                     T0
                 )
                 .is_ok()
@@ -4714,23 +4581,19 @@ mod tests {
         let refused: Vec<(&str, ResolvedPeer)> = vec![
             (
                 "this interface's own identity",
-                resolved(own_pub, Some(outer(2)), None, &[net4(10, 0, 1, 0, 24)]),
+                resolved(own_pub, Some(outer(2)), None, net4(10, 0, 1, 0, 24)),
             ),
             (
                 "a pinned identity",
-                resolved(pinned_pub, Some(outer(9)), None, &[net4(10, 0, 2, 0, 24)]),
+                resolved(pinned_pub, Some(outer(9)), None, net4(10, 0, 2, 0, 24)),
             ),
             (
                 "a peer relaying through itself",
-                resolved(other_pub, None, Some(other_pub), &[net4(10, 0, 3, 0, 24)]),
-            ),
-            (
-                "no address space at all",
-                resolved(other_pub, Some(outer(2)), None, &[]),
+                resolved(other_pub, None, Some(other_pub), net4(10, 0, 3, 0, 24)),
             ),
             (
                 "a default route",
-                resolved(other_pub, Some(outer(2)), None, &[net4(0, 0, 0, 0, 0)]),
+                resolved(other_pub, Some(outer(2)), None, net4(0, 0, 0, 0, 0)),
             ),
         ];
         for (why, answer) in refused {
@@ -4766,7 +4629,7 @@ mod tests {
             .expect("stale completions are ignored");
         assert!(a.next_resolve_request().is_none());
 
-        let after_ttl = T0 + NEGATIVE_TTL + Duration::from_millis(1);
+        let after_ttl = T0 + DEFAULT_NEGATIVE_TTL + Duration::from_millis(1);
         a.send_inner(after_ttl, &packet)
             .await
             .expect("parked again");
@@ -4791,7 +4654,7 @@ mod tests {
                 other_pub,
                 Some(outer(2)),
                 None,
-                &[net4(10, 8, 0, 0, 24)],
+                net4(10, 8, 0, 0, 24),
             ))),
         )
         .await
@@ -4858,7 +4721,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -4893,7 +4756,7 @@ mod tests {
                     c_pub,
                     Some(outer(3)),
                     None,
-                    &c_nets,
+                    c_nets[0],
                 ))),
             )
             .await
@@ -4962,7 +4825,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -5009,7 +4872,7 @@ mod tests {
                     c_pub,
                     Some(outer(3)),
                     None,
-                    &c_nets,
+                    c_nets[0],
                 ))),
             )
             .await
@@ -5044,7 +4907,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -5057,7 +4920,7 @@ mod tests {
                 a_pub,
                 Some(outer(1)),
                 None,
-                &a_nets,
+                a_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -5162,70 +5025,7 @@ mod tests {
     #[maybe_async::test(not(feature = "async"), async(feature = "async", tokio::test))]
     async fn relayed_peer_handshakes_and_carries_data_through_the_relay() {
         let (_, a_pub) = keypair(30);
-        let (_, r_pub) = keypair(31);
-        let (_, b_pub) = keypair(32);
-        let a_nets = [net4(10, 0, 0, 1, 32)];
-        let r_nets = [net4(10, 0, 0, 9, 32)];
-        let b_nets = [net4(10, 0, 0, 2, 32)];
-
-        // A and B are only reachable through R; R is directly reachable by both.
-        let a = node(
-            30,
-            outer(1),
-            &[
-                pinned(
-                    r_pub,
-                    Some(outer(9)),
-                    None,
-                    &r_nets,
-                    InboundPolicy::AllowAll,
-                ),
-                pinned(b_pub, None, Some(r_pub), &b_nets, InboundPolicy::AllowAll),
-            ],
-            StaticRelayPolicy::DenyAll,
-            T0,
-        );
-        let r = node(
-            31,
-            outer(9),
-            &[
-                pinned(
-                    a_pub,
-                    Some(outer(1)),
-                    None,
-                    &a_nets,
-                    InboundPolicy::AllowAll,
-                ),
-                pinned(
-                    b_pub,
-                    Some(outer(2)),
-                    None,
-                    &b_nets,
-                    InboundPolicy::AllowAll,
-                ),
-            ],
-            StaticRelayPolicy::AllowAll,
-            T0,
-        );
-        let b = node(
-            32,
-            outer(2),
-            &[
-                pinned(
-                    r_pub,
-                    Some(outer(9)),
-                    None,
-                    &r_nets,
-                    InboundPolicy::AllowAll,
-                ),
-                pinned(a_pub, None, Some(r_pub), &a_nets, InboundPolicy::AllowAll),
-            ],
-            StaticRelayPolicy::DenyAll,
-            T0,
-        );
-        let mut net = Net {
-            nodes: vec![a, r, b],
-        };
+        let mut net = relay_net(StaticRelayPolicy::AllowAll);
 
         // Both hop-local sessions with the relay come first: an envelope can only
         // be submitted over an established session with the relay itself.
@@ -5290,27 +5090,34 @@ mod tests {
         assert!(net.nodes.iter().all(|node| node.sink.events.is_empty()));
 
         // --- Forwarding is opt-in (§8) ----------------------------------------
-        for index in 0..3 {
-            net.nodes[index].sink.clear();
-        }
-        *net.nodes[1].core.relay_policy_mut() = StaticRelayPolicy::DenyAll;
+        // Relay policy is immutable after construction, so exercise the deny
+        // path with a fresh three-node network whose relay starts as DenyAll.
+        let mut denied_net = relay_net(StaticRelayPolicy::DenyAll);
         assert_eq!(
-            net.nodes[1].core.relay_policy(),
+            denied_net.nodes[1].core.relay_policy(),
             &StaticRelayPolicy::DenyAll
         );
+        denied_net.connect(0, tun(1), tun(9), T0).await;
+        denied_net.connect(2, tun(2), tun(9), T0).await;
+        for index in 0..3 {
+            denied_net.nodes[index].sink.clear();
+        }
 
         let blocked = ipv4(tun(1), tun(2), IPPROTO_UDP, &udp(11, 22, b"denied"));
-        net.nodes[0].send_inner(T0, &blocked).await.expect("sent");
-        let (_, envelope) = net.nodes[0].sink.expect_one_outer();
-        net.nodes[1]
+        denied_net.nodes[0]
+            .send_inner(T0, &blocked)
+            .await
+            .expect("sent");
+        let (_, envelope) = denied_net.nodes[0].sink.expect_one_outer();
+        denied_net.nodes[1]
             .receive_outer(T0, outer(1), &envelope)
             .await
             .expect("dropped silently");
         assert!(
-            net.nodes[1].sink.outer.is_empty(),
+            denied_net.nodes[1].sink.outer.is_empty(),
             "a denied envelope must not be forwarded"
         );
-        assert!(net.nodes[2].sink.inner.is_empty());
+        assert!(denied_net.nodes[2].sink.inner.is_empty());
 
         // Envelope syntax itself is pinned next to the implementation, in
         // `relay::tests`; this scenario covers only the forwarding behaviour that
@@ -5335,7 +5142,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -5349,7 +5156,7 @@ mod tests {
                 a_pub,
                 Some(outer(1)),
                 None,
-                &a_nets,
+                a_nets[0],
                 InboundPolicy::EstablishedOnly,
             )],
             StaticRelayPolicy::DenyAll,
@@ -5455,7 +5262,7 @@ mod tests {
 
     #[maybe_async::test(not(feature = "async"), async(feature = "async", tokio::test))]
     async fn construction_rejects_unsafe_configuration() {
-        fn build(private: [u8; 32], peers: &[PinnedPeer<'_>]) -> Option<Error> {
+        fn build(private: [u8; 32], peers: &[PinnedPeer]) -> Option<Error> {
             TestCore::new(
                 Config::new(private, peers),
                 rng(0x99),
@@ -5484,7 +5291,7 @@ mod tests {
                     peer_pub,
                     Some(outer(2)),
                     None,
-                    &nets,
+                    nets[0],
                     InboundPolicy::AllowAll
                 )]
             ),
@@ -5579,7 +5386,7 @@ mod tests {
                     own_pub,
                     Some(outer(2)),
                     None,
-                    &nets,
+                    nets[0],
                     InboundPolicy::AllowAll
                 )]
             ),
@@ -5595,14 +5402,14 @@ mod tests {
                         peer_pub,
                         Some(outer(2)),
                         None,
-                        &nets,
+                        nets[0],
                         InboundPolicy::AllowAll
                     ),
                     pinned(
                         peer_pub,
                         Some(outer(3)),
                         None,
-                        &relay_nets,
+                        relay_nets[0],
                         InboundPolicy::AllowAll
                     ),
                 ]
@@ -5618,7 +5425,7 @@ mod tests {
                     peer_pub,
                     None,
                     Some(peer_pub),
-                    &nets,
+                    nets[0],
                     InboundPolicy::AllowAll
                 )]
             ),
@@ -5633,7 +5440,7 @@ mod tests {
                     peer_pub,
                     None,
                     Some(relay_pub),
-                    &nets,
+                    nets[0],
                     InboundPolicy::AllowAll
                 )]
             ),
@@ -5646,12 +5453,18 @@ mod tests {
             build(
                 private,
                 &[
-                    pinned(relay_pub, None, None, &relay_nets, InboundPolicy::AllowAll),
+                    pinned(
+                        relay_pub,
+                        None,
+                        None,
+                        relay_nets[0],
+                        InboundPolicy::AllowAll
+                    ),
                     pinned(
                         peer_pub,
                         None,
                         Some(relay_pub),
-                        &nets,
+                        nets[0],
                         InboundPolicy::AllowAll
                     ),
                 ]
@@ -5669,21 +5482,21 @@ mod tests {
                         peer_pub,
                         None,
                         Some(relay_pub),
-                        &nets,
+                        nets[0],
                         InboundPolicy::AllowAll,
                     ),
                     pinned(
                         relay_pub,
                         None,
                         Some(chained_pub),
-                        &relay_nets,
+                        relay_nets[0],
                         InboundPolicy::AllowAll,
                     ),
                     pinned(
                         chained_pub,
                         Some(outer(10)),
                         None,
-                        &chained_nets,
+                        chained_nets[0],
                         InboundPolicy::AllowAll,
                     ),
                 ],
@@ -5699,7 +5512,7 @@ mod tests {
                     peer_pub,
                     Some(outer(2)),
                     None,
-                    &[net4(0, 0, 0, 0, 0)],
+                    net4(0, 0, 0, 0, 0),
                     InboundPolicy::AllowAll
                 )]
             ),
@@ -5716,14 +5529,14 @@ mod tests {
                         peer_pub,
                         Some(outer(2)),
                         None,
-                        &nets,
+                        nets[0],
                         InboundPolicy::AllowAll
                     ),
                     pinned(
                         relay_pub,
                         Some(outer(9)),
                         None,
-                        &overlapping,
+                        overlapping[0],
                         InboundPolicy::AllowAll
                     ),
                 ]
@@ -5744,17 +5557,23 @@ mod tests {
             build(
                 private,
                 &[
-                    pinned(peer_pub, Some(outer(2)), None, &n1, InboundPolicy::AllowAll),
+                    pinned(
+                        peer_pub,
+                        Some(outer(2)),
+                        None,
+                        n1[0],
+                        InboundPolicy::AllowAll
+                    ),
                     pinned(
                         relay_pub,
                         Some(outer(3)),
                         None,
-                        &n2,
+                        n2[0],
                         InboundPolicy::AllowAll
                     ),
-                    pinned(extra1, Some(outer(4)), None, &n3, InboundPolicy::AllowAll),
-                    pinned(extra2, Some(outer(5)), None, &n4, InboundPolicy::AllowAll),
-                    pinned(extra3, Some(outer(6)), None, &n5, InboundPolicy::AllowAll),
+                    pinned(extra1, Some(outer(4)), None, n3[0], InboundPolicy::AllowAll),
+                    pinned(extra2, Some(outer(5)), None, n4[0], InboundPolicy::AllowAll),
+                    pinned(extra3, Some(outer(6)), None, n5[0], InboundPolicy::AllowAll),
                 ]
             ),
             Some(Error::PeerTableFull)
@@ -5831,7 +5650,7 @@ mod tests {
                 anchor_pub,
                 Some(outer(9)),
                 None,
-                &anchor_nets,
+                anchor_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -5850,10 +5669,7 @@ mod tests {
         a.resolve_completed(
             T0,
             request.complete(ResolveOutcome::Found(resolved(
-                first_pub,
-                None,
-                None,
-                &[first_net],
+                first_pub, None, None, first_net,
             ))),
         )
         .await
@@ -5875,7 +5691,7 @@ mod tests {
             let at = T0 + Duration::from_secs(offset as u64 + 1);
             a.core
                 .upsert_peer(
-                    &resolved(public, None, None, &[net4(10, 2, offset as u8, 0, 24)]),
+                    &resolved(public, None, None, net4(10, 2, offset as u8, 0, 24)),
                     at,
                 )
                 .expect("dynamic peer installed");
@@ -5887,10 +5703,10 @@ mod tests {
 
         // One more: the table is full, so the least recently active *dynamic* peer
         // is evicted. A pinned peer is never a candidate.
-        let evicted_at = T0 + DYNAMIC_PEER_MIN_IDLE + Duration::from_secs(1);
+        let evicted_at = T0 + DEFAULT_DYNAMIC_PEER_MIN_IDLE + Duration::from_secs(1);
         a.core
             .upsert_peer(
-                &resolved(newcomer_pub, None, None, &[net4(10, 3, 0, 0, 24)]),
+                &resolved(newcomer_pub, None, None, net4(10, 3, 0, 0, 24)),
                 evicted_at,
             )
             .expect("newcomer installed");
@@ -5923,7 +5739,7 @@ mod tests {
         let (_, routes_changed) = a
             .core
             .upsert_peer(
-                &resolved(second_pub, Some(outer(7)), None, &[net4(10, 2, 0, 0, 24)]),
+                &resolved(second_pub, Some(outer(7)), None, net4(10, 2, 0, 0, 24)),
                 evicted_at,
             )
             .expect("refresh accepted");
@@ -5951,7 +5767,7 @@ mod tests {
                 a_pub,
                 Some(outer(20)),
                 None,
-                &a_nets,
+                a_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,
@@ -5969,7 +5785,7 @@ mod tests {
                     b_pub,
                     Some(outer(21)),
                     None,
-                    &b_nets,
+                    b_nets[0],
                 ))),
             )
             .await
@@ -5988,17 +5804,17 @@ mod tests {
             net.nodes[0]
                 .core
                 .upsert_peer(
-                    &resolved(public, None, None, &[net4(10, 21, offset as u8, 0, 24)]),
+                    &resolved(public, None, None, net4(10, 21, offset as u8, 0, 24)),
                     T0 + Duration::from_secs(offset as u64 + 1),
                 )
                 .expect("idle dynamic peer installed");
         }
 
-        let evict_at = T0 + DYNAMIC_PEER_MIN_IDLE + Duration::from_secs(10);
+        let evict_at = T0 + DEFAULT_DYNAMIC_PEER_MIN_IDLE + Duration::from_secs(10);
         net.nodes[0]
             .core
             .upsert_peer(
-                &resolved(newcomer_pub, None, None, &[net4(10, 22, 0, 0, 24)]),
+                &resolved(newcomer_pub, None, None, net4(10, 22, 0, 0, 24)),
                 evict_at,
             )
             .expect("an idle peer can be displaced");
@@ -6014,137 +5830,6 @@ mod tests {
         );
     }
 
-    #[maybe_async::test(not(feature = "async"), async(feature = "async", tokio::test))]
-    async fn route_refresh_failure_retains_active_peer_and_last_known_good_routes() {
-        let (_, a_pub) = keypair(102);
-        let (_, b_pub) = keypair(103);
-        let c_pub = keypair(104).1;
-        let d_pub = keypair(105).1;
-        let e_pub = keypair(106).1;
-        let a_nets = [net4(10, 0, 0, 1, 32)];
-        let b_nets = [net4(10, 0, 0, 2, 32)];
-        let c_routes = [net4(10, 61, 0, 0, 24), net4(10, 61, 1, 0, 24)];
-        let d_routes = [net4(10, 62, 0, 0, 24), net4(10, 62, 1, 0, 24)];
-        let e_routes = [
-            net4(10, 63, 0, 0, 24),
-            net4(10, 63, 1, 0, 24),
-            net4(10, 63, 2, 0, 24),
-        ];
-
-        let a = node_with_core_config(
-            102,
-            outer(60),
-            &[],
-            StaticRelayPolicy::DenyAll,
-            T0,
-            CoreConfig {
-                dynamic_peer_min_idle: Duration::from_millis(0),
-                ..CoreConfig::default()
-            },
-        );
-        let b = node(
-            103,
-            outer(61),
-            &[pinned(
-                a_pub,
-                Some(outer(60)),
-                None,
-                &a_nets,
-                InboundPolicy::AllowAll,
-            )],
-            StaticRelayPolicy::DenyAll,
-            T0,
-        );
-        let mut net = Net { nodes: vec![a, b] };
-
-        let probe = ipv4(tun(1), tun(2), IPPROTO_UDP, &udp(1, 1, b"connect"));
-        net.nodes[0].send_inner(T0, &probe).await.expect("parked");
-        let request = net.nodes[0].next_resolve_request().expect("lookup queued");
-        net.nodes[0]
-            .resolve_completed(
-                T0,
-                request.complete(ResolveOutcome::Found(resolved(
-                    b_pub,
-                    Some(outer(61)),
-                    None,
-                    &b_nets,
-                ))),
-            )
-            .await
-            .expect("dynamic peer installed");
-        net.pump(T0).await;
-
-        for (offset, (public, routes)) in [
-            (c_pub, c_routes.as_slice()),
-            (d_pub, d_routes.as_slice()),
-            (e_pub, e_routes.as_slice()),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let at = T0 + Duration::from_secs(offset as u64 + 1);
-            let _ = net.nodes[0].core.request_peer_install(public, at);
-            let request = net.nodes[0]
-                .next_resolve_request()
-                .expect("idle peer lookup queued");
-            net.nodes[0]
-                .resolve_completed(
-                    at,
-                    request.complete(ResolveOutcome::Found(resolved(public, None, None, routes))),
-                )
-                .await
-                .expect("idle peer installed");
-        }
-        assert_eq!(net.nodes[0].core.routes.available_slots(), 0);
-
-        let refreshed_at = T0 + Duration::from_secs(5);
-        let expanded = [
-            b_nets[0],
-            net4(10, 64, 0, 0, 24),
-            net4(10, 64, 1, 0, 24),
-            net4(10, 64, 2, 0, 24),
-        ];
-        net.nodes[0]
-            .resolver_event_completed(
-                refreshed_at,
-                ResolverEvent::PeerUpdated(PeerUpdate::new(
-                    b_pub,
-                    ResolveOutcome::Found(resolved(b_pub, Some(outer(61)), None, &expanded)),
-                )),
-            )
-            .await
-            .expect("oversized refresh is retained as last-known-good");
-
-        let bpidx = net.nodes[0]
-            .core
-            .find_peer(&b_pub)
-            .expect("active peer retained");
-        assert!(
-            net.nodes[0].core.peers[bpidx as usize]
-                .as_ref()
-                .is_some_and(|peer| peer.sessions.slots().into_iter().any(|slot| slot.is_some()))
-        );
-        assert_eq!(
-            net.nodes[0]
-                .core
-                .routes
-                .lookup_readonly(&IpAddr::V4(tun(2))),
-            Some(bpidx),
-            "the old route remains installed"
-        );
-        assert!(
-            net.nodes[0]
-                .core
-                .routes
-                .lookup_readonly(&IpAddr::V4(Ipv4Addr::new(10, 64, 0, 1)))
-                .is_none(),
-            "the failed expanded route set was not partially committed"
-        );
-        for public in [c_pub, d_pub, e_pub] {
-            assert!(net.nodes[0].core.find_peer(&public).is_some());
-        }
-    }
-
     #[test]
     fn eviction_cooldown_and_ghost_cache_break_peer_thrashing_cycles() {
         let publics = [keypair(86).1, keypair(87).1, keypair(88).1, keypair(89).1];
@@ -6155,16 +5840,16 @@ mod tests {
         for (offset, public) in publics.into_iter().enumerate() {
             a.core
                 .upsert_peer(
-                    &resolved(public, None, None, &[net4(10, 30, offset as u8, 0, 24)]),
+                    &resolved(public, None, None, net4(10, 30, offset as u8, 0, 24)),
                     T0 + Duration::from_secs(offset as u64),
                 )
                 .expect("table fill");
         }
 
-        let first_evict = T0 + DYNAMIC_PEER_MIN_IDLE + Duration::from_secs(10);
+        let first_evict = T0 + DEFAULT_DYNAMIC_PEER_MIN_IDLE + Duration::from_secs(10);
         a.core
             .upsert_peer(
-                &resolved(newcomer, None, None, &[net4(10, 31, 0, 0, 24)]),
+                &resolved(newcomer, None, None, net4(10, 31, 0, 0, 24)),
                 first_evict,
             )
             .expect("first budgeted eviction");
@@ -6172,7 +5857,7 @@ mod tests {
 
         assert_eq!(
             a.core.upsert_peer(
-                &resolved(publics[0], None, None, &[net4(10, 30, 0, 0, 24)]),
+                &resolved(publics[0], None, None, net4(10, 30, 0, 0, 24)),
                 first_evict,
             ),
             Err(Error::PeerAdmissionLimited),
@@ -6185,180 +5870,31 @@ mod tests {
         );
         assert_eq!(
             a.core.upsert_peer(
-                &resolved(other, None, None, &[net4(10, 32, 0, 0, 24)]),
+                &resolved(other, None, None, net4(10, 32, 0, 0, 24)),
                 first_evict,
             ),
             Err(Error::PeerAdmissionLimited),
             "a second identity cannot consume another destructive eviction immediately"
         );
 
-        let one_interval_later = first_evict + PEER_EVICTION_INTERVAL;
+        let one_interval_later = first_evict + DEFAULT_PEER_EVICTION_INTERVAL;
         assert_eq!(
             a.core.upsert_peer(
-                &resolved(publics[0], None, None, &[net4(10, 30, 0, 0, 24)]),
+                &resolved(publics[0], None, None, net4(10, 30, 0, 0, 24)),
                 one_interval_later,
             ),
             Err(Error::PeerAdmissionLimited),
             "refilling the eviction budget does not bypass the ghost TTL"
         );
 
-        let after_ghost = first_evict + PEER_EVICTION_GHOST_TTL + Duration::from_millis(1);
+        let after_ghost = first_evict + DEFAULT_PEER_EVICTION_GHOST_TTL + Duration::from_millis(1);
         a.core
             .upsert_peer(
-                &resolved(publics[0], None, None, &[net4(10, 30, 0, 0, 24)]),
+                &resolved(publics[0], None, None, net4(10, 30, 0, 0, 24)),
                 after_ghost,
             )
             .expect("the identity may return after the suppression window");
         assert!(a.core.find_peer(&publics[0]).is_some());
-    }
-
-    #[maybe_async::test(not(feature = "async"), async(feature = "async", tokio::test))]
-    async fn route_capacity_preflight_never_partially_evicts_on_budget_failure() {
-        let first_pub = keypair(97).1;
-        let second_pub = keypair(98).1;
-        let third_pub = keypair(99).1;
-        let newcomer_pub = keypair(100).1;
-        let first_routes = [net4(10, 50, 0, 0, 24), net4(10, 50, 1, 0, 24)];
-        let second_routes = [
-            net4(10, 51, 0, 0, 24),
-            net4(10, 51, 1, 0, 24),
-            net4(10, 51, 2, 0, 24),
-        ];
-        let third_routes = [
-            net4(10, 52, 0, 0, 24),
-            net4(10, 52, 1, 0, 24),
-            net4(10, 52, 2, 0, 24),
-        ];
-        let newcomer_routes = [
-            net4(10, 53, 0, 0, 24),
-            net4(10, 53, 1, 0, 24),
-            net4(10, 53, 2, 0, 24),
-            net4(10, 53, 3, 0, 24),
-        ];
-        let mut a = node(101, outer(50), &[], StaticRelayPolicy::DenyAll, T0);
-
-        for (offset, (public, routes)) in [
-            (first_pub, first_routes.as_slice()),
-            (second_pub, second_routes.as_slice()),
-            (third_pub, third_routes.as_slice()),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let at = T0 + Duration::from_secs(offset as u64);
-            let _ = a.core.request_peer_install(public, at);
-            let request = a.next_resolve_request().expect("install lookup queued");
-            a.resolve_completed(
-                at,
-                request.complete(ResolveOutcome::Found(resolved(public, None, None, routes))),
-            )
-            .await
-            .expect("existing peer installed");
-        }
-        assert_eq!(a.core.routes.available_slots(), 0, "route cache is full");
-
-        let at = T0 + DYNAMIC_PEER_MIN_IDLE + Duration::from_secs(10);
-        let _ = a.core.request_peer_install(newcomer_pub, at);
-        let request = a.next_resolve_request().expect("newcomer lookup queued");
-        a.resolve_completed(
-            at,
-            request.complete(ResolveOutcome::Found(resolved(
-                newcomer_pub,
-                None,
-                None,
-                &newcomer_routes,
-            ))),
-        )
-        .await
-        .expect("budget failure is an admission drop, not a core error");
-
-        assert_eq!(a.core.find_peer(&newcomer_pub), None);
-        for public in [first_pub, second_pub, third_pub] {
-            assert!(
-                a.core.find_peer(&public).is_some(),
-                "route admission must not partially evict its preflighted victims"
-            );
-        }
-        assert_eq!(a.core.routes.available_slots(), 0);
-    }
-
-    #[maybe_async::test(not(feature = "async"), async(feature = "async", tokio::test))]
-    async fn combined_peer_and_route_admission_is_preflighted_before_eviction() {
-        let existing = [
-            keypair(107).1,
-            keypair(108).1,
-            keypair(109).1,
-            keypair(110).1,
-        ];
-        let oversized = keypair(111).1;
-        let fitting = keypair(112).1;
-        let mut a = node(113, outer(70), &[], StaticRelayPolicy::DenyAll, T0);
-
-        for (offset, public) in existing.into_iter().enumerate() {
-            let routes = [
-                net4(10, 70 + offset as u8, 0, 0, 24),
-                net4(10, 70 + offset as u8, 1, 0, 24),
-            ];
-            let at = T0 + Duration::from_secs(offset as u64);
-            let _ = a.core.request_peer_install(public, at);
-            let request = a.next_resolve_request().expect("table-fill lookup queued");
-            a.resolve_completed(
-                at,
-                request.complete(ResolveOutcome::Found(resolved(public, None, None, &routes))),
-            )
-            .await
-            .expect("table-fill peer installed");
-        }
-        assert_eq!(a.core.routes.available_slots(), 0);
-
-        let at = T0 + DYNAMIC_PEER_MIN_IDLE + Duration::from_secs(10);
-        let oversized_routes = [
-            net4(10, 80, 0, 0, 24),
-            net4(10, 80, 1, 0, 24),
-            net4(10, 80, 2, 0, 24),
-            net4(10, 80, 3, 0, 24),
-        ];
-        let _ = a.core.request_peer_install(oversized, at);
-        let request = a.next_resolve_request().expect("oversized lookup queued");
-        a.resolve_completed(
-            at,
-            request.complete(ResolveOutcome::Found(resolved(
-                oversized,
-                None,
-                None,
-                &oversized_routes,
-            ))),
-        )
-        .await
-        .expect("unsafe admission is dropped without surfacing a core error");
-        assert_eq!(a.core.find_peer(&oversized), None);
-        for public in existing {
-            assert!(a.core.find_peer(&public).is_some());
-        }
-
-        let fitting_routes = [net4(10, 81, 0, 0, 24), net4(10, 81, 1, 0, 24)];
-        let _ = a.core.request_peer_install(fitting, at);
-        let request = a.next_resolve_request().expect("fitting lookup queued");
-        a.resolve_completed(
-            at,
-            request.complete(ResolveOutcome::Found(resolved(
-                fitting,
-                None,
-                None,
-                &fitting_routes,
-            ))),
-        )
-        .await
-        .expect("fitting admission uses the still-available eviction budget");
-        assert!(a.core.find_peer(&fitting).is_some());
-        assert_eq!(
-            a.core.find_peer(&existing[0]),
-            None,
-            "the oldest eligible peer is evicted only by the fitting admission"
-        );
-        for public in &existing[1..] {
-            assert!(a.core.find_peer(public).is_some());
-        }
     }
 
     #[test]
@@ -6385,7 +5921,7 @@ mod tests {
         for (offset, public) in publics[..3].iter().copied().enumerate() {
             a.core
                 .upsert_outbound_lazy_peer(
-                    &resolved(public, None, None, &[net4(10, 90 + offset as u8, 0, 0, 24)]),
+                    &resolved(public, None, None, net4(10, 90 + offset as u8, 0, 0, 24)),
                     T0,
                 )
                 .expect("an unreserved lazy-cache slot is available");
@@ -6393,7 +5929,7 @@ mod tests {
 
         assert_eq!(
             a.core.upsert_outbound_lazy_peer(
-                &resolved(publics[3], None, None, &[net4(10, 93, 0, 0, 24)]),
+                &resolved(publics[3], None, None, net4(10, 93, 0, 0, 24)),
                 T0,
             ),
             Err(Error::PeerAdmissionLimited),
@@ -6401,10 +5937,10 @@ mod tests {
         );
         assert_eq!(a.core.peers.iter().filter(|peer| peer.is_none()).count(), 1);
 
-        let swap_at = T0 + DYNAMIC_PEER_MIN_IDLE + Duration::from_millis(1);
+        let swap_at = T0 + DEFAULT_DYNAMIC_PEER_MIN_IDLE + Duration::from_millis(1);
         a.core
             .upsert_outbound_lazy_peer(
-                &resolved(publics[3], None, None, &[net4(10, 93, 0, 0, 24)]),
+                &resolved(publics[3], None, None, net4(10, 93, 0, 0, 24)),
                 swap_at,
             )
             .expect("an idle lazy-cache entry may be swapped without using the reserve");
@@ -6418,7 +5954,7 @@ mod tests {
 
         a.core
             .upsert_peer(
-                &resolved(publics[4], None, None, &[net4(10, 94, 0, 0, 24)]),
+                &resolved(publics[4], None, None, net4(10, 94, 0, 0, 24)),
                 swap_at,
             )
             .expect("a key-authenticated initiator may consume the reserve");
@@ -6439,7 +5975,7 @@ mod tests {
                 submitter_pub,
                 Some(outer(41)),
                 None,
-                &submitter_nets,
+                submitter_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::AllowAll,
@@ -6468,7 +6004,7 @@ mod tests {
                 first_pub,
                 None,
                 None,
-                &[net4(10, 41, 0, 0, 24)],
+                net4(10, 41, 0, 0, 24),
             ))),
         )
         .await
@@ -6493,7 +6029,7 @@ mod tests {
                 second_pub,
                 None,
                 None,
-                &[net4(10, 42, 0, 0, 24)],
+                net4(10, 42, 0, 0, 24),
             ))),
         )
         .await
@@ -6516,7 +6052,7 @@ mod tests {
                 b_pub,
                 Some(outer(2)),
                 None,
-                &b_nets,
+                b_nets[0],
                 InboundPolicy::AllowAll,
             )],
             StaticRelayPolicy::DenyAll,

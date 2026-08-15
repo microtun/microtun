@@ -23,7 +23,8 @@ use crate::IpCidr;
 type NodeId = usize;
 
 /// Returned by [`PrefixTrie::insert`] when the node pool is exhausted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("prefix trie capacity exhausted")]
 pub struct CapacityError;
 
 #[derive(Debug)]

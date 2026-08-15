@@ -30,31 +30,22 @@ use crate::{
 };
 
 /// Failure produced while issuing a typed Peers API operation.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     /// A query could not be rendered into the bounded wire representation.
-    Codec(Error),
+    #[error("Peers API codec error: {0}")]
+    Codec(#[from] Error),
     /// The JSON-RPC transport or remote endpoint rejected the operation.
-    Rpc(RpcError),
+    #[error("JSON-RPC error: {0}")]
+    Rpc(#[from] RpcError),
     /// A by-key or watch response named a key other than the requested one.
+    #[error("Peers API response returned an unexpected public key")]
     UnexpectedPublicKey {
         /// Key the operation requested.
         expected: [u8; 32],
         /// Key returned in the positive record.
         actual: [u8; 32],
     },
-}
-
-impl From<Error> for ClientError {
-    fn from(error: Error) -> Self {
-        Self::Codec(error)
-    }
-}
-
-impl From<RpcError> for ClientError {
-    fn from(error: RpcError) -> Self {
-        Self::Rpc(error)
-    }
 }
 
 /// Collects public keys named by `v1.peer.changed` and `v1.peer.removed` notifications.

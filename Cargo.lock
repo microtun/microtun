@@ -365,6 +365,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "darling"
+version = "0.20.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee"
+dependencies = [
+ "darling_core",
+ "darling_macro",
+]
+
+[[package]]
+name = "darling_core"
+version = "0.20.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e"
+dependencies = [
+ "fnv",
+ "ident_case",
+ "proc-macro2",
+ "quote",
+ "strsim",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "darling_macro"
+version = "0.20.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
+dependencies = [
+ "darling_core",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "defmt"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -465,7 +500,7 @@ dependencies = [
  "embassy-time",
  "embedded-io-async",
  "embedded-nal-async",
- "heapless",
+ "heapless 0.9.3",
  "managed",
  "smoltcp",
 ]
@@ -501,7 +536,7 @@ dependencies = [
  "embedded-io-async",
  "futures-core",
  "futures-sink",
- "heapless",
+ "heapless 0.9.3",
 ]
 
 [[package]]
@@ -663,6 +698,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fnv"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -761,6 +802,17 @@ dependencies = [
 
 [[package]]
 name = "heapless"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
+dependencies = [
+ "hash32",
+ "serde",
+ "stable_deref_trait",
+]
+
+[[package]]
+name = "heapless"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
@@ -785,6 +837,12 @@ checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
 ]
+
+[[package]]
+name = "ident_case"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "inout"
@@ -912,12 +970,13 @@ name = "microtun-api"
 version = "0.1.0"
 dependencies = [
  "embedded-io-async",
- "heapless",
+ "heapless 0.9.3",
  "microtun-core",
  "microtun-jsonrpc",
  "rand",
  "serde",
  "serde-json-core",
+ "thiserror",
 ]
 
 [[package]]
@@ -929,6 +988,7 @@ dependencies = [
  "embedded-io-async",
  "microtun-api",
  "microtun-core",
+ "microtun-ini",
  "microtun-jsonrpc",
  "microtun-std",
  "rand",
@@ -952,7 +1012,7 @@ dependencies = [
  "defmt-or-log",
  "digest",
  "hashbrown",
- "heapless",
+ "heapless 0.9.3",
  "hmac",
  "log",
  "maybe-async",
@@ -960,10 +1020,25 @@ dependencies = [
  "rand_chacha",
  "rand_core",
  "subtle",
+ "thiserror",
  "tokio",
  "x25519-dalek",
  "zerocopy",
  "zeroize",
+]
+
+[[package]]
+name = "microtun-device-config"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "cidr",
+ "crc",
+ "heapless 0.9.3",
+ "microtun-ini",
+ "serde",
+ "thiserror",
+ "wary",
 ]
 
 [[package]]
@@ -978,7 +1053,7 @@ dependencies = [
  "embassy-sync",
  "embassy-time",
  "embedded-io-async",
- "heapless",
+ "heapless 0.9.3",
  "log",
  "microtun-api",
  "microtun-core",
@@ -987,15 +1062,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "microtun-ini"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "microtun-jsonrpc"
 version = "0.1.0"
 dependencies = [
  "embedded-io 0.6.1",
  "embedded-io-async",
- "heapless",
+ "heapless 0.9.3",
  "maybe-async",
  "serde",
  "serde-json-core",
+ "thiserror",
  "tokio",
 ]
 
@@ -1003,6 +1088,7 @@ dependencies = [
 name = "microtun-linux"
 version = "0.1.0"
 dependencies = [
+ "microtun-device-config",
  "microtun-std",
  "rand",
  "socket2 0.5.10",
@@ -1017,12 +1103,8 @@ dependencies = [
 name = "microtun-provision"
 version = "0.1.0"
 dependencies = [
- "base64",
  "clap",
- "crc",
- "heapless",
- "serde",
- "serde-json-core",
+ "microtun-device-config",
 ]
 
 [[package]]
@@ -1035,6 +1117,7 @@ dependencies = [
  "microtun-jsonrpc",
  "rand_core",
  "serde-json-core",
+ "thiserror",
  "tokio",
 ]
 
@@ -1437,7 +1520,7 @@ dependencies = [
  "byteorder",
  "cfg-if",
  "defmt 0.3.100",
- "heapless",
+ "heapless 0.9.3",
  "managed",
 ]
 
@@ -1707,6 +1790,28 @@ name = "void"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
+
+[[package]]
+name = "wary"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68a39c75c1896ecfd70f6a65d612f62f6a78a9c3e20cbd61f6cbe29fc4d15c70"
+dependencies = [
+ "thiserror",
+ "wary_derive",
+]
+
+[[package]]
+name = "wary_derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e19843817912346ac6e4c1a9c880f8ec02a4fc222c9564117d5a1b815f756a78"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "wasi"

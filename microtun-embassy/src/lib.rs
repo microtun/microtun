@@ -36,8 +36,21 @@
 //! large bounded tables and packet scratch storage behind the application's
 //! global allocator. This is useful on heap-capable MCUs such as ESP32-C3 where
 //! async task stacks are comparatively small. The protocol capacities remain
-//! bounded by the same const generics, and the runner retains embedded-sized
-//! active rate/firewall limits; only the core storage backend changes.
+//! bounded by the same const generics, and the runner applies
+//! [`runner::embedded_core_config`] so active rate, firewall and under-load
+//! policy stays embedded-sized rather than silently inheriting the core's
+//! host-sized defaults; only the core storage backend changes. A caller that
+//! supplies its own tuned `CoreConfig` keeps it — the profile is applied only
+//! when the caller left the defaults alone.
+//!
+//! That profile lives here rather than in `microtun-core` on purpose. The
+//! core is sans-IO and has no business knowing whether it is running on a
+//! microcontroller or a hub — and cannot know, since the peer-table capacity
+//! most policy scales against is a const generic chosen here. It publishes
+//! storage ceilings and a
+//! [`CoreConfig::validate_against_limits`](microtun_core::CoreConfig::validate_against_limits)
+//! check; the embedding chooses the policy to inject. `microtun-std` does the
+//! same with its own host profile.
 //!
 //! ## The resolver deadlock, and why `try_send`
 //!
@@ -53,13 +66,76 @@
 #![no_std]
 #![deny(unsafe_code)]
 
+/// Tunnel (inner) MTU. 1280 is the IPv6 minimum link MTU and leaves ample
+/// headroom for the outer transport and optional relay envelope.
+pub const MTU: usize = 1280;
+
+/// Embedded peer/session/replay/route capacities.
+pub const MAX_PEERS: usize = 4;
+
+/// Session-slot capacity: four per peer.
+///
+/// A peer can hold `current`, `previous`, `next` and `handshake` at once, and
+/// holding two of them is ordinary steady state rather than a transient — a
+/// rotation parks the outgoing session in `previous` until it reaches
+/// `REJECT_AFTER_TIME`, which with a 120-second rekey against a 180-second
+/// lifetime is a third of every cycle. Sizing this at `MAX_PEERS` meant a
+/// fully-populated device could not seat its own peers: it evicted live
+/// sessions to make room for handshakes, and it sat permanently below
+/// `UNDER_LOAD_FREE_SLOTS`, so every handshake ate a cookie round trip
+/// forever.
+///
+/// The allocation-free peer and session index structures require powers of
+/// two greater than one, so the practical steps here are 16 and 32.
+pub const MAX_SESSIONS: usize = 16;
+
+/// Replay bitmap words per established session.
+///
+/// One word is reserved for recycling, so this accepts packets up to
+/// `(32 - 1) * 64 = 1,984` counters behind the high-water mark. The reference
+/// implementations use 128 words (8,128 counters) because they are servicing
+/// multi-core senders that genuinely reorder that far; a constrained device on
+/// a single link does not, and the difference is roughly 0.8 KiB *per session
+/// slot*. Trading it back is what pays for the pool above: four times the
+/// sessions for about 2 KiB more than the old eight-slot, 128-word pool cost.
+pub const REPLAY_WORDS: usize = 32;
+
+/// Each peer owns exactly one route, so route capacity matches peer capacity.
+pub const MAX_ROUTES: usize = MAX_PEERS;
+
+/// Post-cookie per-source handshake allowance. Tighter than the core's
+/// wireguard-go-matching default: a device with a handful of peers has no
+/// legitimate need for twenty per second from one source.
+pub const RATE_LIMIT_PER_SEC: u32 = 2;
+pub const RATE_LIMIT_BURST: u32 = 4;
+pub const RATE_LIMIT_ENTRIES: usize = 64;
+/// Handshakes per second above which this device engages the cookie
+/// machinery.
+pub const UNDER_LOAD_HANDSHAKES_PER_SEC: u32 = 8;
+/// Ingress firewall table, and the share of it any one peer may hold. The
+/// quota only isolates peers when it is a small fraction of the table.
+pub const FIREWALL_FLOW_ENTRIES: usize = 64;
+pub const FIREWALL_FLOWS_PER_PEER: usize = 8;
+/// Churn brake on destructive capacity evictions. Ten seconds per eviction is
+/// an anti-thrash floor that suits a peer table this small.
+pub const PEER_EVICTION_INTERVAL: microtun_core::Duration = microtun_core::Duration::from_secs(10);
+pub const PEER_EVICTION_GHOSTS: usize = 8;
+/// Live resolver queries plus negative markers tracked at once.
+///
+/// [`crate::resolver::CHANNEL_DEPTH`] must be at least this, or the channel
+/// silently becomes the real concurrency bound instead of this value.
+pub const INFLIGHT_RESOLVES: usize = 12;
+
 pub mod device;
 pub mod resolver;
 pub mod runner;
 
-pub use device::{TunnelState, new_tunnel};
+pub use device::{TunnelDevice, TunnelState, new_tunnel, new_tunnel_with_mtu};
 pub use microtun_api as peers_api;
 /// Convenience re-exports so downstream firmware needs only this crate.
 pub use microtun_core as core;
-pub use resolver::{ResolverBuffers, ResolverChannels, ResolverConfig, resolver_task};
-pub use runner::{MTU, OUTER_SIZE, TunnelRunner};
+pub use resolver::{
+    CHANNEL_DEPTH as RESOLVER_CHANNEL_DEPTH, ResolverBuffers, ResolverChannels, ResolverConfig,
+    resolver_task,
+};
+pub use runner::{OUTER_SIZE, TunnelRunner};

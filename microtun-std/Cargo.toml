@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
 microtun-core = { workspace = true, features = ["async", "log", "alloc"] }
 microtun-api = { workspace = true, features = ["alloc", "tokio-client"] }
 microtun-jsonrpc = { workspace = true, features = ["tokio"] }

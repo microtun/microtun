@@ -38,7 +38,7 @@ use crate::{ip::unmap_ip, time::Instant};
 const COST_MT: u32 = 1000;
 
 /// What the limiter treats as "one source".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Key {
     /// A complete IPv4 address.
     V4([u8; 4]),
@@ -62,19 +62,31 @@ impl Key {
 
 /// One source's bucket. The refill arithmetic is [`TokenBucket`]'s; this type
 /// only attaches the source it belongs to.
+///
+/// Only the allocation-free backend needs this pairing: the `alloc` backend
+/// keys a map on [`Key`] directly.
+#[cfg(not(feature = "alloc"))]
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
     key: Key,
     tokens: TokenBucket,
 }
 
-/// Fixed-size token bucket table.
+/// Bounded token bucket table.
 ///
 /// `MAX_RATE_LIMIT_ENTRIES` is the backend-specific storage ceiling. That
 /// bound is load-bearing rather than a storage detail: a full table *denies*
 /// instead of evicting, which is what stops a source-cycling attacker from
 /// resetting its own limit. `alloc` moves the buckets to the heap and uses a
 /// larger host ceiling; allocation-free builds retain the embedded ceiling.
+///
+/// The two backends differ in lookup structure, and the reason is the same
+/// reason the ceilings differ. This table is consulted once per handshake
+/// message *while under load* — that is, during exactly the flood it exists
+/// to bound — so its per-message cost is on the attack path. A linear scan is
+/// the right shape at 64 entries and the wrong shape at 4,096, where it hands
+/// an attacker a multiplier on every packet they send. `alloc` builds
+/// therefore use a hash map, matching the reference implementation.
 #[derive(Debug)]
 pub struct RateLimiter {
     per_sec: u32,
@@ -83,19 +95,27 @@ pub struct RateLimiter {
     #[cfg(not(feature = "alloc"))]
     buckets: heapless::Vec<Bucket, MAX_RATE_LIMIT_ENTRIES>,
     #[cfg(feature = "alloc")]
-    buckets: alloc::vec::Vec<Bucket>,
+    buckets: hashbrown::HashMap<Key, TokenBucket>,
 }
 
 impl RateLimiter {
+    #[cfg(not(feature = "alloc"))]
     pub const fn new(per_sec: u32, burst: u32, max_entries: usize) -> Self {
         Self {
             per_sec,
             burst,
             max_entries,
-            #[cfg(not(feature = "alloc"))]
             buckets: heapless::Vec::new(),
-            #[cfg(feature = "alloc")]
-            buckets: alloc::vec::Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn new(per_sec: u32, burst: u32, max_entries: usize) -> Self {
+        Self {
+            per_sec,
+            burst,
+            max_entries,
+            buckets: hashbrown::HashMap::new(),
         }
     }
 
@@ -103,43 +123,73 @@ impl RateLimiter {
     pub fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
         let key = Key::from_ip(ip);
 
-        if let Some(bucket) = self.buckets.iter_mut().find(|bucket| bucket.key == key) {
-            return bucket.tokens.try_take(now);
+        if let Some(tokens) = self.lookup_mut(&key) {
+            return tokens.try_take(now);
         }
 
-        // An unseen source. Reclaim refilled buckets, then admit only if the
-        // table has room: a partially drained bucket is never evicted, which
-        // is precisely what stops a source-cycling attacker from resetting
-        // its own limit.
-        self.collect(now);
-
-        let mut bucket = Bucket {
-            key,
-            tokens: TokenBucket::new(self.per_sec, self.burst, now),
-        };
-        let allowed = bucket.tokens.try_take(now);
-        #[cfg(feature = "alloc")]
-        {
-            if self.buckets.len() >= self.max_entries {
+        // An unseen source needs a slot. Reclaiming refilled buckets is only
+        // worth doing when there is no room, so the common admission stays
+        // O(1) on the `alloc` backend instead of paying a full sweep per new
+        // source — which under a source-cycling flood is the whole table,
+        // per packet.
+        if self.len() >= self.max_entries {
+            self.collect(now);
+            if self.len() >= self.max_entries {
                 warn!("handshake denied: rate limiter table full");
                 return false;
             }
-            self.buckets.push(bucket);
         }
-        #[cfg(not(feature = "alloc"))]
-        {
-            if self.buckets.len() >= self.max_entries || self.buckets.push(bucket).is_err() {
-                warn!("handshake denied: rate limiter table full");
-                return false;
-            }
+
+        // A partially drained bucket is never evicted to make room, which is
+        // precisely what stops a source-cycling attacker from resetting its
+        // own limit.
+        let mut tokens = TokenBucket::new(self.per_sec, self.burst, now);
+        let allowed = tokens.try_take(now);
+        if !self.admit(key, tokens) {
+            warn!("handshake denied: rate limiter table full");
+            return false;
         }
         allowed
     }
 
+    #[cfg(not(feature = "alloc"))]
+    fn lookup_mut(&mut self, key: &Key) -> Option<&mut TokenBucket> {
+        self.buckets
+            .iter_mut()
+            .find(|bucket| bucket.key == *key)
+            .map(|bucket| &mut bucket.tokens)
+    }
+
+    #[cfg(feature = "alloc")]
+    fn lookup_mut(&mut self, key: &Key) -> Option<&mut TokenBucket> {
+        self.buckets.get_mut(key)
+    }
+
+    fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    #[cfg(not(feature = "alloc"))]
+    fn admit(&mut self, key: Key, tokens: TokenBucket) -> bool {
+        self.buckets.push(Bucket { key, tokens }).is_ok()
+    }
+
+    #[cfg(feature = "alloc")]
+    fn admit(&mut self, key: Key, tokens: TokenBucket) -> bool {
+        self.buckets.insert(key, tokens);
+        true
+    }
+
     /// Drop every bucket that has refilled to capacity: it constrains
     /// nothing, and its slot is worth more than its history.
+    #[cfg(not(feature = "alloc"))]
     fn collect(&mut self, now: Instant) {
         self.buckets.retain(|bucket| !bucket.tokens.is_full(now));
+    }
+
+    #[cfg(feature = "alloc")]
+    fn collect(&mut self, now: Instant) {
+        self.buckets.retain(|_, tokens| !tokens.is_full(now));
     }
 }
 
@@ -289,28 +339,28 @@ mod tests {
     #[test]
     fn a_source_gets_a_burst_and_then_refills_at_the_configured_rate() {
         let mut limiter = RateLimiter::new(
-            crate::constants::RATE_LIMIT_PER_SEC,
-            crate::constants::RATE_LIMIT_BURST,
+            crate::constants::DEFAULT_RATE_LIMIT_PER_SEC,
+            crate::constants::DEFAULT_RATE_LIMIT_BURST,
             crate::constants::MAX_RATE_LIMIT_ENTRIES,
         );
         let source = v4(198, 51, 100, 1);
 
         // A fresh bucket starts full, so a peer recovering from an outage is
         // not punished for its first handshakes.
-        for attempt in 0..crate::constants::RATE_LIMIT_BURST {
+        for attempt in 0..crate::constants::DEFAULT_RATE_LIMIT_BURST {
             assert!(limiter.allow(source, T0), "burst attempt {attempt}");
         }
         assert!(!limiter.allow(source, T0), "the burst must be finite");
 
         // Refill is linear in elapsed time: one message costs a full token.
-        let one_token_ms = 1000 / u64::from(crate::constants::RATE_LIMIT_PER_SEC);
+        let one_token_ms = 1000 / u64::from(crate::constants::DEFAULT_RATE_LIMIT_PER_SEC);
         assert!(!limiter.allow(source, at(one_token_ms - 1)));
         assert!(limiter.allow(source, at(one_token_ms)));
         assert!(!limiter.allow(source, at(one_token_ms)));
 
         // Waiting far longer than the burst period does not bank extra credit.
         let much_later = at(60_000);
-        for _ in 0..crate::constants::RATE_LIMIT_BURST {
+        for _ in 0..crate::constants::DEFAULT_RATE_LIMIT_BURST {
             assert!(limiter.allow(source, much_later));
         }
         assert!(!limiter.allow(source, much_later));
@@ -319,8 +369,8 @@ mod tests {
     #[test]
     fn sources_are_keyed_the_way_addresses_are_actually_allocated() {
         let mut limiter = RateLimiter::new(
-            crate::constants::RATE_LIMIT_PER_SEC,
-            crate::constants::RATE_LIMIT_BURST,
+            crate::constants::DEFAULT_RATE_LIMIT_PER_SEC,
+            crate::constants::DEFAULT_RATE_LIMIT_BURST,
             crate::constants::MAX_RATE_LIMIT_ENTRIES,
         );
 
@@ -335,7 +385,7 @@ mod tests {
         let same_prefix_b = v6([0x2001, 0xdb8, 0, 1, 0xffff, 0xffff, 0xffff, 0xffff]);
         let other_prefix = v6([0x2001, 0xdb8, 0, 2, 0, 0, 0, 1]);
 
-        for _ in 0..crate::constants::RATE_LIMIT_BURST {
+        for _ in 0..crate::constants::DEFAULT_RATE_LIMIT_BURST {
             assert!(limiter.allow(same_prefix_a, T0));
         }
         assert!(
@@ -347,7 +397,7 @@ mod tests {
         // An IPv4-mapped source is the IPv4 source, not a second identity.
         let native = v4(203, 0, 113, 9);
         let mapped = core::net::IpAddr::V6(Ipv4Addr::new(203, 0, 113, 9).to_ipv6_mapped());
-        for _ in 0..crate::constants::RATE_LIMIT_BURST {
+        for _ in 0..crate::constants::DEFAULT_RATE_LIMIT_BURST {
             assert!(limiter.allow(native, T0));
         }
         assert!(
@@ -362,8 +412,8 @@ mod tests {
         // fresh full burst, so an attacker cycling addresses would never be
         // limited no matter how large the table was.
         let mut limiter = RateLimiter::new(
-            crate::constants::RATE_LIMIT_PER_SEC,
-            crate::constants::RATE_LIMIT_BURST,
+            crate::constants::DEFAULT_RATE_LIMIT_PER_SEC,
+            crate::constants::DEFAULT_RATE_LIMIT_BURST,
             crate::constants::MAX_RATE_LIMIT_ENTRIES,
         );
         for index in 0..crate::constants::MAX_RATE_LIMIT_ENTRIES {

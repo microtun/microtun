@@ -37,10 +37,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use microtun_std::{
-    TunnelDevice,
-    core::{IpCidr, MAX_INNER_SIZE},
-};
+use microtun_std::{TunnelDevice, core::IpInet};
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
     phy::{Device as PhyDevice, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -57,10 +54,28 @@ use tokio::{
     time::{Duration, Instant},
 };
 
-const TCP_RX_BUFFER: usize = 16 * 1024;
-const TCP_TX_BUFFER: usize = 16 * 1024;
+/// Per-socket smoltcp buffers.
+///
+/// The Peers API's largest possible frame is `RECORD_FRAME_LEN` (1 KiB), and
+/// the embedded client on the other end of these sockets uses a 2 KiB buffer.
+/// These were 16 KiB each — sixteen times the largest message that can ever
+/// traverse them — and they are allocated eagerly, once per backlog slot and
+/// once per established connection, so the old sizing cost 2 MiB before a
+/// single peer connected and roughly 18 MiB at a full host-sized fleet.
+///
+/// 4 KiB leaves room for several pipelined change notifications behind a slow
+/// reader while keeping the idle footprint proportionate. TX is the direction
+/// that bursts (the server pushes invalidations; it never reads bursts), so
+/// if either of these grows again it should be that one.
+const TCP_RX_BUFFER: usize = 4 * 1024;
+const TCP_TX_BUFFER: usize = 4 * 1024;
 const STACK_QUEUE_DEPTH: usize = 64;
-const SMOLTCP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Upper bound on how long the stack may sleep when nothing wakes it.
+///
+/// This is a ceiling, not a cadence: `run` also polls on the NIC's notify, so
+/// the latency-sensitive path does not wait for it. It exists so smoltcp's
+/// own retransmission and delayed-ACK timers cannot be missed indefinitely.
+const SMOLTCP_MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TCP_KEEP_ALIVE: SmolDuration = SmolDuration::from_secs(15);
 const TCP_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(45);
 
@@ -68,7 +83,10 @@ const TCP_IDLE_TIMEOUT: SmolDuration = SmolDuration::from_secs(45);
 /// forgotten. A peer that opens connections and never completes them can only
 /// cost this much memory, and only its own entries are at risk of eviction
 /// once it exceeds the whole listener backlog on its own.
-const MAX_PENDING_ENDPOINTS: usize = 512;
+///
+/// Derived from the peer table and the per-peer connection cap rather than
+/// restated, so it cannot drift out of proportion with either.
+const MAX_PENDING_ENDPOINTS: usize = microtun_std::MAX_PEERS * crate::rpc::MAX_CONNECTIONS_PER_PEER;
 
 /// A connecting peer's endpoint: address plus source port.
 type Endpoint = (IpAddr, u16);
@@ -81,7 +99,10 @@ pub struct SmolTcpNic {
 }
 
 impl SmolTcpNic {
-    pub fn new(local_addresses: impl IntoIterator<Item = IpCidr>) -> (Self, SmolTcpStack) {
+    pub fn new(
+        local_addresses: impl IntoIterator<Item = IpInet>,
+        mtu: usize,
+    ) -> (Self, SmolTcpStack) {
         let (inbound_tx, inbound_rx) = mpsc::channel(STACK_QUEUE_DEPTH);
         let (outbound_tx, outbound_rx) = mpsc::channel(STACK_QUEUE_DEPTH);
         let notify = Arc::new(Notify::new());
@@ -93,7 +114,14 @@ impl SmolTcpNic {
             pending: Arc::clone(&pending),
             notify: Arc::clone(&notify),
         };
-        let stack = SmolTcpStack::new(local_addresses, inbound_rx, outbound_tx, pending, notify);
+        let stack = SmolTcpStack::new(
+            local_addresses,
+            mtu,
+            inbound_rx,
+            outbound_tx,
+            pending,
+            notify,
+        );
         (nic, stack)
     }
 }
@@ -230,29 +258,29 @@ struct Inner {
 
 impl SmolTcpStack {
     fn new(
-        local_addresses: impl IntoIterator<Item = IpCidr>,
+        local_addresses: impl IntoIterator<Item = IpInet>,
+        mtu: usize,
         inbound_rx: mpsc::Receiver<Vec<u8>>,
         outbound_tx: mpsc::Sender<Vec<u8>>,
         pending: Arc<Mutex<PendingKeys>>,
         notify: Arc<Notify>,
     ) -> Self {
-        let mut device = QueueDevice::new(inbound_rx, outbound_tx, Arc::clone(&notify));
+        let mut device = QueueDevice::new(inbound_rx, outbound_tx, Arc::clone(&notify), mtu);
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = 0x5eed_5eed;
 
         let mut iface = Interface::new(config, &mut device, smol_instant());
         iface.update_ip_addrs(|addrs| {
             for address in local_addresses {
-                // Convert the core `cidr::IpCidr` into smoltcp's `IpCidr`.
-                // `first_address` is the network address, which for the /32
-                // and /128 host prefixes a Peers API server is configured with
-                // is simply the server's own address.
+                // Convert the interface address without discarding host bits.
+                // For example, 10.0.0.1/24 must remain 10.0.0.1/24 here rather
+                // than becoming the network prefix 10.0.0.0/24.
                 let cidr = match address {
-                    IpCidr::V4(net) => {
-                        SmolIpCidr::new(IpAddress::Ipv4(net.first_address()), net.network_length())
+                    IpInet::V4(inet) => {
+                        SmolIpCidr::new(IpAddress::Ipv4(inet.address()), inet.network_length())
                     }
-                    IpCidr::V6(net) => {
-                        SmolIpCidr::new(IpAddress::Ipv6(net.first_address()), net.network_length())
+                    IpInet::V6(inet) => {
+                        SmolIpCidr::new(IpAddress::Ipv6(inet.address()), inet.network_length())
                     }
                 };
                 addrs
@@ -297,22 +325,32 @@ impl SmolTcpStack {
     }
 
     pub async fn run(self) -> ! {
-        let mut ticker = tokio::time::interval(SMOLTCP_POLL_INTERVAL);
         loop {
-            self.poll_once();
+            // `poll_once` returns how long smoltcp itself wants to sleep. An
+            // unconditional ticker woke this task a hundred times a second on
+            // a completely idle server and still quantised smoltcp's own
+            // retransmission and delayed-ACK timers to the tick; asking the
+            // interface gets both right. The ceiling is retained only so a
+            // `None` (nothing scheduled) cannot park the loop forever.
+            let delay = self
+                .poll_once()
+                .unwrap_or(SMOLTCP_MAX_POLL_INTERVAL)
+                .min(SMOLTCP_MAX_POLL_INTERVAL);
             tokio::select! {
-                _ = ticker.tick() => {},
+                _ = tokio::time::sleep(delay) => {},
                 _ = self.notify.notified() => {},
             }
         }
     }
 
-    fn poll_once(&self) {
+    /// Drive the interface once, returning smoltcp's requested sleep.
+    fn poll_once(&self) -> Option<Duration> {
         let mut inner = self.lock();
         inner.poll_iface();
         inner.harvest_accepts();
         inner.cleanup_closed_streams();
         inner.wake_parked_streams();
+        inner.poll_delay()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -337,6 +375,17 @@ impl Inner {
             ..
         } = self;
         let _ = iface.poll(smol_instant(), device, sockets);
+    }
+
+    /// How long smoltcp wants to sleep before it next needs servicing.
+    ///
+    /// `None` means nothing is scheduled at all, which the caller turns into
+    /// its ceiling rather than an indefinite park.
+    fn poll_delay(&mut self) -> Option<Duration> {
+        let Self { iface, sockets, .. } = self;
+        iface
+            .poll_delay(smol_instant(), sockets)
+            .map(|delay| Duration::from_micros(delay.total_micros()))
     }
 
     fn add_listening_socket(&mut self, port: u16) -> io::Result<SocketHandle> {
@@ -598,6 +647,7 @@ struct QueueDevice {
     inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
     notify: Arc<Notify>,
+    mtu: usize,
 }
 
 impl QueueDevice {
@@ -605,11 +655,13 @@ impl QueueDevice {
         inbound_rx: mpsc::Receiver<Vec<u8>>,
         outbound_tx: mpsc::Sender<Vec<u8>>,
         notify: Arc<Notify>,
+        mtu: usize,
     ) -> Self {
         Self {
             inbound_rx,
             outbound_tx,
             notify,
+            mtu,
         }
     }
 }
@@ -647,7 +699,7 @@ impl PhyDevice for QueueDevice {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = MAX_INNER_SIZE;
+        caps.max_transmission_unit = self.mtu;
         caps.medium = Medium::Ip;
         caps
     }
@@ -695,6 +747,7 @@ fn smol_instant() -> SmolInstant {
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
+    use microtun_core::{RECOMMENDED_MAX_MTU, ip::parse_ip_inet};
     use smoltcp::{
         phy::ChecksumCapabilities,
         wire::{Ipv4Repr, TcpControl, TcpRepr, TcpSeqNumber},
@@ -706,8 +759,8 @@ mod tests {
     const SERVER_V4_ALT: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 4);
     const RPC_PORT: u16 = 80;
 
-    fn server_addresses() -> [IpCidr; 1] {
-        ["10.0.0.1/32".parse().unwrap()]
+    fn server_addresses() -> [IpInet; 1] {
+        [parse_ip_inet("10.0.0.1/32").unwrap()]
     }
 
     /// A deterministic public key derived from a single discriminant byte.
@@ -880,7 +933,7 @@ mod tests {
     /// Drive the three-way handshake to completion for `peer`.
     async fn handshake(nic: &mut SmolTcpNic, stack: &SmolTcpStack, peer: &mut SimPeer) {
         inject(nic, &peer.syn(), peer.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
 
         let synack = drain_one(nic).expect("server must answer SYN with SYN-ACK");
         let (dst_port, server_seq, ack, control) = parse_segment(&synack);
@@ -898,7 +951,7 @@ mod tests {
         peer.server_seq = server_seq;
 
         inject(nic, &peer.ack(), peer.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
     }
 
     /// The endpoint smoltcp recorded as the remote end of an accepted stream.
@@ -941,7 +994,8 @@ mod tests {
     async fn the_device_drains_every_queued_packet_in_one_poll() {
         let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(8);
         let (out_tx, _out_rx) = mpsc::channel::<Vec<u8>>(8);
-        let mut device = QueueDevice::new(in_rx, out_tx, Arc::new(Notify::new()));
+        let mut device =
+            QueueDevice::new(in_rx, out_tx, Arc::new(Notify::new()), RECOMMENDED_MAX_MTU);
 
         in_tx.send(vec![1, 2, 3]).await.unwrap();
         in_tx.send(vec![4, 5, 6]).await.unwrap();
@@ -952,6 +1006,15 @@ mod tests {
             PhyDevice::receive(&mut device, smol_instant()).is_none(),
             "an empty queue yields nothing"
         );
+    }
+
+    #[test]
+    fn queue_device_advertises_configured_mtu() {
+        let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (out_tx, _out_rx) = mpsc::channel::<Vec<u8>>(1);
+        let device = QueueDevice::new(in_rx, out_tx, Arc::new(Notify::new()), 1400);
+
+        assert_eq!(PhyDevice::capabilities(&device).max_transmission_unit, 1400);
     }
 
     #[test]
@@ -973,12 +1036,29 @@ mod tests {
         assert_eq!(pending.take(&(last, 1000)), Some(expected(0x01)));
     }
 
+    #[tokio::test]
+    async fn interface_cidr_binds_the_configured_host_not_the_network_address() {
+        let (mut nic, stack) = SmolTcpNic::new(
+            [parse_ip_inet("10.0.0.1/24").expect("valid interface CIDR")],
+            RECOMMENDED_MAX_MTU,
+        );
+        let _listener = stack.listen(RPC_PORT, 1).unwrap();
+        let peer = SimPeer::new(0x07, 2, 40000, 1000);
+
+        inject(&nic, &peer.syn(), peer.key).await;
+        let _ = stack.poll_once();
+
+        let synack = drain_one(&mut nic).expect("server must answer the configured host address");
+        let packet = Ipv4Packet::new_checked(&synack).expect("valid IPv4 reply");
+        assert_eq!(packet.src_addr(), SERVER_V4);
+    }
+
     // -----------------------------------------------------------------------
     // Baseline: a single peer is attributed its own key.
     // -----------------------------------------------------------------------
     #[tokio::test]
     async fn single_peer_is_attributed_its_own_key() {
-        let (mut nic, stack) = SmolTcpNic::new(server_addresses());
+        let (mut nic, stack) = SmolTcpNic::new(server_addresses(), RECOMMENDED_MAX_MTU);
         let listener = stack.listen(RPC_PORT, 8).unwrap();
 
         let mut peer = SimPeer::new(0x07, 2, 40000, 1000);
@@ -1002,25 +1082,25 @@ mod tests {
     // -----------------------------------------------------------------------
     #[tokio::test]
     async fn interleaved_peers_are_never_cross_attributed() {
-        let (mut nic, stack) = SmolTcpNic::new(server_addresses());
+        let (mut nic, stack) = SmolTcpNic::new(server_addresses(), RECOMMENDED_MAX_MTU);
         let listener = stack.listen(RPC_PORT, 8).unwrap();
 
         let mut a = SimPeer::new(0xAA, 2, 40001, 1000);
         let mut b = SimPeer::new(0xBB, 3, 40002, 9000);
 
         inject(&nic, &a.syn(), a.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
         a.server_seq = parse_segment(&drain_one(&mut nic).expect("A SYN-ACK")).1;
 
         inject(&nic, &b.syn(), b.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
         b.server_seq = parse_segment(&drain_one(&mut nic).expect("B SYN-ACK")).1;
 
         // ACKs in REVERSE order: B establishes first, then A.
         inject(&nic, &b.ack(), b.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
         inject(&nic, &a.ack(), a.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
 
         let first = listener.accept().await.unwrap();
         let second = listener.accept().await.unwrap();
@@ -1048,7 +1128,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[tokio::test]
     async fn handshakes_batched_into_one_poll_are_attributed_separately() {
-        let (mut nic, stack) = SmolTcpNic::new(server_addresses());
+        let (mut nic, stack) = SmolTcpNic::new(server_addresses(), RECOMMENDED_MAX_MTU);
         let listener = stack.listen(RPC_PORT, 8).unwrap();
 
         let mut a = SimPeer::new(0xCA, 2, 41001, 2000);
@@ -1057,7 +1137,7 @@ mod tests {
         // Both SYNs, then ONE poll.
         inject(&nic, &a.syn(), a.key).await;
         inject(&nic, &b.syn(), b.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
 
         for _ in 0..2 {
             let (dst_port, seq, _, control) =
@@ -1075,7 +1155,7 @@ mod tests {
         // Both ACKs, then ONE poll: two sockets establish together.
         inject(&nic, &a.ack(), a.key).await;
         inject(&nic, &b.ack(), b.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
 
         let first = listener.accept().await.unwrap();
         let second = listener.accept().await.unwrap();
@@ -1101,7 +1181,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[tokio::test]
     async fn key_is_immutable_after_accept() {
-        let (mut nic, stack) = SmolTcpNic::new(server_addresses());
+        let (mut nic, stack) = SmolTcpNic::new(server_addresses(), RECOMMENDED_MAX_MTU);
         let listener = stack.listen(RPC_PORT, 8).unwrap();
 
         let mut a = SimPeer::new(0xA0, 2, 42001, 3000);
@@ -1112,7 +1192,7 @@ mod tests {
         // A different peer sends a (bogus, unmatched) segment afterwards.
         let b = SimPeer::new(0xB0, 3, 42002, 8000);
         inject(&nic, &b.data(b"noise"), b.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
         let _ = drain_one(&mut nic);
 
         assert_eq!(
@@ -1128,7 +1208,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[tokio::test]
     async fn accept_consumes_the_pending_entry() {
-        let (mut nic, stack) = SmolTcpNic::new(server_addresses());
+        let (mut nic, stack) = SmolTcpNic::new(server_addresses(), RECOMMENDED_MAX_MTU);
         let listener = stack.listen(RPC_PORT, 8).unwrap();
 
         let mut a = SimPeer::new(0x11, 2, 43001, 4000);
@@ -1152,7 +1232,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[tokio::test]
     async fn an_unrecorded_connection_yields_no_key() {
-        let (mut nic, stack) = SmolTcpNic::new(server_addresses());
+        let (mut nic, stack) = SmolTcpNic::new(server_addresses(), RECOMMENDED_MAX_MTU);
         let listener = stack.listen(RPC_PORT, 8).unwrap();
 
         let mut a = SimPeer::new(0x33, 2, 44001, 5000);
@@ -1172,8 +1252,10 @@ mod tests {
     #[tokio::test]
     async fn ipv6_local_address_constructs_and_listens() {
         let v6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
-        let (_nic, stack) =
-            SmolTcpNic::new([format!("{v6}/128").parse().expect("valid IPv6 prefix")]);
+        let (_nic, stack) = SmolTcpNic::new(
+            [parse_ip_inet(&format!("{v6}/128")).expect("valid IPv6 prefix")],
+            RECOMMENDED_MAX_MTU,
+        );
         stack
             .listen(RPC_PORT, 4)
             .expect("listening on an IPv6 stack must succeed");
@@ -1181,12 +1263,15 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_connections_on_every_server_address() {
-        let (mut nic, stack) = SmolTcpNic::new([
-            "10.0.0.1/32".parse().unwrap(),
-            "10.0.0.2/32".parse().unwrap(),
-            "10.0.0.3/32".parse().unwrap(),
-            "10.0.0.4/32".parse().unwrap(),
-        ]);
+        let (mut nic, stack) = SmolTcpNic::new(
+            [
+                parse_ip_inet("10.0.0.1/32").unwrap(),
+                parse_ip_inet("10.0.0.2/32").unwrap(),
+                parse_ip_inet("10.0.0.3/32").unwrap(),
+                parse_ip_inet("10.0.0.4/32").unwrap(),
+            ],
+            RECOMMENDED_MAX_MTU,
+        );
         let listener = stack.listen(RPC_PORT, 4).unwrap();
 
         let mut peer = SimPeer::new(0x42, 9, 41000, 1000);
@@ -1202,7 +1287,7 @@ mod tests {
             &[],
         );
         inject(&nic, &syn, peer.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
 
         let synack = drain_one(&mut nic).expect("server must answer on every configured address");
         let (_, server_seq, _, control) = parse_segment(&synack);
@@ -1221,7 +1306,7 @@ mod tests {
             &[],
         );
         inject(&nic, &ack, peer.key).await;
-        stack.poll_once();
+        let _ = stack.poll_once();
 
         let stream = listener.accept().await.unwrap();
         assert_eq!(stream.remote_peer_key(), Some(peer.key));
@@ -1229,7 +1314,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_listener_is_refused() {
-        let (_nic, stack) = SmolTcpNic::new(server_addresses());
+        let (_nic, stack) = SmolTcpNic::new(server_addresses(), RECOMMENDED_MAX_MTU);
         let _first = stack.listen(RPC_PORT, 4).expect("first listener");
         assert!(stack.listen(8080, 4).is_err());
     }

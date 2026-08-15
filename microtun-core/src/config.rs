@@ -1,23 +1,25 @@
 //! Engine configuration: interface identity, bootstrap peers, and runtime tunables.
 //!
 //! Pinned peers are the bootstrap peers of a microtun deployment. They are
-//! loaded at init, can never be evicted, and their tunnel address prefixes
-//! live in the route cache without a pushed-change feed or polling deadline.
+//! loaded at init, can never be evicted, and their tunnel address
+//! lives in the route cache without a pushed-change feed or polling deadline.
 
 use core::net::SocketAddr;
 
 use zeroize::Zeroizing;
 
 use crate::{
-    IpCidr,
+    Error, IpCidr,
     constants::*,
-    firewall::{DEFAULT_FIREWALL_FLOWS, DEFAULT_FIREWALL_FLOWS_PER_PEER, InboundPolicy},
+    firewall::{
+        DEFAULT_FIREWALL_FLOWS, DEFAULT_FIREWALL_FLOWS_PER_PEER, InboundPolicy, MAX_FIREWALL_FLOWS,
+    },
     time::Duration,
 };
 
 /// A configured, non-evictable bootstrap peer.
 #[derive(Debug, Clone, Copy)]
-pub struct PinnedPeer<'a> {
+pub struct PinnedPeer {
     /// The peer's static Curve25519 public key.
     pub public_key: [u8; 32],
     /// Initial outer endpoint. Required for directly reachable peers
@@ -31,9 +33,9 @@ pub struct PinnedPeer<'a> {
     /// of a direct `endpoint` or a `relay` must be usable for outbound
     /// traffic; when `relay` is set it is the routing authority (relay spec §9).
     pub relay: Option<[u8; 32]>,
-    /// Tunnel address prefixes assigned to this peer, pre-seeded into the
-    /// route cache without expiry.
-    pub addresses: &'a [IpCidr],
+    /// Tunnel address assigned to this peer, pre-seeded into the route cache
+    /// without expiry.
+    pub address: IpCidr,
     /// Ingress policy applied to authenticated inner packets from this peer.
     pub inbound_policy: InboundPolicy,
     /// WireGuard-style persistent keepalive interval. When set, the core
@@ -78,10 +80,6 @@ pub struct CoreConfig {
     /// Peer-table slots reserved from all unauthenticated lazy-cache installs.
     /// Authenticated unknown initiators may consume the reserve.
     pub lazy_peer_reserve: usize,
-    /// Legacy endpoint-confirmation interval retained for configuration/API
-    /// compatibility. Accepted resolver records are complete replacements, so
-    /// this value no longer lets a previously roamed endpoint override them.
-    pub endpoint_confirmation_ttl: Duration,
     /// Stateful firewall lifetime for UDP flows.
     pub firewall_udp_timeout: Duration,
     /// Stateful firewall lifetime for ICMP echo flows.
@@ -123,34 +121,70 @@ pub struct CoreConfig {
 impl Default for CoreConfig {
     fn default() -> Self {
         Self {
-            resolve_timeout: RESOLVE_TIMEOUT,
-            resolve_outbound_timeout: RESOLVE_OUTBOUND_TIMEOUT,
-            negative_ttl: NEGATIVE_TTL,
-            dynamic_peer_min_idle: DYNAMIC_PEER_MIN_IDLE,
-            peer_eviction_interval: PEER_EVICTION_INTERVAL,
-            peer_eviction_burst: PEER_EVICTION_BURST,
-            peer_eviction_ghost_ttl: PEER_EVICTION_GHOST_TTL,
+            resolve_timeout: DEFAULT_RESOLVE_TIMEOUT,
+            resolve_outbound_timeout: DEFAULT_RESOLVE_OUTBOUND_TIMEOUT,
+            negative_ttl: DEFAULT_NEGATIVE_TTL,
+            dynamic_peer_min_idle: DEFAULT_DYNAMIC_PEER_MIN_IDLE,
+            peer_eviction_interval: DEFAULT_PEER_EVICTION_INTERVAL,
+            peer_eviction_burst: DEFAULT_PEER_EVICTION_BURST,
+            peer_eviction_ghost_ttl: DEFAULT_PEER_EVICTION_GHOST_TTL,
             peer_eviction_ghost_entries: DEFAULT_PEER_EVICTION_GHOSTS,
-            relay_resolve_min_interval: RELAY_RESOLVE_MIN_INTERVAL,
-            lazy_peer_reserve: LAZY_PEER_RESERVE,
-            endpoint_confirmation_ttl: ENDPOINT_CONFIRMATION_TTL,
-            firewall_udp_timeout: FIREWALL_UDP_TIMEOUT,
-            firewall_icmp_timeout: FIREWALL_ICMP_TIMEOUT,
-            firewall_tcp_timeout: FIREWALL_TCP_TIMEOUT,
-            firewall_tcp_closing_timeout: FIREWALL_TCP_CLOSING_TIMEOUT,
+            relay_resolve_min_interval: DEFAULT_RELAY_RESOLVE_MIN_INTERVAL,
+            lazy_peer_reserve: DEFAULT_LAZY_PEER_RESERVE,
+            firewall_udp_timeout: DEFAULT_FIREWALL_UDP_TIMEOUT,
+            firewall_icmp_timeout: DEFAULT_FIREWALL_ICMP_TIMEOUT,
+            firewall_tcp_timeout: DEFAULT_FIREWALL_TCP_TIMEOUT,
+            firewall_tcp_closing_timeout: DEFAULT_FIREWALL_TCP_CLOSING_TIMEOUT,
             firewall_flow_entries: DEFAULT_FIREWALL_FLOWS,
             firewall_flows_per_peer: DEFAULT_FIREWALL_FLOWS_PER_PEER,
-            under_load_handshakes_per_sec: UNDER_LOAD_HANDSHAKES_PER_SEC,
-            under_load_free_slots: UNDER_LOAD_FREE_SLOTS,
-            rate_limit_per_sec: RATE_LIMIT_PER_SEC,
-            rate_limit_burst: RATE_LIMIT_BURST,
+            under_load_handshakes_per_sec: DEFAULT_UNDER_LOAD_HANDSHAKES_PER_SEC,
+            under_load_free_slots: DEFAULT_UNDER_LOAD_FREE_SLOTS,
+            rate_limit_per_sec: DEFAULT_RATE_LIMIT_PER_SEC,
+            rate_limit_burst: DEFAULT_RATE_LIMIT_BURST,
             rate_limit_entries: DEFAULT_RATE_LIMIT_ENTRIES,
-            remote_resolve_per_sec: REMOTE_RESOLVE_PER_SEC,
-            remote_resolve_burst: REMOTE_RESOLVE_BURST,
-            unknown_auth_per_sec: UNKNOWN_AUTH_PER_SEC,
-            unknown_auth_burst: UNKNOWN_AUTH_BURST,
-            max_inflight_resolves: MAX_INFLIGHT_RESOLVES,
+            remote_resolve_per_sec: DEFAULT_REMOTE_RESOLVE_PER_SEC,
+            remote_resolve_burst: DEFAULT_REMOTE_RESOLVE_BURST,
+            unknown_auth_per_sec: DEFAULT_UNKNOWN_AUTH_PER_SEC,
+            unknown_auth_burst: DEFAULT_UNKNOWN_AUTH_BURST,
+            max_inflight_resolves: DEFAULT_INFLIGHT_RESOLVES,
         }
+    }
+}
+
+impl CoreConfig {
+    /// Check every runtime limit against the storage ceiling compiled into
+    /// this backend.
+    ///
+    /// [`crate::Core::new`] calls this, so a configuration that fails here is
+    /// one no engine can be built from. It is public because the policy in a
+    /// `CoreConfig` is properly the *embedding's* to choose — the core has no
+    /// business knowing whether it is running on a microcontroller or a
+    /// host — and an embedding that injects its own profile needs some way to
+    /// assert that profile is constructible without restating these bounds
+    /// and letting the two copies drift.
+    ///
+    /// Not checked here: [`CoreConfig::lazy_peer_reserve`] against the peer
+    /// table, which is a const generic on the engine rather than a property
+    /// of the storage backend, so it is only knowable at `Core::new`.
+    pub fn validate_against_limits(&self) -> Result<(), Error> {
+        if self.rate_limit_entries > MAX_RATE_LIMIT_ENTRIES
+            || self.firewall_flow_entries > MAX_FIREWALL_FLOWS
+            || self.firewall_flow_entries == 0
+            || self.firewall_flows_per_peer == 0
+            || self.firewall_flows_per_peer > self.firewall_flow_entries
+            || self.max_inflight_resolves > MAX_INFLIGHT_RESOLVES
+            || self.peer_eviction_ghost_entries > MAX_PEER_EVICTION_GHOSTS
+        {
+            return Err(Error::InvalidCapacity);
+        }
+        if self.resolve_timeout.as_millis() == 0
+            || self.resolve_outbound_timeout.as_millis() == 0
+            || self.peer_eviction_interval.as_millis() == 0
+            || self.peer_eviction_burst == 0
+        {
+            return Err(Error::InvalidCoreConfig);
+        }
+        Ok(())
     }
 }
 
@@ -161,7 +195,7 @@ pub struct Config<'a> {
     /// non-`Copy` and is wiped when its owner is dropped.
     pub private_key: Zeroizing<[u8; 32]>,
     /// Configured bootstrap peers, borrowed only for construction.
-    pub pinned: &'a [PinnedPeer<'a>],
+    pub pinned: &'a [PinnedPeer],
     /// Runtime operational settings.
     pub core_config: CoreConfig,
 }
@@ -172,7 +206,7 @@ impl<'a> Config<'a> {
     /// that consumes it, is dropped. Runtime tunables use
     /// [`CoreConfig::default`], including backend-appropriate host or embedded
     /// state-table capacities.
-    pub fn new(private_key: [u8; 32], pinned: &'a [PinnedPeer<'a>]) -> Self {
+    pub fn new(private_key: [u8; 32], pinned: &'a [PinnedPeer]) -> Self {
         Self {
             private_key: Zeroizing::new(private_key),
             pinned,
@@ -206,54 +240,80 @@ mod tests {
         assert_eq!(
             CoreConfig::default(),
             CoreConfig {
-                resolve_timeout: RESOLVE_TIMEOUT,
-                resolve_outbound_timeout: RESOLVE_OUTBOUND_TIMEOUT,
-                negative_ttl: NEGATIVE_TTL,
-                dynamic_peer_min_idle: DYNAMIC_PEER_MIN_IDLE,
-                peer_eviction_interval: PEER_EVICTION_INTERVAL,
-                peer_eviction_burst: PEER_EVICTION_BURST,
-                peer_eviction_ghost_ttl: PEER_EVICTION_GHOST_TTL,
+                resolve_timeout: DEFAULT_RESOLVE_TIMEOUT,
+                resolve_outbound_timeout: DEFAULT_RESOLVE_OUTBOUND_TIMEOUT,
+                negative_ttl: DEFAULT_NEGATIVE_TTL,
+                dynamic_peer_min_idle: DEFAULT_DYNAMIC_PEER_MIN_IDLE,
+                peer_eviction_interval: DEFAULT_PEER_EVICTION_INTERVAL,
+                peer_eviction_burst: DEFAULT_PEER_EVICTION_BURST,
+                peer_eviction_ghost_ttl: DEFAULT_PEER_EVICTION_GHOST_TTL,
                 peer_eviction_ghost_entries: DEFAULT_PEER_EVICTION_GHOSTS,
-                relay_resolve_min_interval: RELAY_RESOLVE_MIN_INTERVAL,
-                lazy_peer_reserve: LAZY_PEER_RESERVE,
-                endpoint_confirmation_ttl: ENDPOINT_CONFIRMATION_TTL,
-                firewall_udp_timeout: FIREWALL_UDP_TIMEOUT,
-                firewall_icmp_timeout: FIREWALL_ICMP_TIMEOUT,
-                firewall_tcp_timeout: FIREWALL_TCP_TIMEOUT,
-                firewall_tcp_closing_timeout: FIREWALL_TCP_CLOSING_TIMEOUT,
+                relay_resolve_min_interval: DEFAULT_RELAY_RESOLVE_MIN_INTERVAL,
+                lazy_peer_reserve: DEFAULT_LAZY_PEER_RESERVE,
+                firewall_udp_timeout: DEFAULT_FIREWALL_UDP_TIMEOUT,
+                firewall_icmp_timeout: DEFAULT_FIREWALL_ICMP_TIMEOUT,
+                firewall_tcp_timeout: DEFAULT_FIREWALL_TCP_TIMEOUT,
+                firewall_tcp_closing_timeout: DEFAULT_FIREWALL_TCP_CLOSING_TIMEOUT,
                 firewall_flow_entries: DEFAULT_FIREWALL_FLOWS,
                 firewall_flows_per_peer: DEFAULT_FIREWALL_FLOWS_PER_PEER,
-                under_load_handshakes_per_sec: UNDER_LOAD_HANDSHAKES_PER_SEC,
-                under_load_free_slots: UNDER_LOAD_FREE_SLOTS,
-                rate_limit_per_sec: RATE_LIMIT_PER_SEC,
-                rate_limit_burst: RATE_LIMIT_BURST,
+                under_load_handshakes_per_sec: DEFAULT_UNDER_LOAD_HANDSHAKES_PER_SEC,
+                under_load_free_slots: DEFAULT_UNDER_LOAD_FREE_SLOTS,
+                rate_limit_per_sec: DEFAULT_RATE_LIMIT_PER_SEC,
+                rate_limit_burst: DEFAULT_RATE_LIMIT_BURST,
                 rate_limit_entries: DEFAULT_RATE_LIMIT_ENTRIES,
-                remote_resolve_per_sec: REMOTE_RESOLVE_PER_SEC,
-                remote_resolve_burst: REMOTE_RESOLVE_BURST,
-                unknown_auth_per_sec: UNKNOWN_AUTH_PER_SEC,
-                unknown_auth_burst: UNKNOWN_AUTH_BURST,
-                max_inflight_resolves: MAX_INFLIGHT_RESOLVES,
+                remote_resolve_per_sec: DEFAULT_REMOTE_RESOLVE_PER_SEC,
+                remote_resolve_burst: DEFAULT_REMOTE_RESOLVE_BURST,
+                unknown_auth_per_sec: DEFAULT_UNKNOWN_AUTH_PER_SEC,
+                unknown_auth_burst: DEFAULT_UNKNOWN_AUTH_BURST,
+                max_inflight_resolves: DEFAULT_INFLIGHT_RESOLVES,
             }
         );
     }
 
+    /// Every storage-backed runtime limit must sit at or under the ceiling
+    /// [`crate::Core::new`] enforces, in whichever backend is being built.
+    /// A default that exceeds its ceiling is not a tuning mistake, it is a
+    /// configuration that cannot be constructed at all.
+    ///
+    /// Embeddings that inject their own profile are responsible for making
+    /// the same assertion against it; [`CoreConfig::validate_against_limits`]
+    /// is provided so they do not have to restate these bounds.
     #[test]
-    #[cfg(feature = "alloc")]
-    fn alloc_defaults_are_host_sized() {
-        let config = CoreConfig::default();
-        assert_eq!(config.rate_limit_entries, 1_024);
-        assert_eq!(config.firewall_flow_entries, 4_096);
-        assert_eq!(config.firewall_flows_per_peer, 128);
-        assert!(config.rate_limit_entries <= MAX_RATE_LIMIT_ENTRIES);
-        assert!(config.firewall_flow_entries <= crate::firewall::MAX_FIREWALL_FLOWS);
+    fn defaults_fit_their_compile_time_ceilings() {
+        CoreConfig::default()
+            .validate_against_limits()
+            .expect("the shipped defaults must be constructible");
     }
 
+    /// Only *storage* sizing follows the backend. Policy defaults must not:
+    /// the useful value for a churn brake, a cookie threshold or a resolver
+    /// working set is a function of the peer table, which is a const generic
+    /// on the engine and invisible from here. Embeddings inject those.
     #[test]
-    #[cfg(not(feature = "alloc"))]
-    fn allocation_free_defaults_remain_embedded_sized() {
+    fn only_storage_sizing_varies_with_the_backend() {
         let config = CoreConfig::default();
-        assert_eq!(config.rate_limit_entries, 64);
-        assert_eq!(config.firewall_flow_entries, 16);
-        assert_eq!(config.firewall_flows_per_peer, 8);
+
+        #[cfg(feature = "alloc")]
+        {
+            assert_eq!(config.rate_limit_entries, 1_024);
+            assert_eq!(config.firewall_flow_entries, 4_096);
+            assert_eq!(config.firewall_flows_per_peer, 128);
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            assert_eq!(config.rate_limit_entries, 64);
+            assert_eq!(config.firewall_flow_entries, 64);
+            assert_eq!(config.firewall_flows_per_peer, 8);
+        }
+
+        // Identical in every feature configuration.
+        assert_eq!(config.under_load_handshakes_per_sec, 8);
+        assert_eq!(config.peer_eviction_interval, Duration::from_secs(10));
+        assert_eq!(config.peer_eviction_ghost_entries, 8);
+        assert_eq!(config.max_inflight_resolves, 12);
+        assert_eq!(config.lazy_peer_reserve, DEFAULT_LAZY_PEER_RESERVE);
+
+        assert!(config.rate_limit_entries <= MAX_RATE_LIMIT_ENTRIES);
+        assert!(config.firewall_flow_entries <= crate::firewall::MAX_FIREWALL_FLOWS);
     }
 }

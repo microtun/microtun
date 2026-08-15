@@ -14,6 +14,7 @@ microtun-core = { workspace = true, features = ["alloc"] }
 # incident.
 microtun-api = { workspace = true }
 microtun-jsonrpc = { workspace = true, features = ["tokio"] }
+microtun-ini = { workspace = true, features = ["std"] }
 embedded-io = { workspace = true, features = ["std"] }
 embedded-io-async = { workspace = true }
 

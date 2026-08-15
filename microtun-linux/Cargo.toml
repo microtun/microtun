@@ -8,8 +8,7 @@ license.workspace = true
 
 [dependencies]
 microtun-std = { workspace = true }
-# `bind_device` (SO_BINDTODEVICE) is behind socket2's `all` feature. It is what
-# pins Peers API server lookups to the tunnel interface; see `TunTransport`.
+microtun-device-config = { workspace = true }
 socket2 = { version = "0.5", features = ["all"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }

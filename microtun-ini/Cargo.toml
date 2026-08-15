@@ -1,0 +1,24 @@
+[package]
+name = "microtun-ini"
+description = "A tiny, allocation-free Serde deserializer for WireGuard-style INI files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["alloc"]
+alloc = ["serde/alloc"]
+std = ["alloc", "serde/std"]
+heapless = ["dep:heapless"]
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { version = "1.0.203", default-features = false }
+heapless = { version = "0.8", default-features = false, features = ["serde"], optional = true }
+
+[dev-dependencies]
+serde = { version = "1.0.203", default-features = false, features = ["derive"] }
+
+[package.metadata.docs.rs]
+all-features = true

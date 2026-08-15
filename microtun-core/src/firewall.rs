@@ -29,7 +29,8 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[cfg(test)]
 use crate::constants::{
-    FIREWALL_ICMP_TIMEOUT, FIREWALL_TCP_CLOSING_TIMEOUT, FIREWALL_TCP_TIMEOUT, FIREWALL_UDP_TIMEOUT,
+    DEFAULT_FIREWALL_ICMP_TIMEOUT, DEFAULT_FIREWALL_TCP_CLOSING_TIMEOUT,
+    DEFAULT_FIREWALL_TCP_TIMEOUT, DEFAULT_FIREWALL_UDP_TIMEOUT,
 };
 use crate::{
     ip,
@@ -39,12 +40,15 @@ use crate::{
 
 /// Compile-time ceiling for TCP/UDP flows remembered by the ingress firewall.
 ///
-/// Allocation-free builds retain the embedded 16-entry table. Host builds
-/// keep entries on the heap and permit a substantially larger bounded table.
+/// Allocation-free builds keep an inline table; host builds keep entries on
+/// the heap and permit a substantially larger bounded one. An [`Entry`] is
+/// roughly 64 bytes, so the embedded table below costs about 4 KiB — an
+/// affordable trade on any target that can run this stack at all, and the
+/// price of making [`DEFAULT_FIREWALL_FLOWS_PER_PEER`] mean something.
 #[cfg(feature = "alloc")]
 pub const MAX_FIREWALL_FLOWS: usize = 16_384;
 #[cfg(not(feature = "alloc"))]
-pub const MAX_FIREWALL_FLOWS: usize = 16;
+pub const MAX_FIREWALL_FLOWS: usize = 64;
 
 /// Backend-appropriate active firewall table default.
 #[cfg(feature = "alloc")]
@@ -55,6 +59,12 @@ pub const DEFAULT_FIREWALL_FLOWS: usize = MAX_FIREWALL_FLOWS;
 /// Backend-appropriate maximum number of live tracked flows owned by one peer.
 /// This quota prevents one authenticated peer from evicting every other
 /// protected peer's return-flow state.
+///
+/// The quota only isolates peers if it is a small fraction of the table: the
+/// host ratio is 1/32, and the embedded ratio is 1/8 against the widened
+/// table above. At the previous embedded sizing (8 of 16) two peers could
+/// consume the whole table between them, which is the exact outcome the
+/// quota exists to prevent.
 #[cfg(feature = "alloc")]
 pub const DEFAULT_FIREWALL_FLOWS_PER_PEER: usize = 128;
 #[cfg(not(feature = "alloc"))]
@@ -230,10 +240,10 @@ impl<const MAX_FLOWS: usize, const MAX_PEERS: usize> Firewall<MAX_FLOWS, MAX_PEE
         Self::with_limits_and_timeouts(
             MAX_FLOWS,
             MAX_FLOWS,
-            FIREWALL_UDP_TIMEOUT,
-            FIREWALL_ICMP_TIMEOUT,
-            FIREWALL_TCP_TIMEOUT,
-            FIREWALL_TCP_CLOSING_TIMEOUT,
+            DEFAULT_FIREWALL_UDP_TIMEOUT,
+            DEFAULT_FIREWALL_ICMP_TIMEOUT,
+            DEFAULT_FIREWALL_TCP_TIMEOUT,
+            DEFAULT_FIREWALL_TCP_CLOSING_TIMEOUT,
         )
     }
 
@@ -1252,10 +1262,10 @@ mod tests {
         let mut firewall = Firewall::<6, 4>::with_limits_and_timeouts(
             6,
             2,
-            FIREWALL_UDP_TIMEOUT,
-            FIREWALL_ICMP_TIMEOUT,
-            FIREWALL_TCP_TIMEOUT,
-            FIREWALL_TCP_CLOSING_TIMEOUT,
+            DEFAULT_FIREWALL_UDP_TIMEOUT,
+            DEFAULT_FIREWALL_ICMP_TIMEOUT,
+            DEFAULT_FIREWALL_TCP_TIMEOUT,
+            DEFAULT_FIREWALL_TCP_CLOSING_TIMEOUT,
         );
 
         firewall.observe_outbound(peer_a, &flow(1000), T0);
@@ -1285,10 +1295,10 @@ mod tests {
         let mut firewall = Firewall::<4, 4>::with_limits_and_timeouts(
             4,
             4,
-            FIREWALL_UDP_TIMEOUT,
-            FIREWALL_ICMP_TIMEOUT,
-            FIREWALL_TCP_TIMEOUT,
-            FIREWALL_TCP_CLOSING_TIMEOUT,
+            DEFAULT_FIREWALL_UDP_TIMEOUT,
+            DEFAULT_FIREWALL_ICMP_TIMEOUT,
+            DEFAULT_FIREWALL_TCP_TIMEOUT,
+            DEFAULT_FIREWALL_TCP_CLOSING_TIMEOUT,
         );
 
         firewall.observe_outbound(peer_a, &flow(1000), T0);

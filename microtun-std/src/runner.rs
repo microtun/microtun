@@ -6,19 +6,21 @@
 //! Linux TUN, userspace IP stacks, and test harnesses can all adapt to that
 //! contract.
 
-use std::{
-    collections::VecDeque, error::Error as StdError, fmt, future::Future, io, net::SocketAddr,
-    time::Duration,
-};
+use std::{collections::VecDeque, fmt, future::Future, io, net::SocketAddr, time::Duration};
 
 use microtun_core::{
-    Config, Core, Event, Instant, MAX_PEER_ADDRESSES, ResolveRequest, ResolverCommand,
-    ResolverEvent, Sink, StaticRelayPolicy, ip::unmap_socket_addr,
+    Config, Core, CoreConfig, Event, Instant, ResolveRequest, ResolverCommand, ResolverEvent, Sink,
+    StaticRelayPolicy, ip::unmap_socket_addr,
 };
 use rand_core::{CryptoRng, RngCore};
 use tokio::{sync::mpsc, time::Instant as TokioInstant};
 
-use crate::resolver::{PeersApiResolver, PeersApiTransport, resolver_task};
+use crate::{
+    INFLIGHT_RESOLVES, LAZY_PEER_RESERVE, MAX_PEERS, MAX_ROUTES, MAX_SESSIONS,
+    PEER_EVICTION_GHOSTS, PEER_EVICTION_INTERVAL, REPLAY_WORDS, RESOLVER_QUEUE_DEPTH,
+    UNDER_LOAD_HANDSHAKES_PER_SEC,
+    resolver::{PeersApiResolver, PeersApiTransport, resolver_task},
+};
 
 /// Maximum encrypted outer UDP payload.
 pub const OUTER_SIZE: usize = microtun_core::MAX_UDP_SIZE;
@@ -42,34 +44,17 @@ const OUTER_RECV_SIZE: usize = OUTER_SIZE + 1;
 /// Maximum buffer passed to a host tunnel device for one IP packet.
 pub const MAX_IP_PACKET_SIZE: usize = u16::MAX as usize + 1;
 
-// Host peer/session/replay/route capacities.
-//
-// This crate enables `microtun-core/alloc`, so these are upper bounds on
-// heap-backed pools rather than the lengths of inline arrays: a `TunnelCore`
-// is small enough to move around freely and does not have to be boxed or
-// placed in a `static`. They are still real limits — a full peer table evicts
-// the least-recently-active dynamic peer, and a full route cache is an error —
-// so they are sized for a host rather than made unbounded.
-//
-// The index-addressed pools are allocated at their full length when the core
-// is built, so raising these trades a one-off heap allocation (roughly
-// `MAX_PEERS` × 200 B plus `MAX_SESSIONS` × roughly 1.2 KiB with
-// `REPLAY_WORDS = 128`)
-// for headroom, and costs nothing on the stack.
-
-/// Maximum number of peers, including pinned and dynamically resolved peers.
-pub const MAX_PEERS: usize = 128;
-/// Maximum number of session slots, shared by handshakes and live sessions.
-pub const MAX_SESSIONS: usize = 256;
-/// Replay bitmap words per established session. 128 matches the reference
-/// implementations' 8,128-counter trailing window.
-pub const REPLAY_WORDS: usize = 128;
-/// Default route-cache sizing for the host runner. Resolver answers may carry
-/// more than four unique prefixes, but the core still admits at most this many
-/// routes overall.
-pub const MAX_ROUTES: usize = MAX_PEERS * MAX_PEER_ADDRESSES;
-/// Bounded request and response queue depth used by [`TunnelRunner::run`].
-pub const RESOLVER_QUEUE_DEPTH: usize = 8;
+/// Runtime policy for a host-sized deployment.
+pub fn host_core_config() -> CoreConfig {
+    CoreConfig {
+        lazy_peer_reserve: LAZY_PEER_RESERVE,
+        max_inflight_resolves: INFLIGHT_RESOLVES,
+        under_load_handshakes_per_sec: UNDER_LOAD_HANDSHAKES_PER_SEC,
+        peer_eviction_interval: PEER_EVICTION_INTERVAL,
+        peer_eviction_ghost_entries: PEER_EVICTION_GHOSTS,
+        ..CoreConfig::default()
+    }
+}
 
 /// The concrete core type driven by the standard-runtime runner.
 pub type TunnelCore<RNG> =
@@ -105,45 +90,16 @@ pub trait TunnelObserver: Send + Sync {
 impl TunnelObserver for () {}
 
 /// Errors produced while constructing or running a host tunnel.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Core(microtun_core::Error),
-    Io(io::Error),
+    #[error("core error: {0:?}")]
+    Core(#[from] microtun_core::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("resolver task exited unexpectedly")]
     ResolverExited,
-    ResolverTask(tokio::task::JoinError),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Core(error) => write!(formatter, "core error: {error:?}"),
-            Self::Io(error) => write!(formatter, "I/O error: {error}"),
-            Self::ResolverExited => formatter.write_str("resolver task exited unexpectedly"),
-            Self::ResolverTask(error) => write!(formatter, "resolver task failed: {error}"),
-        }
-    }
-}
-
-impl StdError for Error {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::ResolverTask(error) => Some(error),
-            Self::Core(_) | Self::ResolverExited => None,
-        }
-    }
-}
-
-impl From<microtun_core::Error> for Error {
-    fn from(error: microtun_core::Error) -> Self {
-        Self::Core(error)
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
+    #[error("resolver task failed: {0}")]
+    ResolverTask(#[source] tokio::task::JoinError),
 }
 
 struct TunnelSink<'a, D> {
@@ -281,14 +237,24 @@ where
 {
     /// Construct a runner around an already-bound outer UDP socket.
     pub fn new(
-        config: Config<'_>,
+        mut config: Config<'_>,
         rng: RNG,
         device: D,
         outer: tokio::net::UdpSocket,
+        enable_forwarding: bool,
     ) -> Result<Self, Error> {
+        if config.core_config == CoreConfig::default() {
+            config.core_config = host_core_config();
+        }
+
         let clock_base = TokioInstant::now();
         log::info!("constructing tunnel runner");
-        let engine = Core::new(config, rng, StaticRelayPolicy::DenyAll, now(clock_base))?;
+        let engine = Core::new(
+            config,
+            rng,
+            StaticRelayPolicy::forwarding(enable_forwarding),
+            now(clock_base),
+        )?;
         Ok(Self {
             engine,
             device,
@@ -304,17 +270,12 @@ where
         rng: RNG,
         device: D,
         listen: SocketAddr,
+        enable_forwarding: bool,
     ) -> Result<Self, Error> {
         let listen = unmap_socket_addr(listen);
         log::debug!("binding outer UDP socket on {listen}");
         let outer = tokio::net::UdpSocket::bind(listen).await?;
-        Self::new(config, rng, device, outer)
-    }
-
-    /// Opt in to forwarding type-5 relay packets between authenticated peers.
-    pub fn enable_forwarding(&mut self, enabled: bool) {
-        *self.engine.relay_policy_mut() = StaticRelayPolicy::forwarding(enabled);
-        log::info!("relay forwarding configured: {enabled}");
+        Self::new(config, rng, device, outer, enable_forwarding)
     }
 
     pub fn public_key(&self) -> [u8; 32] {

@@ -5,7 +5,7 @@ use core::net::SocketAddr;
 use zeroize::Zeroize;
 
 use crate::{
-    PeerAddresses,
+    IpCidr,
     crypto::TIMESTAMP_LEN,
     error::Error,
     firewall::InboundPolicy,
@@ -139,8 +139,8 @@ pub(crate) struct PeerEntry {
     pub(crate) inbound_policy: InboundPolicy,
     /// Configured WireGuard-style idle keepalive interval.
     pub(crate) persistent_keepalive: Option<Duration>,
-    /// Last authoritative tunnel address set, used to make refreshes no-ops.
-    pub(crate) addresses: PeerAddresses,
+    /// Last authoritative tunnel address, used to make refreshes no-ops.
+    pub(crate) address: IpCidr,
     pub(crate) greatest_ts: [u8; TIMESTAMP_LEN],
     /// Monotonic time at which the last authenticated initiation was accepted.
     /// Kept independently of cookie/rate limiting, as in wireguard-go.
@@ -175,7 +175,7 @@ impl PeerEntry {
         relay: Option<[u8; 32]>,
         inbound_policy: InboundPolicy,
         persistent_keepalive: Option<Duration>,
-        addresses: PeerAddresses,
+        address: IpCidr,
         now: Instant,
     ) -> Self {
         let persistent_keepalive =
@@ -192,7 +192,7 @@ impl PeerEntry {
             relay,
             inbound_policy,
             persistent_keepalive,
-            addresses,
+            address,
             greatest_ts: [0; TIMESTAMP_LEN],
             last_initiation_consumption: None,
             cookie: None,
@@ -237,7 +237,7 @@ impl core::fmt::Debug for PeerEntry {
             .field("endpoint", &self.endpoint)
             .field("relay", &self.relay)
             .field("persistent_keepalive", &self.persistent_keepalive)
-            .field("addresses", &self.addresses)
+            .field("address", &self.address)
             .field("sessions", &self.sessions)
             .finish_non_exhaustive()
     }
@@ -252,7 +252,7 @@ impl Drop for PeerEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PeerAddresses, time::Duration};
+    use crate::time::Duration;
 
     /// A fixed instant well away from zero, so a saturated-to-zero deadline
     /// can never be mistaken for a correct one.
@@ -418,7 +418,7 @@ mod tests {
             Some([1u8; 32]),
             InboundPolicy::AllowAll,
             None,
-            PeerAddresses::new(),
+            "10.0.0.1/32".parse().expect("test CIDR"),
             T0,
         );
 

@@ -24,7 +24,7 @@
 //!
 //! Ordinary lookups are side-effect free. A retaining client uses
 //! `v1.peer.watch`, which atomically establishes per-connection interest in a
-//! visible key and returns its current record. The server dispatches
+//! configured key and returns its current record. The server dispatches
 //! `v1.peer.changed` / `v1.peer.removed` only to connections watching that key.
 //! Either invalidation is confirmed with an ordinary `v1.peer.by_key` refresh.
 //! `v1.peer.unwatch` drops interest when the client evicts the peer.
@@ -101,15 +101,13 @@ use core::{
     net::{IpAddr, SocketAddr},
 };
 
-use heapless::{String, Vec};
+use heapless::String;
 #[cfg(any(feature = "embedded-client", feature = "tokio-client"))]
 pub use jitter::{Jitter, REFRESH_BURST_WINDOW_MS};
 use microtun_core::{
-    Duration, IpCidr, MAX_PEER_ADDRESSES, PeerAddresses, ResolveOutcome, ResolveQuery,
-    ResolvedPeer,
+    Duration, IpCidr, ResolveOutcome, ResolveQuery, ResolvedPeer,
     ip::{parse_ip_cidr, unmap_socket_addr},
     key::{KEY_TEXT_LEN, decode_key, encode_key},
-    push_peer_address,
 };
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
@@ -122,7 +120,7 @@ pub const METHOD_BY_KEY: &str = "v1.peer.by_key";
 /// Resolve the peer that owns a tunnel address (longest prefix wins).
 pub const METHOD_BY_ADDRESS: &str = "v1.peer.by_address";
 /// Atomically subscribe this connection to one public key and return its
-/// current visible state.
+/// current registry state.
 pub const METHOD_WATCH: &str = "v1.peer.watch";
 /// Best-effort notification removing one public key from this connection's
 /// watch set.
@@ -176,7 +174,7 @@ pub const MAX_CIDR_TEXT_LEN: usize = MAX_ADDRESS_TEXT_LEN + 4;
 /// Frame buffer size for the direction that carries a peer record.
 ///
 /// A worst-case record — a 44-character key, a bracketed IPv6 endpoint, a
-/// relay key, and [`MAX_PEER_ADDRESSES`] IPv6 CIDRs — plus the surrounding
+/// relay key, and one IPv6 CIDR — plus the surrounding
 /// lookup response fits below this bound. This is the client's
 /// `RX_BUFFER_SIZE` and the server's `TX_BUFFER_SIZE`, and with the `alloc`
 /// feature of
@@ -203,14 +201,17 @@ const _: () = assert!(QUERY_TEXT_LEN >= KEY_TEXT_LEN);
 // ---------------------------------------------------------------------------
 
 /// Errors while building or decoding the Peers API wire protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// A bounded wire field or caller-provided buffer was too small.
+    #[error("buffer too small")]
     BufferTooSmall,
     /// The payload was not valid JSON for the Peers API schema.
+    #[error("invalid Peers API JSON")]
     BadJson,
     /// A wire value had invalid syntax, such as a malformed key, endpoint, or
     /// CIDR.
+    #[error("invalid Peers API wire syntax")]
     InvalidSyntax,
 }
 
@@ -339,6 +340,7 @@ pub fn encode_query<'a>(query: &ResolveQuery, text: &'a mut QueryText) -> Result
 /// an over-long value is a parse failure — a transient outcome — rather than
 /// something the decoder has to reject later.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerInfo {
     /// The peer's public key, as WireGuard's base64: 44 characters.
     pub public_key: String<KEY_TEXT_LEN>,
@@ -348,8 +350,8 @@ pub struct PeerInfo {
     /// Optional relay static public key, in the same base64 form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String<KEY_TEXT_LEN>>,
-    /// Tunnel address prefixes assigned to the peer.
-    pub addresses: Vec<String<MAX_CIDR_TEXT_LEN>, MAX_PEER_ADDRESSES>,
+    /// Tunnel address prefix assigned to the peer.
+    pub address: String<MAX_CIDR_TEXT_LEN>,
     /// WireGuard-style persistent keepalive interval in seconds.
     /// Absent means disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -362,28 +364,21 @@ impl PeerInfo {
         public_key: &[u8; 32],
         endpoint: Option<SocketAddr>,
         relay: Option<&[u8; 32]>,
-        addresses: impl IntoIterator<Item = IpCidr>,
+        address: IpCidr,
         persistent_keepalive: Option<u16>,
     ) -> Result<Self, Error> {
-        let mut encoded_addresses = Vec::new();
-        for address in addresses {
-            let mut text = String::new();
-            // `{:#}` is load-bearing, not cosmetic. `IpCidr`'s plain `Display`
-            // abbreviates a host prefix to a bare address, so `10.0.0.3/32`
-            // would go on the wire as `10.0.0.3` — and §4.4 of the Peers API
-            // spec defines this field as a CIDR string. The alternate form
-            // always writes `address/length`.
-            write!(&mut text, "{address:#}").map_err(|_| Error::BufferTooSmall)?;
-            encoded_addresses
-                .push(text)
-                .map_err(|_| Error::BufferTooSmall)?;
-        }
+        let mut encoded_address = String::new();
+        // `{:#}` is load-bearing, not cosmetic. `IpCidr`'s plain `Display`
+        // abbreviates a host prefix to a bare address, so `10.0.0.3/32`
+        // would go on the wire as `10.0.0.3`. The alternate form always
+        // writes `address/length`.
+        write!(&mut encoded_address, "{address:#}").map_err(|_| Error::BufferTooSmall)?;
 
         Ok(Self {
             public_key: render_key(public_key)?,
             endpoint: endpoint.map(render_endpoint).transpose()?,
             relay: relay.map(render_key).transpose()?,
-            addresses: encoded_addresses,
+            address: encoded_address,
             persistent_keepalive,
         })
     }
@@ -450,7 +445,7 @@ pub fn decode_peer(info: &PeerInfo) -> Result<ResolvedPeer, Error> {
         info.public_key.as_str(),
         info.endpoint.as_ref().map(String::as_str),
         info.relay.as_ref().map(String::as_str),
-        info.addresses.iter().map(String::as_str),
+        info.address.as_str(),
         info.persistent_keepalive,
     )
 }
@@ -480,11 +475,11 @@ fn render_endpoint(endpoint: SocketAddr) -> Result<String<MAX_ENDPOINT_TEXT_LEN>
     Ok(text)
 }
 
-fn decode_fields<'a>(
+fn decode_fields(
     public_key: &str,
     endpoint: Option<&str>,
     relay: Option<&str>,
-    addresses: impl Iterator<Item = &'a str>,
+    address: &str,
     persistent_keepalive: Option<u16>,
 ) -> Result<ResolvedPeer, Error> {
     let public_key = key_from_wire(public_key)?;
@@ -494,24 +489,16 @@ fn decode_fields<'a>(
         .map_err(|_| Error::InvalidSyntax)?;
     let relay = relay.map(key_from_wire).transpose()?;
 
-    // `PeerAddresses` is a `heapless::Vec` or a heap `Vec` depending on
-    // `microtun-core`'s `alloc` feature; `push_peer_address` enforces
-    // `MAX_PEER_ADDRESSES` either way.
-    let mut peer_addresses = PeerAddresses::new();
-    for value in addresses {
-        // `parse_ip_cidr`, not `IpCidr::from_str`: §4.4 asks a receiver to accept
-        // both abbreviations a sender must not produce — a bare address for a
-        // host prefix, and a prefix carrying host bits — and to normalize them
-        // here. `IpCidr::from_str` rejects the second outright.
-        let cidr = parse_ip_cidr(value).map_err(|_| Error::InvalidSyntax)?;
-        push_peer_address(&mut peer_addresses, cidr).map_err(|_| Error::InvalidSyntax)?;
-    }
+    // `parse_ip_cidr`, not `IpCidr::from_str`: the protocol accepts a bare
+    // address for a host prefix and a prefix carrying host bits, and normalizes
+    // either form at this boundary.
+    let address = parse_ip_cidr(address).map_err(|_| Error::InvalidSyntax)?;
 
     Ok(ResolvedPeer {
         public_key,
         endpoint,
         relay,
-        addresses: peer_addresses,
+        address,
         // Ingress filtering is an embedding detail, not part of the Peers API
         // protocol. Dynamic records therefore use the core's default policy.
         inbound_policy: Default::default(),
@@ -641,12 +628,12 @@ mod tests {
     #[test]
     fn decodes_wire_values() {
         let body = format!(
-            r#"{{"public_key":"{KEY_B64}","endpoint":"203.0.113.5:51820","relay":"{RELAY_B64}","addresses":["10.1.2.3/32","10.1.4.0/24"],"persistent_keepalive":25}}"#
+            r#"{{"public_key":"{KEY_B64}","endpoint":"203.0.113.5:51820","relay":"{RELAY_B64}","address":"10.1.2.3/32","persistent_keepalive":25}}"#
         );
         let resolved = decode_record(body.as_bytes()).unwrap();
         assert_eq!(resolved.public_key, [0xAA; 32]);
         assert_eq!(resolved.relay, Some([0xCC; 32]));
-        assert_eq!(resolved.addresses.len(), 2);
+        assert_eq!(resolved.address, "10.1.2.3/32".parse::<IpCidr>().unwrap());
         assert!(resolved.endpoint.is_some());
         assert_eq!(resolved.persistent_keepalive, Some(Duration::from_secs(25)));
         assert_eq!(
@@ -662,7 +649,7 @@ mod tests {
     #[test]
     fn decoded_endpoint_unmaps_ipv4_mapped_ipv6() {
         let body = format!(
-            r#"{{"public_key":"{KEY_B64}","endpoint":"[::ffff:203.0.113.5]:51820","addresses":["10.1.2.3/32"]}}"#
+            r#"{{"public_key":"{KEY_B64}","endpoint":"[::ffff:203.0.113.5]:51820","address":"10.1.2.3/32"}}"#
         );
         let resolved = decode_record(body.as_bytes()).unwrap();
         assert_eq!(
@@ -673,7 +660,7 @@ mod tests {
 
     #[test]
     fn defaults_optional_fields() {
-        let body = format!(r#"{{"public_key":"{KEY_B64}","addresses":["10.1.2.3/32"]}}"#);
+        let body = format!(r#"{{"public_key":"{KEY_B64}","address":"10.1.2.3/32"}}"#);
         let resolved = decode_peer(&peer_info(&body)).unwrap();
         assert!(resolved.endpoint.is_none());
         assert!(resolved.relay.is_none());
@@ -684,7 +671,7 @@ mod tests {
         );
 
         let zero = format!(
-            r#"{{"public_key":"{KEY_B64}","addresses":["10.1.2.3/32"],"persistent_keepalive":0}}"#
+            r#"{{"public_key":"{KEY_B64}","address":"10.1.2.3/32","persistent_keepalive":0}}"#
         );
         assert!(
             decode_record(zero.as_bytes())
@@ -696,7 +683,7 @@ mod tests {
 
     #[test]
     fn malformed_wire_values_are_rejected() {
-        let invalid_key = br#"{"public_key":"not-a-key","addresses":["10.1.2.3/32"]}"#;
+        let invalid_key = br#"{"public_key":"not-a-key","address":"10.1.2.3/32"}"#;
         assert_eq!(
             decode_record(invalid_key).unwrap_err(),
             Error::InvalidSyntax
@@ -705,7 +692,7 @@ mod tests {
         // The URL-safe, unpadded spelling was only ever needed for a path
         // segment. There are no paths now, and it is not a key.
         let url_form = format!(
-            r#"{{"public_key":"{}","addresses":["10.1.2.3/32"]}}"#,
+            r#"{{"public_key":"{}","address":"10.1.2.3/32"}}"#,
             &KEY_B64[..43]
         );
         assert_eq!(
@@ -714,27 +701,18 @@ mod tests {
         );
 
         let bad_endpoint = format!(
-            r#"{{"public_key":"{KEY_B64}","endpoint":"not-an-endpoint","addresses":["10.1.2.3/32"]}}"#
+            r#"{{"public_key":"{KEY_B64}","endpoint":"not-an-endpoint","address":"10.1.2.3/32"}}"#
         );
         assert_eq!(
             decode_record(bad_endpoint.as_bytes()).unwrap_err(),
             Error::InvalidSyntax
         );
 
-        let bad_cidr = format!(r#"{{"public_key":"{KEY_B64}","addresses":["not-a-cidr"]}}"#);
+        let bad_cidr = format!(r#"{{"public_key":"{KEY_B64}","address":"not-a-cidr"}}"#);
         assert_eq!(
             decode_record(bad_cidr.as_bytes()).unwrap_err(),
             Error::InvalidSyntax
         );
-    }
-
-    #[test]
-    fn too_many_addresses_are_rejected_by_parser() {
-        let body = format!(
-            r#"{{"public_key":"{KEY_B64}","addresses":["10.1.2.0/32","10.1.2.1/32","10.1.2.2/32","10.1.2.3/32","10.1.2.4/32"]}}"#
-        );
-        assert!(parse_record(body.as_bytes()).is_err());
-        assert!(serde_json_core::from_slice::<PeerInfo>(body.as_bytes()).is_err());
     }
 
     /// An over-long field is a parse failure, which the caller reports as a
@@ -742,7 +720,7 @@ mod tests {
     #[test]
     fn over_long_fields_do_not_parse() {
         let long_endpoint = format!(
-            r#"{{"public_key":"{KEY_B64}","endpoint":"{}","addresses":["10.1.2.3/32"]}}"#,
+            r#"{{"public_key":"{KEY_B64}","endpoint":"{}","address":"10.1.2.3/32"}}"#,
             "9".repeat(MAX_ENDPOINT_TEXT_LEN + 1)
         );
         assert!(serde_json_core::from_slice::<PeerInfo>(long_endpoint.as_bytes()).is_err());
@@ -756,7 +734,7 @@ mod tests {
 
     #[test]
     fn results_are_classified() {
-        let body = format!(r#"{{"public_key":"{KEY_B64}","addresses":["10.1.2.3/32"]}}"#);
+        let body = format!(r#"{{"public_key":"{KEY_B64}","address":"10.1.2.3/32"}}"#);
         assert!(matches!(
             classify_result(&LookupResult::Found(peer_info(&body))),
             ResolveOutcome::Found(_)
@@ -768,7 +746,7 @@ mod tests {
 
         // Valid JSON, valid field lengths, invalid syntax: transient, so an
         // installed record survives it.
-        let bad = format!(r#"{{"public_key":"{KEY_B64}","addresses":["not-a-cidr"]}}"#);
+        let bad = format!(r#"{{"public_key":"{KEY_B64}","address":"not-a-cidr"}}"#);
         assert!(matches!(
             classify_result(&LookupResult::Found(peer_info(&bad))),
             ResolveOutcome::Failed
@@ -779,14 +757,14 @@ mod tests {
     /// protocol.
     #[test]
     fn lookup_results_round_trip() {
-        let body = format!(r#"{{"public_key":"{KEY_B64}","addresses":["10.1.2.3/32"]}}"#);
+        let body = format!(r#"{{"public_key":"{KEY_B64}","address":"10.1.2.3/32"}}"#);
         let found = LookupResult::Found(peer_info(&body));
         let mut buffer = [0u8; RECORD_FRAME_LEN];
         let len = serde_json_core::to_slice(&found, &mut buffer).expect("found serializes");
         let text = core::str::from_utf8(&buffer[..len]).expect("utf-8");
         assert_eq!(
             text,
-            format!(r#"{{"found":{{"public_key":"{KEY_B64}","addresses":["10.1.2.3/32"]}}}}"#)
+            format!(r#"{{"found":{{"public_key":"{KEY_B64}","address":"10.1.2.3/32"}}}}"#)
         );
         assert_eq!(lookup_result(text), found);
 
@@ -810,7 +788,7 @@ mod tests {
             r#"{"not_found":null}"#,
             r#"{"not_found":{"extra":1}}"#,
             r#"{"not_found":{},"extra":1}"#,
-            r#"{"found":{"public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","addresses":[]},"not_found":{}}"#,
+            r#"{"found":{"public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","address":"10.1.2.3/32"},"not_found":{}}"#,
         ] {
             assert!(
                 serde_json_core::from_slice::<LookupResult>(body.as_bytes()).is_err(),
@@ -849,14 +827,14 @@ mod tests {
             &[0xAA; 32],
             Some("203.0.113.5:51820".parse().unwrap()),
             Some(&[0xCC; 32]),
-            ["10.1.2.3/32".parse().unwrap()],
+            "10.1.2.3/32".parse().unwrap(),
             Some(25),
         )
         .unwrap();
         assert_eq!(record.public_key.as_str(), KEY_B64);
         assert_eq!(record.endpoint.as_deref(), Some("203.0.113.5:51820"));
         assert_eq!(record.relay.as_deref(), Some(RELAY_B64));
-        assert_eq!(record.addresses[0].as_str(), "10.1.2.3/32");
+        assert_eq!(record.address.as_str(), "10.1.2.3/32");
         assert_eq!(record.persistent_keepalive, Some(25));
     }
 
@@ -866,44 +844,44 @@ mod tests {
     /// wire format.
     #[test]
     fn host_prefixes_keep_their_length_on_the_wire() {
-        let record = PeerInfo::from_fields(
+        let v4 = PeerInfo::from_fields(
             &[0xAA; 32],
             None,
             None,
-            [
-                "10.1.2.3/32".parse().unwrap(),
-                "2001:db8::1/128".parse().unwrap(),
-            ],
+            "10.1.2.3/32".parse().unwrap(),
             None,
         )
         .unwrap();
-        assert_eq!(record.addresses[0].as_str(), "10.1.2.3/32");
-        assert_eq!(record.addresses[1].as_str(), "2001:db8::1/128");
+        assert_eq!(v4.address.as_str(), "10.1.2.3/32");
+
+        let v6 = PeerInfo::from_fields(
+            &[0xAA; 32],
+            None,
+            None,
+            "2001:db8::1/128".parse().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(v6.address.as_str(), "2001:db8::1/128");
     }
 
     /// §4.4: a receiver accepts the two forms a conforming sender never emits,
     /// and normalizes them rather than rejecting the record.
     #[test]
     fn abbreviated_and_sloppy_prefixes_are_normalized_not_rejected() {
-        let body = format!(
-            r#"{{"public_key":"{KEY_B64}","addresses":["10.1.2.3/24","10.0.0.9","fd00::9"]}}"#
-        );
-        let resolved = decode_record(body.as_bytes()).expect("both abbreviations are tolerated");
-        assert_eq!(resolved.addresses.len(), 3);
+        let body = format!(r#"{{"public_key":"{KEY_B64}","address":"10.1.2.3/24"}}"#);
+        let resolved = decode_record(body.as_bytes()).expect("host bits are tolerated");
         // Host bits cleared.
-        assert_eq!(
-            resolved.addresses[0],
-            "10.1.2.0/24".parse::<IpCidr>().unwrap()
-        );
+        assert_eq!(resolved.address, "10.1.2.0/24".parse::<IpCidr>().unwrap());
+
+        let body = format!(r#"{{"public_key":"{KEY_B64}","address":"10.0.0.9"}}"#);
+        let resolved = decode_record(body.as_bytes()).expect("bare IPv4 is tolerated");
         // Missing length read as a host prefix, per family.
-        assert_eq!(
-            resolved.addresses[1],
-            "10.0.0.9/32".parse::<IpCidr>().unwrap()
-        );
-        assert_eq!(
-            resolved.addresses[2],
-            "fd00::9/128".parse::<IpCidr>().unwrap()
-        );
+        assert_eq!(resolved.address, "10.0.0.9/32".parse::<IpCidr>().unwrap());
+
+        let body = format!(r#"{{"public_key":"{KEY_B64}","address":"fd00::9"}}"#);
+        let resolved = decode_record(body.as_bytes()).expect("bare IPv6 is tolerated");
+        assert_eq!(resolved.address, "fd00::9/128".parse::<IpCidr>().unwrap());
     }
 
     /// The buffer budget has to hold a worst-case record *inside the tagged
@@ -912,7 +890,7 @@ mod tests {
     fn worst_case_record_fits_the_frame_budget() {
         let v6 = "2001:0db8:0000:0000:0000:ffff:255.255.255.255";
         let record = format!(
-            r#"{{"public_key":"{KEY_B64}","endpoint":"[{v6}]:65535","relay":"{RELAY_B64}","addresses":["{v6}/128","{v6}/128","{v6}/128","{v6}/128"],"persistent_keepalive":65535}}"#
+            r#"{{"public_key":"{KEY_B64}","endpoint":"[{v6}]:65535","relay":"{RELAY_B64}","address":"{v6}/128","persistent_keepalive":65535}}"#
         );
         let body =
             format!(r#"{{"jsonrpc":"2.0","id":9007199254740991,"result":{{"found":{record}}}}}"#);

@@ -20,7 +20,7 @@ v1.peer.removed     {"public_key": "<44-character base64>"}  -> server notificat
 ```
 
 The server tracks watched peer keys per connection and indexes those watches by
-key. It applies the caller-specific group-link policy when establishing a watch.
+key.
 The reference server sends `v1.peer.changed` / `v1.peer.removed` only to
 connections currently watching the changed key. Both notifications contain
 only the peer public key.
@@ -28,13 +28,13 @@ only the peer public key.
 A retaining client establishes interest with `v1.peer.watch`. For either
 invalidation it performs an ordinary `v1.peer.by_key` refresh. That lookup
 returns either the complete current record or the explicit `{"not_found":{}}`
-result that authoritatively means the caller no longer has a visible record for
-that peer. In particular, `peer.removed` is an invalidation hint rather than
+result that authoritatively means the registry no longer has a record for that
+peer. In particular, `peer.removed` is an invalidation hint rather than
 replacement state; confirming it by key makes remove/re-add races converge on
 the registry's current state.
 
 `v1.peer.watch` atomically establishes the keyed subscription and samples the
-current visible record, so a registry change cannot slip between the initial
+current record, so a registry change cannot slip between the initial
 snapshot and subscription. Reconnect recovery replays `v1.peer.watch` for the
 peer keys the client still holds.
 
@@ -103,8 +103,7 @@ express protocol requirements.
   completed `v1.peer.watch` and has not subsequently unwatched or disconnected.
 - **Peer invalidation**: a `v1.peer.changed` or `v1.peer.removed` notification naming one watched peer key.
 - **Authoritative miss**: a successful lookup whose result is exactly
-  `{"not_found":{}}`; the requested target is absent from the caller's visible
-  registry, whether because it is unconfigured or hidden by policy.
+  `{"not_found":{}}`; the requested target is absent from the shared registry.
 - **Authoritative removal**: an authoritative miss from a by-key refresh for a
   peer the client still holds.
 - **Transient failure**: a JSON-RPC error, malformed response, timeout,
@@ -126,6 +125,10 @@ The authenticated tunnel peer that owns the TCP connection is the caller.
 
 A server MUST serve Peers API operations only to a caller that is present in
 the current peer registry.
+
+All admitted callers query the same registry. A configured peer may resolve any
+other configured peer by public key or tunnel address; there is no per-caller
+visibility filter in version 1.
 
 The reference server binds each accepted API connection to the static public
 key of the WireGuard peer that delivered it. Identity is therefore fixed for
@@ -164,9 +167,9 @@ The supplied implementations use fixed receive buffers:
 A complete newline-terminated frame MUST fit in the receiving buffer. An
 oversized incoming frame is a transient connection failure.
 
-A peer record contains at most four address prefixes, and the 1024-byte record
-buffer is sized for the largest valid lookup response. Both peer invalidations
-are much smaller but travel in the same direction.
+A peer record contains one address prefix, and the 1024-byte record buffer is
+sized with ample headroom for the largest valid lookup response. Both peer
+invalidations are much smaller but travel in the same direction.
 
 ### 3.5 JSON-RPC envelope
 
@@ -181,7 +184,7 @@ Request:
 Positive response:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"found":{"public_key":"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=","addresses":["10.0.0.3/32"]}}}
+{"jsonrpc":"2.0","id":1,"result":{"found":{"public_key":"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=","address":"10.0.0.3/32"}}}
 ```
 
 Authoritative miss:
@@ -255,8 +258,8 @@ Hostnames are not part of the wire schema. IPv6 endpoints use brackets.
 A tunnel prefix is an IPv4 or IPv6 CIDR such as `10.1.2.0/24` or
 `2001:db8:1::/64`.
 
-A conforming sender includes the prefix length, including on host prefixes. A
-peer record contains at most four prefixes.
+A conforming sender includes the prefix length, including on host prefixes.
+Each peer record contains exactly one prefix.
 
 ### 4.5 PeerInfo
 
@@ -268,7 +271,7 @@ lookup.
   "public_key": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=",
   "endpoint": "203.0.113.5:51820",
   "relay": "zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw=",
-  "addresses": ["10.1.2.0/24", "2001:db8:1::/64"],
+  "address": "10.1.2.0/24",
   "persistent_keepalive": 25
 }
 ```
@@ -278,7 +281,7 @@ lookup.
 | `public_key` | `PublicKey` | yes | Static public key of the described peer. |
 | `endpoint` | `Endpoint` | no | Current directly reachable outer UDP endpoint. |
 | `relay` | `PublicKey` | no | Static key of the relay through which this peer is reached. |
-| `addresses` | array of `Cidr` | yes | Tunnel prefixes owned by the peer; maximum four. |
+| `address` | `Cidr` | yes | The tunnel prefix owned by the peer. |
 | `persistent_keepalive` | integer `0..65535` | no | Keepalive interval in seconds. `0` and omission disable it. |
 
 The reference server may replace a configured endpoint with the most recently
@@ -298,7 +301,7 @@ exactly one externally tagged variant.
 Found:
 
 ```json
-{"found":{"public_key":"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=","addresses":["10.0.0.3/32"]}}
+{"found":{"public_key":"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=","address":"10.0.0.3/32"}}
 ```
 
 Not found:
@@ -342,10 +345,9 @@ Result: `LookupResult`.
 Behavior:
 
 1. Decode the public key.
-2. Look up exactly that key in the current published registry and apply the
-   caller's group-link policy.
-3. Return `{"found": <PeerInfo>}` when present and visible.
-4. Return `{"not_found":{}}` when the key is valid but absent or hidden.
+2. Look up exactly that key in the current published registry.
+3. Return `{"found": <PeerInfo>}` when present.
+4. Return `{"not_found":{}}` when the key is valid but absent.
 5. Return invalid-params for an undecodable key.
 
 A positive response MUST name the key that was requested.
@@ -366,9 +368,8 @@ Behavior:
 
 1. Parse the address.
 2. Perform longest-prefix match over the published peer prefixes.
-3. Apply the caller's group-link policy and return the owning peer as
-   `{"found": <PeerInfo>}` only when it is visible.
-4. Return `{"not_found":{}}` when no visible peer owns the address.
+3. Return the owning peer as `{"found": <PeerInfo>}`.
+4. Return `{"not_found":{}}` when no peer owns the address.
 5. Return invalid-params for an undecodable address.
 
 A client accepting the positive response MUST verify that the returned record
@@ -380,12 +381,12 @@ actually contains the queried address.
 
 Params are identical to `v1.peer.by_key`. Result: `LookupResult`.
 
-For a valid, visible peer key, the server MUST establish interest in that key
+For a valid peer key, the server MUST establish interest in that key
 and sample the corresponding `LookupResult` as one atomic registry operation. A
 peer transition therefore cannot occur between the returned snapshot and watch
 registration without also producing a later invalidation for this connection.
 
-If the key is absent or hidden, the server returns `{"not_found":{}}` and MUST
+If the key is absent, the server returns `{"not_found":{}}` and MUST
 NOT establish a watch. An undecodable key is invalid params.
 
 Calling `v1.peer.watch` again for an already-watched key is idempotent and
@@ -414,7 +415,7 @@ Params:
 
 The reference server emits this notification to connections watching the named
 key when that peer is added or when its effective published record changes,
-including configuration changes to its endpoint, relay, addresses, or
+including configuration changes to its endpoint, relay, address, or
 keepalive and authenticated endpoint changes.
 
 ### 6.6 `v1.peer.removed`
@@ -506,10 +507,9 @@ failure    -> keep old record and retry through normal reconnect flow
 
 This recovers changes missed because of transport failure or server restart.
 
-The reference server closes keyed subscriptions when the group-link policy
-changes. Reconnect and re-watch then reconcile records that became hidden
-without requiring the server to enumerate newly-hidden keys. Removing the
-caller's own registry record also closes all of that caller's subscriptions.
+Removing the caller's own registry record closes all of that caller's
+subscriptions. Reconnect and re-watch then re-establish admission and retained
+watches.
 
 ### 7.5 Bounded keyed queues
 
@@ -568,7 +568,7 @@ other than `v1.peer.changed` and `v1.peer.removed`.
   document.
 - `v1.peer.by_key` and `v1.peer.by_address` MUST be side-effect free.
 - A successful `v1.peer.watch` MUST atomically establish per-connection interest
-  in the visible key and return a current `LookupResult`.
+  in the key and return a current `LookupResult`.
 - `v1.peer.watch` returning `not_found` MUST leave that key unwatched.
 - `v1.peer.unwatch` MUST be an idempotent client notification.
 - The server MUST deliver peer invalidations only to connections currently
@@ -617,9 +617,7 @@ lookup path.
 The API intentionally returns the same `{"not_found":{}}` result for:
 
 - a valid but unknown peer key;
-- a valid address no configured prefix contains;
-- a configured peer hidden from the authenticated caller;
-- a valid address whose owning peer is hidden from the caller.
+- a valid address no configured prefix contains.
 
 An undecodable key or address receives invalid-params instead. Loss of caller
 admission and rate limiting are also distinct transient errors because neither

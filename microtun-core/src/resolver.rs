@@ -14,12 +14,11 @@ use core::net::{IpAddr, SocketAddr};
 use defmt_or_log::{debug, info, warn};
 
 use crate::{
-    Core, Error, EvictedPeerGhost, PeerAddresses, RelayPolicy, Sink, Slot,
+    Core, Error, EvictedPeerGhost, IpCidr, RelayPolicy, Sink, Slot,
     firewall::InboundPolicy,
     ip::unmap_socket_addr,
     peer::{PeerEntry, PeerKind},
     pending::Wait,
-    push_peer_address,
     routing::PeerIdx,
     time::{Duration, Instant},
 };
@@ -66,7 +65,8 @@ pub struct ResolvedPeer {
     /// Relay protocol: static public key of the peer through which this
     /// peer is reached, if it is not directly addressable.
     pub relay: Option<[u8; 32]>,
-    pub addresses: PeerAddresses,
+    /// The peer's single authoritative tunnel prefix.
+    pub address: IpCidr,
     /// Ingress policy applied to authenticated inner packets from this peer.
     pub inbound_policy: InboundPolicy,
     /// WireGuard-style persistent keepalive interval. `None` disables it.
@@ -579,7 +579,7 @@ impl<
     ///
     /// * a lookup result is a *complete replacement*, so the peer must end up
     ///   describing the answer entirely or not at all — never new metadata
-    ///   stapled to old addresses;
+    ///   stapled to the old address;
     /// * only a well-formed `not_found` removes anything, so a rejected or
     ///   failed answer leaves the held record exactly as it was;
     /// * a reconciliation that could not be completed is still owed, so it is
@@ -654,12 +654,12 @@ impl<
     /// Route replacement is the only step that can fail, and it is fully
     /// preflighted — it plans every eviction and draws the whole eviction
     /// budget before it mutates anything — so running it *first* is what makes
-    /// the update atomic. Peer metadata is applied only once the address set
+    /// the update atomic. Peer metadata is applied only once the address
     /// is committed, and applying it cannot fail for a peer that is already
     /// installed.
     ///
     /// Doing it the other way round is what produced records carrying a new
-    /// endpoint, relay, policy and keepalive alongside the addresses of the
+    /// endpoint, relay, policy and keepalive alongside the address from the
     /// previous answer, with nothing scheduled to ever reconcile them.
     fn commit_held_update(
         &mut self,
@@ -842,7 +842,7 @@ impl<
                     // is in flight. In that race this answer is a replacement,
                     // not a new admission: commit routes first so a capacity
                     // failure cannot leave new metadata attached to the old
-                    // address set.
+                    // address.
                     match self.commit_existing_resolved_peer(
                         pidx,
                         &info,
@@ -868,15 +868,15 @@ impl<
                         };
                     if routes_changed
                         && self
-                            .replace_dynamic_routes(
+                            .replace_dynamic_route(
                                 pidx,
-                                &info.addresses,
+                                info.address,
                                 now,
                                 !matches!(source, InstallSource::Relay),
                             )
                             .is_err()
                     {
-                        // A freshly admitted peer has no usable old route set.
+                        // A freshly admitted peer has no usable old route.
                         // Remove it entirely rather than retaining a partial
                         // record; eviction reports that the resolver interest must
                         // be released.
@@ -947,7 +947,7 @@ impl<
                 // them leaves the retry to the next packet, exactly as the
                 // transient-failure arm below does.
                 let info_key = info.public_key;
-                if !info.addresses.iter().any(|cidr| cidr.contains(&address)) {
+                if !info.address.contains(&address) {
                     warn!("discarding a by-address answer that does not cover the query");
                     // The resolver locally retained the key returned by the
                     // address lookup before completing this answer. Every path
@@ -994,7 +994,7 @@ impl<
                         };
                     if routes_changed
                         && self
-                            .replace_dynamic_routes(pidx, &info.addresses, now, true)
+                            .replace_dynamic_route(pidx, info.address, now, true)
                             .is_err()
                     {
                         if installed_new {
@@ -1043,79 +1043,48 @@ impl<
         }
     }
 
-    /// Reinstall `pidx`'s routes as one complete address set.
+    /// Reinstall `pidx`'s single dynamic route.
     ///
     /// Capacity is reserved before insertion by preflighting whole-peer
     /// evictions. Only idle, sessionless dynamic peers are candidates; pinned
-    /// and active peers are never selected. The complete victim set and global
-    /// eviction budget are checked before the first mutation, preventing a
-    /// failed multi-victim admission from causing partial churn. Returns
-    /// [`Error::RouteCacheFull`] when no safe plan can fit the full set.
-    ///
-    /// Sizing note: `MAX_ROUTES` is exactly `MAX_PEERS * MAX_PEER_ADDRESSES` in the host
-    /// runner, so eviction is normally unnecessary there. The embassy profile
-    /// is deliberately oversubscribed (`MAX_PEERS = 8`, `MAX_ROUTES = 16`).
-    fn replace_dynamic_routes(
+    /// and active peers are never selected. Returns [`Error::RouteCacheFull`]
+    /// when no safe plan can fit the route.
+    fn replace_dynamic_route(
         &mut self,
         pidx: PeerIdx,
-        addresses: &PeerAddresses,
+        address: IpCidr,
         now: Instant,
         allow_peer_eviction: bool,
     ) -> Result<(), Error> {
         let current_slots = self.routes.peer_route_count(pidx);
-        let required_slots = Self::required_route_slots(addresses);
-
         let available_after_replace = self.routes.available_slots().saturating_add(current_slots);
-        let shortage = required_slots.saturating_sub(available_after_replace);
-        if shortage != 0 {
+        if available_after_replace == 0 {
             if !allow_peer_eviction {
                 return Err(Error::RouteCacheFull);
             }
 
-            // Plan the entire route-capacity mutation before evicting anyone.
-            // Without this preflight, an answer requiring multiple victims
-            // could evict one legitimate peer, exhaust the global budget on
-            // the next, and then fail to install at all.
-            let mut victims = [None; MAX_PEERS];
-            let mut victim_count = 0usize;
-            let mut reclaimed_slots = 0usize;
-            while reclaimed_slots < shortage {
-                let Some(victim) =
-                    self.capacity_victim_excluding(now, Some(pidx), &victims, victim_count, 1)
-                else {
-                    return Err(Error::RouteCacheFull);
-                };
-                let freed = self.routes.peer_route_count(victim);
-                if freed == 0 || victim_count >= victims.len() {
-                    return Err(Error::RouteCacheFull);
-                }
-                victims[victim_count] = Some(victim);
-                victim_count += 1;
-                reclaimed_slots = reclaimed_slots.saturating_add(freed);
-            }
-
-            let eviction_count = u32::try_from(victim_count).unwrap_or(u32::MAX);
-            if !self.peer_evictions.try_take_many(eviction_count, now) {
+            let selected = [None; MAX_PEERS];
+            let Some(victim) = self.capacity_victim_excluding(now, Some(pidx), &selected, 0, 1)
+            else {
+                return Err(Error::RouteCacheFull);
+            };
+            if !self.peer_evictions.try_take_many(1, now) {
                 debug!("route-capacity eviction denied by global cooldown");
                 return Err(Error::PeerAdmissionLimited);
             }
-            for victim in victims[..victim_count].iter().flatten().copied() {
-                warn!(
-                    "evicting idle sessionless peer to make room in the route cache: peer={}",
-                    victim
-                );
-                self.evict_peer_and_remember(victim, now)?;
-            }
+            warn!(
+                "evicting idle sessionless peer to make room in the route cache: peer={}",
+                victim
+            );
+            self.evict_peer_and_remember(victim, now)?;
         }
 
         self.routes.remove_peer(pidx)?;
-        for cidr in addresses.iter() {
-            self.routes.insert(*cidr, pidx, false, now)?;
-        }
+        self.routes.insert(address, pidx, false, now)?;
         let Some(peer) = self.peers.get_mut(pidx as usize).and_then(Option::as_mut) else {
             return Err(Error::InternalInvariant);
         };
-        peer.addresses = addresses.clone();
+        peer.address = address;
         Ok(())
     }
 
@@ -1139,14 +1108,10 @@ impl<
             let Some(peer) = self.peers.get(pidx as usize).and_then(Option::as_ref) else {
                 return Err(Error::InternalInvariant);
             };
-            peer.addresses.len() != info.addresses.len()
-                || !peer
-                    .addresses
-                    .iter()
-                    .all(|cidr| info.addresses.contains(cidr))
+            peer.address != info.address
         };
         if routes_changed {
-            self.replace_dynamic_routes(pidx, &info.addresses, now, allow_peer_eviction)?;
+            self.replace_dynamic_route(pidx, info.address, now, allow_peer_eviction)?;
         }
 
         let (updated, _, installed_new) = self.upsert_peer_unchecked(info, now, admission)?;
@@ -1164,7 +1129,7 @@ impl<
     ///
     /// A by-key answer must name the key that was queried. Every answer must
     /// also avoid this interface's own identity and pinned identities, avoid a
-    /// self-relay, carry at least one address, and avoid default routes.
+    /// self-relay, and carry one non-default tunnel address.
     ///
     /// # The resolver is the routing trust root
     ///
@@ -1195,15 +1160,6 @@ impl<
         query: ResolveQuery,
         mut info: ResolvedPeer,
     ) -> Result<ResolvedPeer, Error> {
-        let mut addresses = PeerAddresses::new();
-        for cidr in info.addresses.iter().copied() {
-            push_peer_address(&mut addresses, cidr).map_err(|_| Error::InvalidResolverAnswer)?;
-        }
-        #[cfg(feature = "alloc")]
-        if addresses.len() > MAX_ROUTES {
-            return Err(Error::InvalidResolverAnswer);
-        }
-        info.addresses = addresses;
         // The single normalization point for a resolver answer. Every path
         // that installs or updates a peer passes through here, so mapped
         // IPv4-in-IPv6 endpoints are folded to native IPv4 exactly once
@@ -1241,18 +1197,12 @@ impl<
         if info.relay == Some(info.public_key) {
             return Err(Error::InvalidResolverAnswer);
         }
-        // A peer with no address space can never pass the inbound source
-        // check nor be selected outbound, so it would occupy a table entry
-        // while being deaf in both directions.
-        if info.addresses.is_empty() {
-            return Err(Error::InvalidResolverAnswer);
-        }
         // A default route is still refused. Not to protect pinned space —
         // overlap is allowed now — but because `/0` cannot be expressed as a
         // resolvable assignment: it matches every `by-address` query, so it
         // would suppress every future lookup and pin all routing to whichever
         // peer happened to claim it first.
-        if info.addresses.iter().any(|cidr| cidr.network_length() == 0) {
+        if info.address.network_length() == 0 {
             return Err(Error::InvalidResolverAnswer);
         }
         Ok(())
@@ -1313,11 +1263,7 @@ impl<
                     peer.endpoint_confirmed = None;
                 }
                 let policy_changed = peer.inbound_policy != info.inbound_policy;
-                let routes_changed = peer.addresses.len() != info.addresses.len()
-                    || !peer
-                        .addresses
-                        .iter()
-                        .all(|cidr| info.addresses.contains(cidr));
+                let routes_changed = peer.address != info.address;
                 peer.relay = info.relay;
                 peer.inbound_policy = info.inbound_policy;
                 let persistent_keepalive = info
@@ -1368,7 +1314,7 @@ impl<
                     info.relay,
                     info.inbound_policy,
                     info.persistent_keepalive,
-                    info.addresses.clone(),
+                    info.address,
                     now,
                 );
                 self.install_peer(i as PeerIdx, peer)?;
@@ -1398,15 +1344,14 @@ impl<
         // Documented caveat: eviction forgets `greatest_ts`, leaving the same
         // bounded replay window as a responder restart (§5.1); the TAI64N
         // monotonicity of initiators bounds the damage.
-        let route_shortage = Self::required_route_slots(&info.addresses)
-            .saturating_sub(self.routes.available_slots());
+        let route_shortage = 1usize.saturating_sub(self.routes.available_slots());
         let selected = [None; MAX_PEERS];
         let Some(i) = self
             .capacity_victim_excluding(now, None, &selected, 0, route_shortage)
             .map(|pidx| pidx as usize)
         else {
             // A table victim is accepted only when removing that same peer also
-            // makes the newcomer's complete route set fit. This keeps peer-table
+            // makes the newcomer's route fit. This keeps peer-table
             // and route-cache admission one destructive transaction.
             return Err(if lazy {
                 Error::PeerAdmissionLimited
@@ -1422,26 +1367,12 @@ impl<
             info.relay,
             info.inbound_policy,
             info.persistent_keepalive,
-            info.addresses.clone(),
+            info.address,
             now,
         );
         self.evict_peer_for_capacity(i as PeerIdx, now)?;
         self.install_peer(i as PeerIdx, peer)?;
         Ok((i as PeerIdx, true, true))
-    }
-
-    fn required_route_slots(addresses: &PeerAddresses) -> usize {
-        let mut required = 0usize;
-        for (index, cidr) in addresses.iter().enumerate() {
-            if !addresses
-                .iter()
-                .take(index)
-                .any(|previous| previous == cidr)
-            {
-                required += 1;
-            }
-        }
-        required
     }
 
     fn capacity_victim_excluding(
@@ -1734,68 +1665,6 @@ impl<
             self.resolves.push(entry).map_err(|_| Error::ResolverBusy)?;
             self.timers.arm(deadline);
             Ok(())
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use core::net::Ipv4Addr;
-
-    use super::*;
-    use crate::{IpCidr, push_peer_address};
-
-    fn net4(a: u8, b: u8, c: u8, d: u8, len: u8) -> IpCidr {
-        // `IpCidr` is canonical by construction, so build through `IpInet`
-        // (which tolerates host bits) and take its network. That keeps the
-        // host-bit cases these tests deliberately exercise expressible.
-        crate::IpInet::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), len)
-            .expect("valid prefix")
-            .network()
-    }
-
-    /// An outer (physical network) address.
-    #[test]
-    fn peer_address_lists_deduplicate_and_canonicalise() {
-        // Answers are canonicalised at the core boundary so that a resolver
-        // returning host bits, or the same prefix twice, cannot consume extra
-        // route-cache slots or per-peer capacity.
-        let mut addresses = PeerAddresses::new();
-        push_peer_address(&mut addresses, net4(10, 1, 2, 3, 24)).expect("push");
-        assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0], net4(10, 1, 2, 0, 24));
-
-        push_peer_address(&mut addresses, net4(10, 1, 2, 200, 24)).expect("duplicate");
-        assert_eq!(
-            addresses.len(),
-            1,
-            "an equivalent prefix is not a second route"
-        );
-
-        push_peer_address(&mut addresses, net4(10, 1, 2, 0, 25)).expect("push");
-        assert_eq!(
-            addresses.len(),
-            2,
-            "a different prefix length is a different route"
-        );
-
-        // Without an allocator the per-peer list is bounded, and overflowing
-        // it is reported rather than silently truncating the peer's routes.
-        #[cfg(not(feature = "alloc"))]
-        {
-            use crate::MAX_PEER_ADDRESSES;
-
-            let mut full = PeerAddresses::new();
-            for index in 0..MAX_PEER_ADDRESSES {
-                push_peer_address(&mut full, net4(10, index as u8, 0, 0, 24)).expect("push");
-            }
-            assert_eq!(full.len(), MAX_PEER_ADDRESSES);
-            assert_eq!(
-                push_peer_address(&mut full, net4(10, 200, 0, 0, 24)),
-                Err(Error::TooManyAddresses)
-            );
-            // A duplicate still succeeds, because it stores nothing.
-            assert_eq!(push_peer_address(&mut full, net4(10, 0, 0, 0, 24)), Ok(()));
         }
     }
 }

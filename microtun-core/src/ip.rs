@@ -135,16 +135,9 @@ pub fn unmap_socket_addr(addr: SocketAddr) -> SocketAddr {
 ///
 /// Deliberately opaque: the underlying parser distinguishes several failure
 /// modes, none of which any caller here acts on differently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not a valid IP network prefix")]
 pub struct InvalidIpCidr;
-
-impl core::fmt::Display for InvalidIpCidr {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("not a valid IP network prefix")
-    }
-}
-
-impl core::error::Error for InvalidIpCidr {}
 
 /// Parse a CIDR prefix such as `10.1.2.0/24` or `2001:db8:1::/64`, truncating
 /// any host bits rather than rejecting them.
@@ -181,6 +174,21 @@ pub fn parse_ip_inet(text: &str) -> Result<crate::IpInet, InvalidIpCidr> {
         .map_err(|_| InvalidIpCidr)
 }
 
+/// Return the single-host route for an IP address.
+///
+/// IPv4 addresses become `/32` prefixes and IPv6 addresses become `/128`
+/// prefixes. This is useful when configuration syntax permits an interface
+/// prefix but the peer itself must only claim the literal host address.
+pub fn host_cidr(address: IpAddr) -> crate::IpCidr {
+    let prefix = match address {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    crate::IpInet::new(address, prefix)
+        .expect("the address-family host prefix is always valid")
+        .network()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +201,18 @@ mod tests {
     /// An inner (tunnel) address.
     fn tun(last: u8) -> Ipv4Addr {
         Ipv4Addr::new(10, 0, 0, last)
+    }
+
+    #[test]
+    fn host_cidr_uses_the_full_address_width() {
+        let v4 = host_cidr(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)));
+        assert_eq!(v4.network_length(), 32);
+        assert_eq!(v4.first_address(), IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)));
+
+        let v6_address = v6_addr(7);
+        let v6 = host_cidr(IpAddr::V6(v6_address));
+        assert_eq!(v6.network_length(), 128);
+        assert_eq!(v6.first_address(), IpAddr::V6(v6_address));
     }
 
     /// A well-formed IPv4 packet whose `total_length` matches its real length.

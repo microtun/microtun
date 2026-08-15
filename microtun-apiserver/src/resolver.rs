@@ -19,16 +19,14 @@ use std::{
     time::Duration,
 };
 
-use microtun_core::{
-    IpCidr, PeerUpdate, ResolveOutcome, ResolveQuery, ResolverCommand, ResolverEvent,
-};
+use microtun_core::{PeerUpdate, ResolveOutcome, ResolveQuery, ResolverCommand, ResolverEvent};
 use tokio::sync::mpsc;
 
 #[cfg(test)]
 use crate::registry::Registry;
 use crate::{
     config::{self, Loaded},
-    registry::{RegistryEvent, SharedRegistry},
+    registry::SharedRegistry,
 };
 
 /// How quickly a changed file becomes visible to resolver and RPC requests.
@@ -39,58 +37,59 @@ const RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 pub struct FixedServer {
     public_key: [u8; 32],
     listen: SocketAddr,
-    relay_forwarding: bool,
-    addresses: Vec<IpCidr>,
+    mtu: u16,
+    enable_forwarding: bool,
+    tunnel_address: microtun_core::IpInet,
 }
 
 impl FixedServer {
     pub fn from_loaded(loaded: &Loaded) -> Result<Self, String> {
-        let addresses = server_addresses(loaded)?;
+        if loaded
+            .registry
+            .lookup_key(&loaded.options.public_key)
+            .is_none()
+        {
+            return Err("Peers API server record is missing from its own registry".to_string());
+        }
         Ok(Self {
             public_key: loaded.options.public_key,
             listen: loaded.options.listen,
-            relay_forwarding: loaded.options.relay_forwarding,
-            addresses,
+            mtu: loaded.options.mtu,
+            enable_forwarding: loaded.options.enable_forwarding,
+            tunnel_address: loaded.options.tunnel_address,
         })
     }
 
     fn validate_reload(&self, loaded: &Loaded) -> Result<(), String> {
         if loaded.options.public_key != self.public_key {
-            return Err("[Server] PrivateKey changed; restart to change tunnel identity".into());
+            return Err("[Tunnel] PrivateKey changed; restart to change tunnel identity".into());
         }
         if loaded.options.listen != self.listen {
             return Err(format!(
-                "[Server] ListenPort changed from {} to {}; restart to rebind UDP",
+                "[Tunnel] ListenPort changed from {} to {}; restart to rebind UDP",
                 self.listen, loaded.options.listen
             ));
         }
-        if loaded.options.relay_forwarding != self.relay_forwarding {
+        if loaded.options.mtu != self.mtu {
+            return Err(format!(
+                "[Tunnel] MTU changed from {} to {}; restart to rebuild the virtual TCP stack",
+                self.mtu, loaded.options.mtu
+            ));
+        }
+        if loaded.options.enable_forwarding != self.enable_forwarding {
             return Err(
-                "[Server] RelayForwarding changed; restart to change relay forwarding policy"
+                "[Tunnel] EnableForwarding changed; restart to change relay forwarding policy"
                     .into(),
             );
         }
 
-        let addresses = server_addresses(loaded)?;
-        if addresses.len() != self.addresses.len()
-            || !addresses
-                .iter()
-                .all(|address| self.addresses.contains(address))
-        {
+        if loaded.options.tunnel_address != self.tunnel_address {
             return Err(
-                "[Server] Addresses changed; restart to rebuild the virtual TCP stack".into(),
+                "[Tunnel] Address changed; restart to rebuild the virtual TCP stack".into(),
             );
         }
         Ok(())
     }
-}
-
-fn server_addresses(loaded: &Loaded) -> Result<Vec<IpCidr>, String> {
-    loaded
-        .registry
-        .lookup_key(&loaded.options.public_key)
-        .map(|record| record.addresses.clone())
-        .ok_or_else(|| "Peers API server record is missing from its own registry".to_string())
 }
 
 /// Run the published-state resolver until its request channel is closed.
@@ -140,7 +139,7 @@ pub async fn task(
             }
             change = changes.recv() => {
                 match change {
-                    Ok(RegistryEvent::Peer(change)) if held.contains(&change.public_key) => {
+                    Ok(change) if held.contains(&change.public_key) => {
                         if send_update(
                             &events,
                             &registry,
@@ -153,7 +152,7 @@ pub async fn task(
                             return;
                         }
                     }
-                    Ok(RegistryEvent::Peer(_)) | Ok(RegistryEvent::LinksChanged) => {}
+                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         for public_key in held.iter().copied().collect::<Vec<_>>() {
                             if send_update(
@@ -339,7 +338,7 @@ mod tests {
     use crate::{
         config::{
             self, Loaded,
-            tests::{SERVER_PRIVATE, server_public},
+            tests::{server_config, server_public},
         },
         registry::SharedRegistry,
     };
@@ -349,8 +348,8 @@ mod tests {
 
     fn config_text(peer_key: &str, endpoint: &str, address: &str) -> String {
         format!(
-            "[Server]\nPrivateKey = {SERVER_PRIVATE}\nAddresses = 10.0.0.1/32\n\n\
-             [Peer.client]\nPublicKey = {peer_key}\nEndpoint = {endpoint}\nAddresses = {address}\n"
+            "{}[Peer]\nName = client\nPublicKey = {peer_key}\nEndpoint = {endpoint}\nAddress = {address}\n",
+            server_config("10.0.0.1/32")
         )
     }
 
@@ -372,9 +371,9 @@ mod tests {
     #[test]
     fn answers_by_key_and_longest_prefix() {
         let text = format!(
-            "[Server]\nPrivateKey = {SERVER_PRIVATE}\nAddresses = 10.0.0.1/32\n\n\
-             [Peer.wide]\nPublicKey = {PEER_A}\nEndpoint = 198.51.100.1:51820\nAddresses = 10.2.0.0/16\n\n\
-             [Peer.narrow]\nPublicKey = {PEER_B}\nEndpoint = 198.51.100.2:51820\nAddresses = 10.2.3.0/24\n"
+            "{}[Peer]\nName = wide\nPublicKey = {PEER_A}\nEndpoint = 198.51.100.1:51820\nAddress = 10.2.0.0/16\n\n\
+             [Peer]\nName = narrow\nPublicKey = {PEER_B}\nEndpoint = 198.51.100.2:51820\nAddress = 10.2.3.0/24\n",
+            server_config("10.0.0.1/32")
         );
         let loaded = loaded(&text);
 
@@ -436,8 +435,8 @@ mod tests {
     #[test]
     fn server_local_resolver_strips_self_relay() {
         let text = format!(
-            "[Server]\nPrivateKey = {SERVER_PRIVATE}\nAddresses = 10.0.0.1/32\n\n\
-             [Peer.client]\nPublicKey = {PEER_A}\nAddresses = 10.0.0.2/32\nRelay = @self\n"
+            "{}[Peer]\nName = client\nPublicKey = {PEER_A}\nAddress = 10.0.0.2/32\nRelay = @self\n",
+            server_config("10.0.0.1/32")
         );
         let loaded = loaded(&text);
 
@@ -492,19 +491,51 @@ mod tests {
     }
 
     #[test]
-    fn relay_forwarding_change_requires_restart() {
+    fn tunnel_prefix_change_requires_restart_even_when_host_is_unchanged() {
+        let first_text = config_text(PEER_A, "198.51.100.10:51820", "10.0.0.2/32")
+            .replace("Address = 10.0.0.1/32", "Address = 10.0.0.1/24");
+        let first = loaded(&first_text);
+        let fixed = FixedServer::from_loaded(&first).unwrap();
+        let changed = loaded(&first_text.replace("Address = 10.0.0.1/24", "Address = 10.0.0.1/16"));
+
+        assert_eq!(
+            fixed.validate_reload(&changed).unwrap_err(),
+            "[Tunnel] Address changed; restart to rebuild the virtual TCP stack"
+        );
+    }
+
+    #[test]
+    fn mtu_change_requires_restart() {
+        let first = loaded(&config_text(PEER_A, "198.51.100.10:51820", "10.0.0.2/32"));
+        let fixed = FixedServer::from_loaded(&first).unwrap();
+        // Any value that differs from the 1280 default and is still inside
+        // `RECOMMENDED_MAX_RELAYED_MTU`; this test is about change detection,
+        // not about the ceiling, which `config` covers.
+        let changed = loaded(
+            &config_text(PEER_A, "198.51.100.10:51820", "10.0.0.2/32")
+                .replace("ListenPort = 51820", "MTU = 1320\nListenPort = 51820"),
+        );
+
+        assert_eq!(
+            fixed.validate_reload(&changed).unwrap_err(),
+            "[Tunnel] MTU changed from 1280 to 1320; restart to rebuild the virtual TCP stack"
+        );
+    }
+
+    #[test]
+    fn enable_forwarding_change_requires_restart() {
         let first = loaded(&config_text(PEER_A, "198.51.100.10:51820", "10.0.0.2/32"));
         let fixed = FixedServer::from_loaded(&first).unwrap();
         let changed = loaded(
             &config_text(PEER_A, "198.51.100.10:51820", "10.0.0.2/32").replace(
-                "Addresses = 10.0.0.1/32",
-                "Addresses = 10.0.0.1/32\nRelayForwarding = true",
+                "ListenPort = 51820",
+                "ListenPort = 51820\nEnableForwarding = true",
             ),
         );
 
         assert_eq!(
             fixed.validate_reload(&changed).unwrap_err(),
-            "[Server] RelayForwarding changed; restart to change relay forwarding policy"
+            "[Tunnel] EnableForwarding changed; restart to change relay forwarding policy"
         );
     }
 
@@ -521,8 +552,8 @@ mod tests {
         assert!(shared.config_snapshot().lookup_key(&[0xAA; 32]).is_some());
 
         let changed_server = format!(
-            "[Server]\nPrivateKey = {SERVER_PRIVATE}\nAddresses = 10.9.9.9/32\n\n\
-             [Peer.client]\nPublicKey = {PEER_B}\nEndpoint = 198.51.100.20:51820\nAddresses = 10.0.0.3/32\n"
+            "{}[Peer]\nName = client\nPublicKey = {PEER_B}\nEndpoint = 198.51.100.20:51820\nAddress = 10.0.0.3/32\n",
+            server_config("10.9.9.9/32")
         );
         fs::write(&path, changed_server).unwrap();
         reload_if_changed(&path, &fixed, &shared, &mut observation);

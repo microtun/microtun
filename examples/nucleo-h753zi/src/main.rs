@@ -11,12 +11,12 @@ use defmt::{info, warn};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_net::{
-    IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4,
+    IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Ipv6Cidr, Stack, StackResources, StaticConfigV4,
+    StaticConfigV6,
     dns::DnsQueryType,
     tcp::{self, TcpSocket},
     udp::{PacketMetadata, UdpSocket},
 };
-use embassy_net_driver_channel::Device as TunnelDevice;
 use embassy_stm32::{
     Config, bind_interrupts, eth,
     flash::{Blocking, Flash},
@@ -30,17 +30,18 @@ use embassy_time::{Duration as EmbassyDuration, Instant as EmbassyInstant, Timer
 use embedded_io_async::Write as _;
 use heapless::String;
 use microtun_embassy::{
-    ResolverBuffers, ResolverChannels, ResolverConfig, TunnelRunner, TunnelState,
+    ResolverBuffers, ResolverChannels, ResolverConfig, TunnelDevice, TunnelRunner, TunnelState,
     core::{
-        Config as TunnelConfig, Duration, Instant, IpCidr, PinnedPeer, ResolverCommand,
+        Config as TunnelConfig, Duration, Instant, IpInet, PinnedPeer, ResolverCommand,
         ResolverEvent,
         firewall::InboundPolicy,
-        ip::parse_ip_cidr,
+        ip::{host_cidr, parse_ip_inet},
         key::{decode_key, decode_key_into, encode_key},
     },
-    new_tunnel, resolver_task,
+    new_tunnel_with_mtu, resolver_task,
+    RESOLVER_CHANNEL_DEPTH,
 };
-use microtun_provision::{ProvisionRecord, RECORD_SIZE, decode_record, parse_ipv4_cidr};
+use microtun_device_config::{ProvisionRecord, RECORD_SIZE, decode_record};
 use panic_probe as _;
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
 use sntpc_net_embassy::UdpSocketWrapper;
@@ -53,13 +54,12 @@ bind_interrupts!(struct Irqs {
 });
 
 type OuterDevice = Ethernet<'static, ETH, GenericPhy<Sma<'static, ETH_SMA>>>;
-type InnerDevice = TunnelDevice<'static, { microtun_embassy::MTU }>;
+type InnerDevice = TunnelDevice<'static>;
 type HardwareRng = Rng<'static, RNG>;
 
-const RESOLVER_CHANNEL_DEPTH: usize = 16;
 const TUNNEL_QUEUE_DEPTH: usize = 4;
 const OUTER_UDP_PACKETS: usize = 4;
-const RESOLVER_TCP_BUFFER: usize = 2048;
+const RESOLVER_TCP_BUFFER: usize = 1024;
 const TELNET_TCP_BUFFER: usize = 1024;
 const TCP_KEEP_ALIVE: EmbassyDuration = EmbassyDuration::from_secs(15);
 const TCP_IDLE_TIMEOUT: EmbassyDuration = EmbassyDuration::from_secs(45);
@@ -90,20 +90,33 @@ async fn inner_net_task(mut runner: embassy_net::Runner<'static, InnerDevice>) -
 
 #[embassy_executor::task]
 async fn tunnel_task(runner: TunnelRunner<'static, HardwareRng>, outer_stack: Stack<'static>) -> ! {
-    let mut rx_meta = [PacketMetadata::EMPTY; OUTER_UDP_PACKETS];
-    let mut tx_meta = [PacketMetadata::EMPTY; OUTER_UDP_PACKETS];
-    let mut rx = [0u8; microtun_embassy::OUTER_SIZE * OUTER_UDP_PACKETS];
-    let mut tx = [0u8; microtun_embassy::OUTER_SIZE * OUTER_UDP_PACKETS];
+    // Held in statics rather than on this task's stack. At OUTER_SIZE (1500)
+    // times OUTER_UDP_PACKETS this is roughly 12 KiB, which is large enough
+    // that burying it in a task stack makes the executor's stack requirement
+    // invisible at the call site and turns any future increase into a stack
+    // overflow rather than a link error. In a static it shows up in the map
+    // alongside the rest of the budget.
+    static RX_META: StaticCell<[PacketMetadata; OUTER_UDP_PACKETS]> = StaticCell::new();
+    static TX_META: StaticCell<[PacketMetadata; OUTER_UDP_PACKETS]> = StaticCell::new();
+    static RX: StaticCell<[u8; microtun_embassy::OUTER_SIZE * OUTER_UDP_PACKETS]> =
+        StaticCell::new();
+    static TX: StaticCell<[u8; microtun_embassy::OUTER_SIZE * OUTER_UDP_PACKETS]> =
+        StaticCell::new();
+
+    let rx_meta = RX_META.init([PacketMetadata::EMPTY; OUTER_UDP_PACKETS]);
+    let tx_meta = TX_META.init([PacketMetadata::EMPTY; OUTER_UDP_PACKETS]);
+    let rx = RX.init([0u8; microtun_embassy::OUTER_SIZE * OUTER_UDP_PACKETS]);
+    let tx = TX.init([0u8; microtun_embassy::OUTER_SIZE * OUTER_UDP_PACKETS]);
 
     runner
         .run(
             outer_stack,
             RESOLVER_COMMANDS.sender(),
             RESOLVER_EVENTS.receiver(),
-            &mut rx_meta,
-            &mut rx,
-            &mut tx_meta,
-            &mut tx,
+            rx_meta,
+            rx,
+            tx_meta,
+            tx,
         )
         .await
 }
@@ -112,22 +125,13 @@ async fn tunnel_task(runner: TunnelRunner<'static, HardwareRng>, outer_stack: St
 async fn peers_resolver_task(
     inner_stack: Stack<'static>,
     local_public_key: [u8; 32],
-    api_server_tunnel_addr: [u8; 4],
+    api_server_tunnel_addr: IpAddr,
 ) -> ! {
     let mut rx = [0u8; RESOLVER_TCP_BUFFER];
     let mut tx = [0u8; RESOLVER_TCP_BUFFER];
 
     let cfg = ResolverConfig {
-        server: IpEndpoint::new(
-            Ipv4Address::new(
-                api_server_tunnel_addr[0],
-                api_server_tunnel_addr[1],
-                api_server_tunnel_addr[2],
-                api_server_tunnel_addr[3],
-            )
-            .into(),
-            PEERS_API_PORT,
-        ),
+        server: IpEndpoint::new(api_server_tunnel_addr.into(), PEERS_API_PORT),
         jitter_seed: microtun_embassy::peers_api::Jitter::seed_from_key(&local_public_key),
     };
 
@@ -209,7 +213,10 @@ async fn main(spawner: Spawner) -> ! {
         let mut flash = Flash::new_blocking(p.FLASH);
         load_provisioning(&mut flash)
     };
-    info!("loaded provisioning for tunnel {}", provision.config.tunnel_address.as_str());
+    info!(
+        "loaded provisioning for tunnel {}",
+        provision.config.tunnel.tunnel_address.as_str()
+    );
     let config = provision.config;
 
     let (mut rtc, rtc_time) = Rtc::new(p.RTC, RtcConfig::default());
@@ -254,39 +261,44 @@ async fn main(spawner: Spawner) -> ! {
     outer_stack.wait_config_up().await;
     info!("wired Ethernet DHCP lease acquired");
 
-    let (rtc_unix_secs, rtc_unix_nanos) = sync_rtc_from_ntp(
-        outer_stack,
-        &mut rtc,
-        &rtc_time,
-        config.ntp.host.as_str(),
-        config.ntp.port,
-    )
-    .await;
+    let wall_clock = if let Some(ntp) = config.ntp.as_ref() {
+        Some(
+            sync_rtc_from_ntp(outer_stack, &mut rtc, &rtc_time, ntp.host.as_str(), ntp.port).await,
+        )
+    } else {
+        info!("NTP not configured; using the current STM32 RTC value");
+        rtc_unix_time(&rtc_time)
+    };
 
     let api_server_outer_ip =
         resolve_api_server_host(outer_stack, config.api_server.host.as_str()).await;
 
+    let tunnel_mtu = config
+        .tunnel
+        .mtu
+        .map_or(microtun_embassy::MTU, usize::from);
     static TUNNEL_STATE: StaticCell<TunnelState<TUNNEL_QUEUE_DEPTH, TUNNEL_QUEUE_DEPTH>> =
         StaticCell::new();
-    let (channel_runner, tunnel_device) =
-        new_tunnel(TUNNEL_STATE.init(TunnelState::<TUNNEL_QUEUE_DEPTH, TUNNEL_QUEUE_DEPTH>::new()));
+    let (channel_runner, tunnel_device) = new_tunnel_with_mtu(
+        TUNNEL_STATE.init(TunnelState::<TUNNEL_QUEUE_DEPTH, TUNNEL_QUEUE_DEPTH>::new()),
+        tunnel_mtu,
+    );
+    info!("inner tunnel MTU: {}", tunnel_mtu);
 
-    let (local_tunnel_ipv4, local_tunnel_prefix_len) =
-        parse_ipv4_cidr(config.tunnel_address.as_str()).expect("validated local tunnel address");
-    let local_tunnel_octets = local_tunnel_ipv4.octets();
-    let inner_cfg = embassy_net::Config::ipv4_static(StaticConfigV4 {
-        address: Ipv4Cidr::new(
-            Ipv4Address::new(
-                local_tunnel_octets[0],
-                local_tunnel_octets[1],
-                local_tunnel_octets[2],
-                local_tunnel_octets[3],
-            ),
-            local_tunnel_prefix_len,
-        ),
-        gateway: None,
-        dns_servers: Default::default(),
-    });
+    let local_tunnel_address = parse_ip_inet(config.tunnel.tunnel_address.as_str())
+        .expect("validated local tunnel address");
+    let inner_cfg = match local_tunnel_address {
+        IpInet::V4(address) => embassy_net::Config::ipv4_static(StaticConfigV4 {
+            address: Ipv4Cidr::new(address.address(), address.network_length()),
+            gateway: None,
+            dns_servers: Default::default(),
+        }),
+        IpInet::V6(address) => embassy_net::Config::ipv6_static(StaticConfigV6 {
+            address: Ipv6Cidr::new(address.address(), address.network_length()),
+            gateway: None,
+            dns_servers: Default::default(),
+        }),
+    };
 
     static INNER_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
     let (inner_stack, inner_runner) = embassy_net::new(
@@ -297,13 +309,12 @@ async fn main(spawner: Spawner) -> ! {
     );
     spawner.spawn(inner_net_task(inner_runner).unwrap());
 
-    let api_inner: IpCidr = parse_ip_cidr(config.api_server.tunnel_address.as_str())
-        .expect("validated API server tunnel host CIDR");
-    let (api_server_tunnel_ipv4, _) = parse_ipv4_cidr(config.api_server.tunnel_address.as_str())
-        .expect("validated API server tunnel host CIDR");
+    let api_server_tunnel = parse_ip_inet(config.api_server.tunnel_address.as_str())
+        .expect("validated API server tunnel address");
+    let api_server_tunnel_addr = api_server_tunnel.address();
+    let api_inner = host_cidr(api_server_tunnel_addr);
     let api_server_public_key = decode_key(config.api_server.public_key.as_str())
         .expect("validated API server public key");
-    let api_routes = [api_inner];
     let pinned = [PinnedPeer {
         public_key: api_server_public_key,
         endpoint: Some(SocketAddr::from((
@@ -311,7 +322,7 @@ async fn main(spawner: Spawner) -> ! {
             config.api_server.port,
         ))),
         relay: None,
-        addresses: &api_routes,
+        address: api_inner,
         // The Peers API server is a client destination, not an unsolicited
         // service source for this board.
         inbound_policy: InboundPolicy::EstablishedOnly,
@@ -319,7 +330,7 @@ async fn main(spawner: Spawner) -> ! {
     }];
 
     let mut private_key = [0u8; 32];
-    decode_key_into(config.private_key.as_str(), &mut private_key)
+    decode_key_into(config.tunnel.private_key.as_str(), &mut private_key)
         .expect("validated device private key");
 
     let now = Instant::from_millis(EmbassyInstant::now().as_millis());
@@ -328,11 +339,16 @@ async fn main(spawner: Spawner) -> ! {
         rng,
         channel_runner,
         LISTEN_PORT,
+        config.tunnel.enable_forwarding,
         now,
     )
     .expect("create microtun runner");
 
-    tunnel.set_unix_time(rtc_unix_secs, rtc_unix_nanos, now);
+    if let Some((rtc_unix_secs, rtc_unix_nanos)) = wall_clock {
+        tunnel.set_unix_time(rtc_unix_secs, rtc_unix_nanos, now);
+    } else {
+        warn!("no usable wall clock is available to microtun");
+    }
     let local_public_key = tunnel.public_key();
     info!("microtun tunnel ready; telnet is only on the inner stack");
 
@@ -342,7 +358,7 @@ async fn main(spawner: Spawner) -> ! {
             peers_resolver_task(
                 inner_stack,
                 local_public_key,
-                api_server_tunnel_ipv4.octets(),
+                api_server_tunnel_addr,
             )
             .unwrap(),
         );

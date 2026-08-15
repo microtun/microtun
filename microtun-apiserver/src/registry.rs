@@ -1,12 +1,11 @@
-//! Peer records, lookup indexes, and the compiled group-link policy.
+//! Peer records and lookup indexes.
 //!
 //! Configured records contain only validated peer data. The published registry
 //! also carries a small runtime overlay of direct endpoints learned from
 //! authenticated tunnel traffic. RPC and local-resolver projections combine the
 //! two on read, with learned endpoints taking precedence over configured
-//! `Endpoint` values. RPC lookups additionally apply the authenticated caller's
-//! group-link policy while the server's local tunnel resolver intentionally sees
-//! the full registry. No result is pre-rendered or cached.
+//! `Endpoint` values. Every admitted peer sees the same full registry. No result
+//! is pre-rendered or cached.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,8 +18,7 @@ use std::{
 
 use microtun_api::PeerInfo;
 use microtun_core::{
-    IpCidr, PeerAddresses, ResolvedPeer, firewall::InboundPolicy, key::encode_key,
-    prefix_trie::PrefixTrie, push_peer_address,
+    IpCidr, ResolvedPeer, firewall::InboundPolicy, key::encode_key, prefix_trie::PrefixTrie,
 };
 
 /// Characters of a key's base64 form used to name a peer in a log line: wide
@@ -42,9 +40,8 @@ pub struct PeerRecord {
     pub endpoint: Option<SocketAddr>,
     pub relay: Option<[u8; 32]>,
     pub persistent_keepalive: Option<u16>,
-    /// Canonical (host-bits-cleared) tunnel prefixes, at least one, at most
-    /// `microtun_core::MAX_PEER_ADDRESSES`.
-    pub addresses: Vec<IpCidr>,
+    /// Canonical (host-bits-cleared) tunnel prefix owned by this peer.
+    pub address: IpCidr,
 }
 
 impl PeerRecord {
@@ -53,7 +50,7 @@ impl PeerRecord {
         public_key: [u8; 32],
         endpoint: Option<SocketAddr>,
         relay: Option<[u8; 32]>,
-        addresses: Vec<IpCidr>,
+        address: IpCidr,
         persistent_keepalive: Option<u16>,
     ) -> Self {
         let public_key_text = encode_key(&public_key).as_str().to_string();
@@ -64,7 +61,7 @@ impl PeerRecord {
             endpoint,
             relay,
             persistent_keepalive,
-            addresses,
+            address,
         }
     }
 
@@ -81,34 +78,20 @@ impl PeerRecord {
             &self.public_key,
             endpoint,
             self.relay.as_ref(),
-            self.addresses.iter().copied(),
+            self.address,
             self.persistent_keepalive,
         )
         .expect("validated Peers API server records fit the bounded API type")
     }
 
-    /// Clone this configured record into the tunnel core's resolver shape.
-    #[cfg(test)]
-    pub fn resolved(&self) -> ResolvedPeer {
-        self.resolved_with_endpoint(self.endpoint)
-    }
-
     /// Clone this record into the tunnel resolver shape using an effective
     /// runtime endpoint.
     pub fn resolved_with_endpoint(&self, endpoint: Option<SocketAddr>) -> ResolvedPeer {
-        let mut addresses = PeerAddresses::new();
-        for address in self.addresses.iter().copied() {
-            // Configuration validation already applies the same per-peer
-            // address limit and canonicalization rules as the core.
-            push_peer_address(&mut addresses, address)
-                .expect("validated Peers API server addresses fit resolver records");
-        }
-
         ResolvedPeer {
             public_key: self.public_key,
             endpoint,
             relay: self.relay,
-            addresses,
+            address: self.address,
             inbound_policy: InboundPolicy::AllowAll,
             persistent_keepalive: self
                 .persistent_keepalive
@@ -134,7 +117,6 @@ pub struct Registry {
     /// Longest-prefix-match index from tunnel prefix to owning peer.
     routes: PrefixTrie<usize, 0>,
     route_count: usize,
-    links: LinkPolicy,
 }
 
 impl Default for Registry {
@@ -157,15 +139,6 @@ pub enum RegistryChangeKind {
 pub struct RegistryChange {
     pub public_key: [u8; 32],
     pub kind: RegistryChangeKind,
-}
-
-/// One atomically published registry event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegistryEvent {
-    Peer(RegistryChange),
-    /// Link-policy changes close RPC connections so clients reconcile without the
-    /// server disclosing which previously-held keys just became invisible.
-    LinksChanged,
 }
 
 /// Per-connection invalidation queue used by the Peers API.
@@ -421,18 +394,6 @@ impl KeyedDispatcher {
             connection.queue.push(change);
         }
     }
-
-    fn close_all(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.by_key.clear();
-        for connection in state.connections.values_mut() {
-            connection.watched.clear();
-            connection.queue.close();
-        }
-    }
 }
 
 /// One remote Peers API connection's registration in the keyed dispatcher.
@@ -462,80 +423,6 @@ impl KeyedSubscription {
 impl Drop for KeyedSubscription {
     fn drop(&mut self) {
         self.dispatcher.remove(self.id);
-    }
-}
-
-/// Compiled group-link visibility policy.
-///
-/// Peers can always see themselves. Distinct peers can see one another only
-/// when their groups are joined by an explicit link. A one-group link is
-/// represented as a self-link; a two-group link is stored symmetrically.
-/// An empty restricted policy therefore denies all cross-peer visibility.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkPolicy {
-    restricted: bool,
-    group_links: Vec<HashSet<usize>>,
-    memberships: HashMap<[u8; 32], Vec<usize>>,
-}
-
-impl LinkPolicy {
-    pub fn allow_all() -> Self {
-        Self {
-            restricted: false,
-            group_links: Vec::new(),
-            memberships: HashMap::new(),
-        }
-    }
-
-    pub fn deny_all() -> Self {
-        Self {
-            restricted: true,
-            group_links: Vec::new(),
-            memberships: HashMap::new(),
-        }
-    }
-
-    pub fn from_groups_and_links(
-        groups: Vec<HashSet<[u8; 32]>>,
-        links: Vec<(usize, usize)>,
-    ) -> Self {
-        let mut memberships: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
-        for (index, members) in groups.iter().enumerate() {
-            for key in members {
-                memberships.entry(*key).or_default().push(index);
-            }
-        }
-
-        let mut group_links = vec![HashSet::new(); groups.len()];
-        for (a, b) in links {
-            group_links[a].insert(b);
-            group_links[b].insert(a);
-        }
-
-        Self {
-            restricted: true,
-            group_links,
-            memberships,
-        }
-    }
-
-    pub fn are_linked(&self, a: &[u8; 32], b: &[u8; 32]) -> bool {
-        if a == b || !self.restricted {
-            return true;
-        }
-
-        let Some(a_groups) = self.memberships.get(a) else {
-            return false;
-        };
-        let Some(b_groups) = self.memberships.get(b) else {
-            return false;
-        };
-
-        a_groups.iter().any(|&a_group| {
-            b_groups
-                .iter()
-                .any(|b_group| self.group_links[a_group].contains(b_group))
-        })
     }
 }
 
@@ -576,24 +463,6 @@ impl<'a> PublishedView<'a> {
         self.registry.lookup_address(address)
     }
 
-    pub(crate) fn lookup_key_for(
-        self,
-        caller: &[u8; 32],
-        public_key: &[u8; 32],
-    ) -> Option<&'a PeerRecord> {
-        self.lookup_key(public_key)
-            .filter(|record| self.registry.are_linked(caller, &record.public_key))
-    }
-
-    pub(crate) fn lookup_address_for(
-        self,
-        caller: &[u8; 32],
-        address: IpAddr,
-    ) -> Option<&'a PeerRecord> {
-        self.lookup_address(address)
-            .filter(|record| self.registry.are_linked(caller, &record.public_key))
-    }
-
     pub(crate) fn effective_endpoint(self, record: &PeerRecord) -> Option<SocketAddr> {
         self.observed_endpoints
             .get(&record.public_key)
@@ -609,7 +478,7 @@ impl<'a> PublishedView<'a> {
 #[derive(Debug, Clone)]
 pub struct SharedRegistry {
     current: Arc<RwLock<PublishedRegistry>>,
-    changes: tokio::sync::broadcast::Sender<RegistryEvent>,
+    changes: tokio::sync::broadcast::Sender<RegistryChange>,
     keyed: KeyedDispatcher,
 }
 
@@ -684,13 +553,13 @@ impl SharedRegistry {
                 public_key,
                 kind: RegistryChangeKind::Changed,
             };
-            let _ = self.changes.send(RegistryEvent::Peer(change));
+            let _ = self.changes.send(change);
             self.keyed.dispatch_peer(change);
         }
     }
 
-    /// Subscribe to peer invalidations and group-link policy changes.
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RegistryEvent> {
+    /// Subscribe to peer invalidations.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RegistryChange> {
         self.changes.subscribe()
     }
 
@@ -722,7 +591,6 @@ impl SharedRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old_registry = Arc::clone(&current.registry);
         let old_observed = current.observed_endpoints.clone();
-        let links_changed = old_registry.links != registry.links;
 
         current
             .observed_endpoints
@@ -753,7 +621,7 @@ impl SharedRegistry {
                         || before_endpoint != after_endpoint
                         || before.relay != after.relay
                         || before.persistent_keepalive != after.persistent_keepalive
-                        || before.addresses != after.addresses)
+                        || before.address != after.address)
                         .then_some(RegistryChangeKind::Changed)
                 }
                 (None, None) => None,
@@ -767,15 +635,8 @@ impl SharedRegistry {
         // change. If the observation is later invalidated, fallback must use the
         // newest configuration rather than the snapshot from when it was learned.
         current.registry = Arc::new(registry);
-        // Link-policy changes are ordered before peer invalidations. RPC consumers
-        // close on this event, so they cannot receive a removal/addition key
-        // whose visibility changed in the same atomic configuration reload.
-        if links_changed {
-            let _ = self.changes.send(RegistryEvent::LinksChanged);
-            self.keyed.close_all();
-        }
         for change in changes {
-            let _ = self.changes.send(RegistryEvent::Peer(change));
+            let _ = self.changes.send(change);
             self.keyed.dispatch_peer(change);
         }
     }
@@ -784,10 +645,6 @@ impl SharedRegistry {
 impl Registry {
     /// Index a set of records, rejecting collisions.
     pub fn build(records: Vec<PeerRecord>) -> Result<Self, String> {
-        Self::build_with_links(records, LinkPolicy::allow_all())
-    }
-
-    pub fn build_with_links(records: Vec<PeerRecord>, links: LinkPolicy) -> Result<Self, String> {
         let mut peers: Vec<PeerRecord> = Vec::with_capacity(records.len());
         let mut by_key: HashMap<[u8; 32], usize> = HashMap::new();
         // The API server is allocator-backed through `microtun-std`, so the
@@ -804,22 +661,21 @@ impl Registry {
                     record.public_key_text
                 ));
             }
-            for cidr in &record.addresses {
-                // Overlap is fine and is resolved by longest-prefix match, but
-                // an identical prefix on two peers has no tie-break: the
-                // by-address answer would depend on load order.
-                if let Some(&owner) = routes.get(*cidr) {
-                    return Err(format!(
-                        "peers {} and {} both claim {cidr}",
-                        peers[owner].key_prefix(),
-                        record.key_prefix()
-                    ));
-                }
-                routes
-                    .insert(*cidr, index)
-                    .expect("allocator-backed prefix trie grows on demand");
-                route_count += 1;
+            let cidr = record.address;
+            // Overlap is fine and is resolved by longest-prefix match, but an
+            // identical prefix on two peers has no tie-break: the by-address
+            // answer would depend on load order.
+            if let Some(&owner) = routes.get(cidr) {
+                return Err(format!(
+                    "peers {} and {} both claim {cidr}",
+                    peers[owner].key_prefix(),
+                    record.key_prefix()
+                ));
             }
+            routes
+                .insert(cidr, index)
+                .expect("allocator-backed prefix trie grows on demand");
+            route_count += 1;
             by_key.insert(record.public_key, index);
             peers.push(record);
         }
@@ -829,7 +685,6 @@ impl Registry {
             by_key,
             routes,
             route_count,
-            links,
         })
     }
 
@@ -843,10 +698,6 @@ impl Registry {
     /// Longest prefix wins, matching the route cache on the client side.
     pub fn lookup_address(&self, address: IpAddr) -> Option<&PeerRecord> {
         self.routes.lookup(address).map(|&index| &self.peers[index])
-    }
-
-    pub fn are_linked(&self, a: &[u8; 32], b: &[u8; 32]) -> bool {
-        self.links.are_linked(a, b)
     }
 
     /// Number of configured peers.
@@ -864,16 +715,13 @@ impl Registry {
 pub(crate) mod tests {
     use super::*;
 
-    /// A record with `key`-filled key bytes and the given prefixes.
-    pub(crate) fn record(key: u8, addresses: &[&str]) -> PeerRecord {
+    /// A record with `key`-filled key bytes and the given single prefix.
+    pub(crate) fn record(key: u8, address: &str) -> PeerRecord {
         PeerRecord::new(
             [key; 32],
             None,
             None,
-            addresses
-                .iter()
-                .map(|cidr| cidr.parse().expect("test prefix parses"))
-                .collect(),
+            address.parse().expect("test prefix parses"),
             None,
         )
     }
@@ -888,7 +736,7 @@ pub(crate) mod tests {
             [0xAA; 32],
             Some("203.0.113.5:51820".parse().unwrap()),
             Some([0xCC; 32]),
-            vec!["10.0.0.3/32".parse().unwrap()],
+            "10.0.0.3/32".parse().unwrap(),
             Some(25),
         );
         assert_eq!(
@@ -897,14 +745,14 @@ pub(crate) mod tests {
                 r#"{"public_key":"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=","#,
                 r#""endpoint":"203.0.113.5:51820","#,
                 r#""relay":"zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw=","#,
-                r#""addresses":["10.0.0.3/32"],"persistent_keepalive":25}"#,
+                r#""address":"10.0.0.3/32","persistent_keepalive":25}"#,
             )
         );
     }
 
     #[test]
     fn omits_absent_optional_fields() {
-        let body = body_of(&record(0x01, &["10.0.0.1/32"]));
+        let body = body_of(&record(0x01, "10.0.0.1/32"));
         assert!(!body.contains("endpoint"));
         assert!(!body.contains("relay"));
         assert!(!body.contains("persistent_keepalive"));
@@ -917,25 +765,25 @@ pub(crate) mod tests {
             [0x02; 32],
             Some("[2001:db8::5]:51820".parse().unwrap()),
             None,
-            vec!["fd00::1/128".parse().unwrap()],
+            "fd00::1/128".parse().unwrap(),
             None,
         );
         assert!(body_of(&peer).contains(r#""endpoint":"[2001:db8::5]:51820""#));
     }
 
     #[test]
-    fn several_addresses_are_comma_separated() {
-        let peer = record(0x04, &["10.0.0.1/32", "10.5.0.0/24"]);
-        assert!(body_of(&peer).ends_with(r#""addresses":["10.0.0.1/32","10.5.0.0/24"]}"#));
+    fn serializes_single_address() {
+        let peer = record(0x04, "10.0.0.1/32");
+        assert!(body_of(&peer).ends_with(r#""address":"10.0.0.1/32"}"#));
     }
 
     #[test]
     fn longest_prefix_wins() {
         // 0x01 is the widest prefix, 0x03 the narrowest.
         let registry = Registry::build(vec![
-            record(0x01, &["10.0.0.0/8"]),
-            record(0x02, &["10.1.2.0/24"]),
-            record(0x03, &["10.1.2.7/32"]),
+            record(0x01, "10.0.0.0/8"),
+            record(0x02, "10.1.2.0/24"),
+            record(0x03, "10.1.2.7/32"),
         ])
         .expect("builds");
 
@@ -954,7 +802,7 @@ pub(crate) mod tests {
 
     #[test]
     fn indexes_by_key() {
-        let registry = Registry::build(vec![record(0x01, &["10.0.0.1/32"])]).expect("builds");
+        let registry = Registry::build(vec![record(0x01, "10.0.0.1/32")]).expect("builds");
         assert!(registry.lookup_key(&[0x01; 32]).is_some());
         assert!(registry.lookup_key(&[0x02; 32]).is_none());
         assert_eq!(registry.peer_count(), 1);
@@ -965,9 +813,9 @@ pub(crate) mod tests {
     fn replacement_broadcasts_only_invalidated_peer_keys() {
         let shared = SharedRegistry::new(
             Registry::build(vec![
-                record(0x01, &["10.0.0.1/32"]),
-                record(0x02, &["10.0.0.2/32"]),
-                record(0x03, &["10.0.0.3/32"]),
+                record(0x01, "10.0.0.1/32"),
+                record(0x02, "10.0.0.2/32"),
+                record(0x03, "10.0.0.3/32"),
             ])
             .expect("initial registry builds"),
         );
@@ -975,18 +823,16 @@ pub(crate) mod tests {
 
         shared.replace(
             Registry::build(vec![
-                record(0x01, &["10.0.0.1/32"]),
-                record(0x02, &["10.2.0.0/24"]),
-                record(0x04, &["10.0.0.4/32"]),
+                record(0x01, "10.0.0.1/32"),
+                record(0x02, "10.2.0.0/24"),
+                record(0x04, "10.0.0.4/32"),
             ])
             .expect("replacement registry builds"),
         );
 
         let mut observed = Vec::new();
         while let Ok(event) = changes.try_recv() {
-            if let RegistryEvent::Peer(change) = event {
-                observed.push((change.public_key[0], change.kind));
-            }
+            observed.push((event.public_key[0], event.kind));
         }
         observed.sort_unstable_by_key(|(key, _)| *key);
         assert_eq!(
@@ -1000,9 +846,9 @@ pub(crate) mod tests {
 
         shared.replace(
             Registry::build(vec![
-                record(0x01, &["10.0.0.1/32"]),
-                record(0x02, &["10.2.0.0/24"]),
-                record(0x04, &["10.0.0.4/32"]),
+                record(0x01, "10.0.0.1/32"),
+                record(0x02, "10.2.0.0/24"),
+                record(0x04, "10.0.0.4/32"),
             ])
             .expect("identical registry builds"),
         );
@@ -1012,48 +858,13 @@ pub(crate) mod tests {
         ));
     }
 
-    #[test]
-    fn link_policy_change_is_broadcast_before_peer_keys() {
-        let shared = SharedRegistry::new(
-            Registry::build(vec![
-                record(0x01, &["10.0.0.1/32"]),
-                record(0x02, &["10.0.0.2/32"]),
-            ])
-            .unwrap(),
-        );
-        let mut changes = shared.subscribe();
-        let keyed = shared.subscribe_keyed([0x01; 32]);
-        shared.read(|_| keyed.watch([0x02; 32]));
-
-        shared.replace(
-            Registry::build_with_links(
-                vec![record(0x01, &["10.0.0.1/32"])],
-                LinkPolicy::from_groups_and_links(Vec::new(), Vec::new()),
-            )
-            .unwrap(),
-        );
-
-        assert_eq!(changes.try_recv().unwrap(), RegistryEvent::LinksChanged);
-        assert!(matches!(
-            changes.try_recv().unwrap(),
-            RegistryEvent::Peer(RegistryChange {
-                public_key,
-                kind: RegistryChangeKind::Removed,
-            }) if public_key == [0x02; 32]
-        ));
-        assert!(
-            keyed.queue.is_closed(),
-            "link-policy changes must close remote keyed subscriptions"
-        );
-    }
-
     #[tokio::test]
     async fn keyed_dispatch_wakes_only_watchers_and_unwatch_removes_interest() {
         let shared = SharedRegistry::new(
             Registry::build(vec![
-                record(0x01, &["10.0.0.1/32"]),
-                record(0x02, &["10.0.0.2/32"]),
-                record(0x03, &["10.0.0.3/32"]),
+                record(0x01, "10.0.0.1/32"),
+                record(0x02, "10.0.0.2/32"),
+                record(0x03, "10.0.0.3/32"),
             ])
             .unwrap(),
         );
@@ -1100,7 +911,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn keyed_dispatch_coalesces_repeated_changes_per_key() {
         let shared =
-            SharedRegistry::new(Registry::build(vec![record(0x01, &["10.0.0.1/32"])]).unwrap());
+            SharedRegistry::new(Registry::build(vec![record(0x01, "10.0.0.1/32")]).unwrap());
         // Use a caller distinct from the watched key so a Removed transition
         // tests coalescing rather than caller-deadmission closure.
         let subscription = shared.subscribe_keyed([0x02; 32]);
@@ -1132,8 +943,8 @@ pub(crate) mod tests {
     async fn unwatch_discards_a_pending_invalidation_for_that_key() {
         let shared = SharedRegistry::new(
             Registry::build(vec![
-                record(0x01, &["10.0.0.1/32"]),
-                record(0x02, &["10.0.0.2/32"]),
+                record(0x01, "10.0.0.1/32"),
+                record(0x02, "10.0.0.2/32"),
             ])
             .unwrap(),
         );
@@ -1156,7 +967,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn removing_the_caller_closes_keyed_subscription_without_self_watch() {
         let shared =
-            SharedRegistry::new(Registry::build(vec![record(0x01, &["10.0.0.1/32"])]).unwrap());
+            SharedRegistry::new(Registry::build(vec![record(0x01, "10.0.0.1/32")]).unwrap());
         let subscription = shared.subscribe_keyed([0x01; 32]);
         shared.keyed.dispatch_peer(RegistryChange {
             public_key: [0x01; 32],
@@ -1176,7 +987,7 @@ pub(crate) mod tests {
                 key,
                 Some(endpoint),
                 None,
-                vec!["10.0.0.5/32".parse().unwrap()],
+                "10.0.0.5/32".parse().unwrap(),
                 None,
             )
         };
@@ -1217,9 +1028,7 @@ pub(crate) mod tests {
             published.effective_endpoint(record)
         });
         assert_eq!(effective, Some(roamed));
-        let RegistryEvent::Peer(change) = changes.try_recv().unwrap() else {
-            panic!("expected peer change");
-        };
+        let change = changes.try_recv().unwrap();
         assert_eq!(change.public_key, key);
         assert_eq!(change.kind, RegistryChangeKind::Changed);
     }
@@ -1234,7 +1043,7 @@ pub(crate) mod tests {
                 key,
                 Some(configured),
                 None,
-                vec!["10.0.0.6/32".parse().unwrap()],
+                "10.0.0.6/32".parse().unwrap(),
                 None,
             )
         };
@@ -1253,15 +1062,15 @@ pub(crate) mod tests {
     #[test]
     fn rejects_collisions() {
         let error = Registry::build(vec![
-            record(0x01, &["10.0.0.1/32"]),
-            record(0x01, &["10.0.0.2/32"]),
+            record(0x01, "10.0.0.1/32"),
+            record(0x01, "10.0.0.2/32"),
         ])
         .expect_err("duplicate key");
         assert!(error.contains("share the public key"), "{error}");
 
         let error = Registry::build(vec![
-            record(0x01, &["10.0.0.0/24"]),
-            record(0x02, &["10.0.0.0/24"]),
+            record(0x01, "10.0.0.0/24"),
+            record(0x02, "10.0.0.0/24"),
         ])
         .expect_err("duplicate prefix");
         assert!(error.contains("both claim 10.0.0.0/24"), "{error}");

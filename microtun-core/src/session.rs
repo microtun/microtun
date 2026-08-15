@@ -3,10 +3,10 @@
 use zeroize::Zeroize;
 
 use crate::{
-    constants::{REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME},
+    constants::{REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME, REKEY_AFTER_TIME},
     noise::TransportKeys,
     replay::ReplayWindow,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Handle into the session slot pool.
@@ -45,6 +45,17 @@ pub struct Session<const REPLAY_WORDS: usize> {
     pub role: Role,
     /// Session age is measured from transport-key derivation (§6.1).
     pub created: Instant,
+    /// Session age at which the initiator begins a rekey.
+    ///
+    /// Per-session rather than the bare [`REKEY_AFTER_TIME`] constant so a
+    /// fleet that established every one of its sessions inside the same
+    /// second does not then rekey inside the same second forever. Sampled in
+    /// `REKEY_AFTER_TIME - REKEY_AFTER_TIME_JITTER_MAX ..= REKEY_AFTER_TIME`
+    /// by the core, which owns the CSPRNG; see
+    /// [`crate::constants::REKEY_AFTER_TIME_JITTER_MAX`]. Defaults to the
+    /// unjittered constant so a session built without an explicit value is
+    /// never *less* conservative than the whitepaper requires.
+    pub rekey_after: Duration,
     /// A responder session is unconfirmed ("next" slot, §6.3) until the
     /// first valid transport message arrives from the initiator.
     pub confirmed: bool,
@@ -81,9 +92,22 @@ impl<const REPLAY_WORDS: usize> Session<REPLAY_WORDS> {
             remote_index,
             role,
             created: now,
+            rekey_after: REKEY_AFTER_TIME,
             confirmed: role == Role::Initiator,
             rekey_triggered: false,
         }
+    }
+
+    /// Session age at which this session's initiator should rekey, clamped so
+    /// a nonsensical override can never push the rekey past the point where
+    /// the session is refused outright (§6.2).
+    pub fn rekey_deadline(&self) -> Instant {
+        let after = if self.rekey_after < REJECT_AFTER_TIME {
+            self.rekey_after
+        } else {
+            REKEY_AFTER_TIME
+        };
+        self.created + after
     }
 
     /// §6.2: refuse to send or receive past `Reject-After-Time` or

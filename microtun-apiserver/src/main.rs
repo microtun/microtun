@@ -1,9 +1,10 @@
 //! microtun Peers API server.
 //!
-//! Answers the two resolver lookups from a `wg.conf`-shaped configuration file
-//! listing every peer in the network — a `[Server]` section for this server,
-//! one named `[Peer.name]` section per peer, optional `[Group.name]` membership
-//! sections, and `[Link.name]` relationship sections:
+//! Answers the two resolver lookups from `[Microtun]` and `[Tunnel]` base
+//! sections followed by repeated `[Peer]` sections.
+//! The server's own peer identity and address come from `[Tunnel]`; its record
+//! deliberately has no advertised outer endpoint. The API server owns these
+//! config types and parses them with `microtun-ini`.
 //!
 //! ```bash
 //! microtun-apiserver /etc/microtun/apiserver.conf
@@ -27,8 +28,8 @@
 //! observations learned by the running tunnel. Learned endpoints override
 //! configured `Endpoint` values for the same key. The file is checked for
 //! changes once a second; a successful reload updates future answers without
-//! tearing down existing peers or sessions. Server identity, UDP listen
-//! address, tunnel addresses, and relay-forwarding policy still require a
+//! tearing down existing peers or sessions. Tunnel identity, UDP listen port,
+//! tunnel MTU, tunnel address, and relay-forwarding policy still require a
 //! restart.
 
 mod config;
@@ -51,6 +52,14 @@ use crate::{
 };
 
 /// Listener backlog for the virtual TCP stack.
+///
+/// This is not a queue depth: `SmolTcpStack::listen` creates one real smoltcp
+/// socket per backlog slot, each carrying its own send and receive buffers,
+/// and `harvest_accepts` replenishes one for every connection it promotes. So
+/// this many sockets exist from startup, idle, forever. At the previous 16 KiB
+/// buffer sizing that was 2 MiB of eagerly-zeroed memory on a server with no
+/// peers; at the current 4 KiB it is 512 KiB, which is a defensible price for
+/// absorbing a whole fleet's reconnect spike without dropping SYNs.
 const ACCEPT_BACKLOG: usize = 64;
 /// The Peers API's fixed port inside the tunnel.
 ///
@@ -83,7 +92,7 @@ impl TunnelObserver for LearnedEndpointObserver {
 
 #[derive(Debug, Parser)]
 #[command(
-    about = "Serves the microtun Peers API from a wg.conf-style list of network peers",
+    about = "Serves the microtun Peers API from an extended microtun device configuration",
     version
 )]
 struct Args {
@@ -124,32 +133,31 @@ async fn serve(config_path: &std::path::Path, loaded: config::Loaded) -> Result<
     let fixed_server = resolver::FixedServer::from_loaded(&loaded)?;
     let config::Loaded { options, registry } = loaded;
 
-    let server_addresses = registry
+    let server_address = registry
         .lookup_key(&options.public_key)
         .ok_or_else(|| "Peers API server record is missing from its own registry".to_string())?
-        .addresses
-        .clone();
+        .address;
 
     let state = AppState::new(registry);
     let shared_registry = state.registry();
 
-    let (nic, stack) = SmolTcpNic::new(server_addresses.iter().copied());
+    let (nic, stack) = SmolTcpNic::new([options.tunnel_address], usize::from(options.mtu));
     let listener = stack
         .listen(RPC_PORT, ACCEPT_BACKLOG)
         .map_err(|error| format!("cannot listen on virtual port {RPC_PORT}: {error}"))?;
-    let mut runner = TunnelRunner::bind(
+    let runner = TunnelRunner::bind(
         TunnelConfig::new(options.private_key, &[]),
         rand::rngs::OsRng,
         nic,
         options.listen,
+        options.enable_forwarding,
     )
     .await
     .map_err(|error| format!("cannot bind tunnel on {}: {error}", options.listen))?
     .with_observer(LearnedEndpointObserver {
         registry: shared_registry.clone(),
     });
-    runner.enable_forwarding(options.relay_forwarding);
-    if options.relay_forwarding {
+    if options.enable_forwarding {
         tracing::warn!("relay forwarding enabled");
     }
 
@@ -158,15 +166,12 @@ async fn serve(config_path: &std::path::Path, loaded: config::Loaded) -> Result<
     let routes = config_snapshot.route_count();
 
     tracing::info!(
+        tunnel.mtu = options.mtu,
         "serving {} as {} on virtual port {} at {} via UDP {}: {peers} peers, {routes} routes",
         config_path.display(),
         encode_key(&options.public_key),
         RPC_PORT,
-        server_addresses
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", "),
+        server_address,
         options.listen,
     );
 

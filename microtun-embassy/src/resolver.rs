@@ -33,18 +33,60 @@ use microtun_api::{
 use microtun_core::{PeerUpdate, ResolveOutcome, ResolveQuery, ResolverCommand, ResolverEvent};
 use microtun_jsonrpc::Error as RpcError;
 
-const TCP_CONNECT_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(5);
-const REQUEST_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(15);
+/// Transport budget for one lookup.
+///
+/// These must fit inside the core's `resolve_timeout`, and they did not: a
+/// five-second connect plus a fifteen-second request is a twenty-second worst
+/// case against a ten-second deadline. The core reclaims the resolve entry at
+/// its deadline and then *ignores the answer* as a stale request identifier,
+/// having already dropped the parked initiation — so on a marginal link the
+/// device completed the whole round trip and threw the result away, and
+/// connection setup simply never finished while the resolver appeared
+/// healthy.
+///
+/// The core's deadline is deliberately `2 × REKEY_TIMEOUT` so a throttled
+/// lookup is retried by the initiator's own retransmission rather than
+/// waited on, so the transport is what gives way here. Connect plus request
+/// now totals nine seconds, leaving margin under the ten-second deadline for
+/// the event to be dequeued and applied.
+const TCP_CONNECT_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(3);
+const REQUEST_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(6);
 const TCP_KEEP_ALIVE: embassy_time::Duration = embassy_time::Duration::from_secs(15);
 const TCP_IDLE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(45);
 /// Base reconnect delay, spread over `[500ms, 1500ms)` by the resolver's
 /// jitter. A Peers API server restart drops every client at once, so an unjittered
 /// delay would reconnect the whole fleet in one spike.
 const RECONNECT_DELAY_MS: u32 = 1_000;
-/// The embassy runner currently supports eight peers total, so this covers
-/// every possible dynamic peer and one queued invalidation per peer.
-const MAX_HELD_PEERS: usize = 8;
-const CHANNEL_DEPTH: usize = 16;
+/// One watch entry per peer the runner can hold, plus one queued
+/// invalidation each.
+///
+/// Derived from the runner's capacity rather than restated, because a
+/// mismatch is silent: `HeldSet` is fixed-capacity, so a peer beyond this
+/// bound simply fails to register its subscription and then never learns
+/// that its record changed. Stale forever, with no error anywhere.
+const MAX_HELD_PEERS: usize = crate::MAX_PEERS;
+
+/// Depth of the command and event channels between the tunnel task and this
+/// one.
+///
+/// The core can have `max_inflight_resolves` lookups outstanding, and every
+/// one of them has to fit through this channel, so the channel is the real
+/// bound on resolver concurrency whenever it is the smaller of the two. The
+/// assertion below ties it to [`crate::INFLIGHT_RESOLVES`], the value
+/// this crate injects, so the relationship cannot drift the next time either
+/// number is tuned.
+///
+/// Public because firmware has to declare the backing
+/// [`embassy_sync::channel::Channel`] itself, and a channel of a different
+/// depth simply will not coerce to [`CommandSender`] / [`EventReceiver`]. It
+/// is exported so that constraint is expressed once here rather than
+/// restated as a literal in every board's `main.rs`.
+pub const CHANNEL_DEPTH: usize = 16;
+
+const _: () = assert!(
+    CHANNEL_DEPTH >= crate::INFLIGHT_RESOLVES,
+    "resolver channel depth must be able to carry every in-flight core resolve"
+);
 
 /// Commands from the tunnel loop to the resolver task.
 pub type CommandSender<'a> = Sender<'a, CriticalSectionRawMutex, ResolverCommand, CHANNEL_DEPTH>;

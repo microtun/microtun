@@ -18,40 +18,36 @@ use embassy_net_driver_channel::Runner as ChannelRunner;
 use embassy_time::{Instant as EmbassyInstant, Timer};
 use heapless::Deque;
 use microtun_core::{
-    Config, Core, Event, Instant, ResolveRequest, ResolverCommand, Sink, StaticRelayPolicy,
-    ip::unmap_socket_addr,
+    Config, Core, CoreConfig, Event, Instant, ResolveRequest, ResolverCommand, Sink,
+    StaticRelayPolicy, ip::unmap_socket_addr,
 };
 use rand_core::{CryptoRng, RngCore};
 
-use crate::resolver::{CommandSender, EventReceiver};
-
-/// Tunnel (inner) MTU. 1280 is the IPv6 minimum link MTU and leaves ample
-/// headroom for the outer transport and optional relay envelope.
-pub const MTU: usize = 1280;
+use crate::{
+    FIREWALL_FLOW_ENTRIES, FIREWALL_FLOWS_PER_PEER, INFLIGHT_RESOLVES, MAX_PEERS, MAX_ROUTES,
+    MAX_SESSIONS, MTU, PEER_EVICTION_GHOSTS, PEER_EVICTION_INTERVAL, RATE_LIMIT_BURST,
+    RATE_LIMIT_ENTRIES, RATE_LIMIT_PER_SEC, REPLAY_WORDS, UNDER_LOAD_HANDSHAKES_PER_SEC,
+    resolver::{CommandSender, EventReceiver},
+};
 
 /// Maximum encrypted outer UDP payload.
 pub const OUTER_SIZE: usize = microtun_core::MAX_UDP_SIZE;
 
-/// Embedded peer/session/replay/route capacities.
-pub const MAX_PEERS: usize = 8;
-pub const MAX_SESSIONS: usize = 8;
-/// Replay bitmap words per established session.
-pub const REPLAY_WORDS: usize = 128;
-pub const MAX_ROUTES: usize = 16;
-
-/// Embedded post-cookie handshake rate limit. The core defaults match
-/// wireguard-go; constrained embassy targets retain the project's tighter
-/// sustained and burst policy through `CoreConfig`.
-const RATE_LIMIT_PER_SEC: u32 = 2;
-const RATE_LIMIT_BURST: u32 = 4;
-
-/// Keep Embassy's active-table policy embedded-sized even when the optional
-/// `alloc` backend moves the storage itself to the heap. `microtun-core/alloc`
-/// deliberately has host-sized defaults; forwarding that feature must not turn
-/// a small MCU into a host-sized deployment.
-const RATE_LIMIT_ENTRIES: usize = 64;
-const FIREWALL_FLOW_ENTRIES: usize = 16;
-const FIREWALL_FLOWS_PER_PEER: usize = 8;
+/// Runtime policy for a constrained embassy target.
+pub fn embedded_core_config() -> CoreConfig {
+    CoreConfig {
+        rate_limit_per_sec: RATE_LIMIT_PER_SEC,
+        rate_limit_burst: RATE_LIMIT_BURST,
+        rate_limit_entries: RATE_LIMIT_ENTRIES,
+        under_load_handshakes_per_sec: UNDER_LOAD_HANDSHAKES_PER_SEC,
+        firewall_flow_entries: FIREWALL_FLOW_ENTRIES,
+        firewall_flows_per_peer: FIREWALL_FLOWS_PER_PEER,
+        peer_eviction_interval: PEER_EVICTION_INTERVAL,
+        peer_eviction_ghost_entries: PEER_EVICTION_GHOSTS,
+        max_inflight_resolves: INFLIGHT_RESOLVES,
+        ..CoreConfig::default()
+    }
+}
 
 /// The concrete core type this runner drives.
 pub type TunnelCore<RNG> =
@@ -176,7 +172,6 @@ pub struct TunnelRunner<'a, RNG: RngCore + CryptoRng> {
     engine: TunnelCore<RNG>,
     device: ChannelRunner<'a, MTU>,
     listen_port: u16,
-    forwarding: bool,
 }
 
 impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
@@ -185,31 +180,28 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
         rng: RNG,
         device: ChannelRunner<'a, MTU>,
         listen_port: u16,
+        enable_forwarding: bool,
         now: Instant,
     ) -> Result<Self, microtun_core::Error> {
-        // Tighten up the rate limits on embedded targets.
-        config.core_config.rate_limit_per_sec = RATE_LIMIT_PER_SEC;
-        config.core_config.rate_limit_burst = RATE_LIMIT_BURST;
-        config.core_config.rate_limit_entries = RATE_LIMIT_ENTRIES;
-        config.core_config.firewall_flow_entries = FIREWALL_FLOW_ENTRIES;
-        config.core_config.firewall_flows_per_peer = FIREWALL_FLOWS_PER_PEER;
+        if config.core_config == CoreConfig::default() {
+            config.core_config = embedded_core_config();
+        }
 
         info!(
             "creating embassy tunnel runner: listen_port={}",
             listen_port
         );
+
         Ok(Self {
-            engine: Core::new(config, rng, StaticRelayPolicy::DenyAll, now)?,
+            engine: Core::new(
+                config,
+                rng,
+                StaticRelayPolicy::forwarding(enable_forwarding),
+                now,
+            )?,
             device,
             listen_port,
-            forwarding: false,
         })
-    }
-
-    /// Opt in to forwarding type-5 relay packets between authenticated peers.
-    pub fn enable_forwarding(&mut self, enabled: bool) {
-        self.forwarding = enabled;
-        info!("relay forwarding configured: enabled={}", enabled);
     }
 
     pub fn public_key(&self) -> [u8; 32] {
@@ -249,10 +241,8 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
         let mut pending_forgets = Deque::<[u8; 32], MAX_PEERS>::new();
         // Split the borrow once: the device is both an awaited event source
         // and a sink destination, so it cannot live inside a long-lived sink.
-        let forwarding = self.forwarding;
         let engine = &mut self.engine;
         let device = &mut self.device;
-        *engine.relay_policy_mut() = StaticRelayPolicy::forwarding(forwarding);
 
         loop {
             let poll_deadline = engine.poll_at();

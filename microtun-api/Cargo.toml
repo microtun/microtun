@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
 microtun-core = { workspace = true }
 heapless = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
@@ -32,7 +33,6 @@ tokio-client = [
     "dep:rand",
     "microtun-jsonrpc/tokio",
 ]
-# Forwarded to `microtun-core`: decoded peer records use heap storage. The
-# owned wire shape stays inline either way, since it is bounded by
-# `MAX_PEER_ADDRESSES` regardless of backend.
+# Forwarded to `microtun-core` for host integrations that use its allocator-
+# backed peer/session/route storage. The owned wire record remains inline.
 alloc = ["microtun-core/alloc"]

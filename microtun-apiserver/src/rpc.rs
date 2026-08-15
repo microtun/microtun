@@ -13,15 +13,15 @@
 //! `{"not_found":{}}`. Nothing else is an authoritative lookup result.
 //!
 //! Ordinary lookups are side-effect free. `v1.peer.watch` atomically registers
-//! a visible key in a server-side keyed dispatch index and returns its current
+//! a configured key in a server-side keyed dispatch index and returns its current
 //! record. Config reloads and authenticated endpoint observations dispatch
 //! `v1.peer.changed` / `v1.peer.removed` only to connections watching the
 //! changed key. A client confirms either invalidation with ordinary
 //! `v1.peer.by_key`, and `v1.peer.unwatch` drops interest.
 //!
 //! Each connection has a coalescing pending-key queue. Reconnect re-establishes
-//! watches for the peer keys the client still holds. Group-link changes and
-//! removal of the caller close subscriptions so reconnect can reconcile policy.
+//! watches for the peer keys the client still holds. Removal of the caller closes
+//! the subscription so reconnect can re-establish admission and watches.
 //!
 //! Because notifications carry no peer record and only trigger a fresh lookup,
 //! they cannot directly install stale state. The server therefore owes no
@@ -57,11 +57,10 @@
 //! returns a transient JSON-RPC error rather than the authoritative `not_found`
 //! sentinel, so overload cannot poison a client's negative cache.
 //!
-//! # `not_found` describes the caller's visible registry
+//! # `not_found` describes the shared registry
 //!
-//! `{"not_found":{}}` means exactly one thing: *the caller has no visible
-//! record for the target it named*. An absent record and a record hidden by group
-//! access are deliberately indistinguishable. The client treats the result as authoritative, negative
+//! `{"not_found":{}}` means exactly one thing: *the registry has no record for
+//! the target it named*. The client treats the result as authoritative, negative
 //! caches it, and — on a refresh for a record it already holds — deletes that
 //! record. So the sentinel must be reserved for statements about the target,
 //! and three other outcomes that are not such statements answer differently:
@@ -79,9 +78,8 @@
 //! * **Overload.** Answered [`microtun_api::ERROR_RATE_LIMITED`].
 //!
 //! All three are transient in the client's classification, so an installed
-//! record survives them. What remains indistinguishable is what the enumeration
-//! argument actually covers: an unknown key, an unclaimed address, and a
-//! configured-but-hidden peer are the same miss.
+//! record survives them. An unknown key and an unclaimed address are the same
+//! authoritative miss.
 //!
 //! Reload failures likewise keep serving the previous validated snapshot rather
 //! than briefly turning every record into a miss.
@@ -120,7 +118,7 @@ use crate::registry::{
 /// configured, authenticated tunnel key. Multiple connections are useful for
 /// reconnect overlap, but an unbounded number multiplies subscription and refresh
 /// work during registry churn.
-const MAX_CONNECTIONS_PER_PEER: usize = 4;
+pub(crate) const MAX_CONNECTIONS_PER_PEER: usize = 4;
 /// Sustained Peers API request budget per configured, authenticated tunnel key.
 const REQUESTS_PER_SEC: u32 = 20;
 /// Short request bursts allowed before the sustained budget takes effect.
@@ -406,8 +404,7 @@ impl AppState {
         let count = self.refused.fetch_add(1, Ordering::Relaxed) + 1;
         if count == 1 {
             tracing::warn!(
-                "refusing a Peers API operation from authenticated peer {}: it has no [Server] or \
-                 [Peer.name] record. It can open a tunnel session but cannot resolve",
+                "refusing a Peers API operation from authenticated peer {}: it has no peer registry record. It can open a tunnel session but cannot resolve",
                 encode_key(&source)
             );
         } else {
@@ -454,9 +451,9 @@ enum Lookup<'a> {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum Answer {
-    /// The caller may observe this registry record.
+    /// The registry contains this record.
     Record(PeerInfo),
-    /// The caller authoritatively has no visible record for the target.
+    /// The registry authoritatively has no record for the target.
     Miss,
     /// The caller's own key has no registry record.
     NotAdmitted,
@@ -490,14 +487,13 @@ impl PeersApiHandler {
                     let Ok(key) = decode_key(text) else {
                         return Answer::BadArgument;
                     };
-                    published.lookup_key_for(&self.peer_key, &key)
+                    published.lookup_key(&key)
                 }
                 Lookup::Address(text) => {
                     let Ok(address) = text.parse::<IpAddr>() else {
                         return Answer::BadArgument;
                     };
-                    published
-                        .lookup_address_for(&self.peer_key, microtun_api::unmap_address(address))
+                    published.lookup_address(microtun_api::unmap_address(address))
                 }
             };
             match record {
@@ -507,7 +503,7 @@ impl PeersApiHandler {
         })
     }
 
-    /// Subscribe to one visible peer and return the snapshot protected by that
+    /// Subscribe to one peer and return the snapshot protected by that
     /// subscription.
     ///
     /// Registration happens while the shared registry read lock is held. A
@@ -521,7 +517,7 @@ impl PeersApiHandler {
             let Ok(public_key) = decode_key(text) else {
                 return Answer::BadArgument;
             };
-            let Some(record) = published.lookup_key_for(&self.peer_key, &public_key) else {
+            let Some(record) = published.lookup_key(&public_key) else {
                 // If this was an idempotent re-watch of a key that has since
                 // disappeared, do not leave stale interest indexed forever.
                 self.subscription.unwatch(public_key);
@@ -651,8 +647,8 @@ fn admit<'a>(state: &AppState, registry: &'a Registry, source: [u8; 32]) -> Opti
 
 /// The authoritative miss.
 ///
-/// An unknown key, an address nobody claims, and a group-hidden peer are the
-/// same `{"not_found":{}}` and are meant to be indistinguishable. An unadmitted
+/// An unknown key and an address nobody claims are the same `{"not_found":{}}`.
+/// An unadmitted
 /// caller, an undecodable argument, and an overloaded server are *not* misses
 /// and never reach here; see the module header.
 fn miss(responder: Responder<'_>) -> Reply {
@@ -740,9 +736,8 @@ where
                         }
                     }
                     None => {
-                        // Link-policy changes and caller removal close the keyed
-                        // subscription. Reconnect replay re-establishes watches
-                        // only for records the client still holds.
+                        // Caller removal closes the keyed subscription. Reconnect
+                        // replay re-establishes watches only after admission.
                         reader_task.abort();
                         return;
                     }
@@ -790,7 +785,7 @@ mod tests {
     use super::*;
     use crate::config::{
         self,
-        tests::{SERVER_PRIVATE, server_public},
+        tests::{server_config, server_public},
     };
 
     const GATEWAY_KEY: [u8; 32] = [0xAA; 32];
@@ -835,31 +830,10 @@ mod tests {
     /// laptop owns the /24 around them, so longest-prefix behavior is exercised
     /// — and so a source-address attribution would get the laptop wrong.
     fn config_text() -> String {
-        let server_key = encode_key(&server_public());
         format!(
-            "\
-[Server]
-PrivateKey = {SERVER_PRIVATE}
-ListenPort = 51820
-Endpoint = 203.0.113.10:51820
-Addresses = 10.0.0.9/32
-
-[Peer.gateway]
-PublicKey = {GATEWAY}
-Endpoint = 198.51.100.20:51820
-Addresses = 10.0.0.1/32, 10.5.0.0/24
-
-[Peer.laptop]
-PublicKey = {LAPTOP}
-Addresses = 10.0.0.0/24
-Relay = gateway
-
-[Group.test-mesh]
-Peers = gateway, laptop, {server_key}
-
-[Link.test-mesh]
-Groups = test-mesh
-"
+            "{}[Peer]\nName = gateway\nPublicKey = {GATEWAY}\nEndpoint = 198.51.100.20:51820\nAddress = 10.0.0.1/32\n\n\
+             [Peer]\nName = laptop\nPublicKey = {LAPTOP}\nAddress = 10.0.0.0/24\nRelay = gateway\n",
+            server_config("10.0.0.9/32")
         )
     }
 
@@ -978,12 +952,13 @@ Groups = test-mesh
         assert_eq!(record.endpoint.as_deref(), Some("198.51.100.20:51820"));
 
         // The Peers API server's own record is keyed by the key derived from
-        // [Server] PrivateKey.
+        // Tunnel.PrivateKey.
         let server_text = encode_key(&server_public());
         let record = by_key(&state, LAPTOP_KEY, server_text.as_str())
             .await
             .expect("the server has its own record");
         assert_eq!(record.public_key.as_str(), server_text.as_str());
+        assert_eq!(record.endpoint, None);
 
         // A well-formed key nobody holds is the authoritative miss.
         assert!(by_key(&state, LAPTOP_KEY, ABSENT).await.is_none());
@@ -1008,95 +983,18 @@ Groups = test-mesh
     }
 
     #[tokio::test]
-    async fn link_policy_hides_peers_by_key_and_address() {
-        let text = format!(
-            "\
-[Server]
-PrivateKey = {SERVER_PRIVATE}
-Addresses = 10.0.0.9/32
+    async fn every_admitted_peer_can_resolve_every_other_peer() {
+        let state = app_state();
+        assert!(by_key(&state, LAPTOP_KEY, GATEWAY).await.is_some());
+        assert!(by_address(&state, "10.0.0.1").await.is_some());
 
-[Peer.gateway]
-PublicKey = {GATEWAY}
-Endpoint = 198.51.100.20:51820
-Addresses = 10.0.0.1/32
-
-[Peer.laptop]
-PublicKey = {LAPTOP}
-Addresses = 10.0.0.5/32
-
-[Group.clients]
-Peers = laptop
-
-[Group.gateways]
-Peers = gateway
-"
+        let server_text = encode_key(&server_public());
+        assert!(by_key(&state, GATEWAY_KEY, LAPTOP).await.is_some());
+        assert!(
+            by_key(&state, GATEWAY_KEY, server_text.as_str())
+                .await
+                .is_some()
         );
-        let loaded =
-            config::parse(&text, Path::new("test.conf")).expect("link-policy config loads");
-        let state = AppState::new(loaded.registry);
-
-        assert!(by_key(&state, LAPTOP_KEY, LAPTOP).await.is_some());
-        assert!(by_key(&state, LAPTOP_KEY, GATEWAY).await.is_none());
-        assert!(by_address(&state, "10.0.0.1").await.is_none());
-        assert!(by_address(&state, "10.0.0.5").await.is_some());
-    }
-
-    #[tokio::test]
-    async fn hidden_peer_changes_are_not_dispatched() {
-        let text = format!(
-            "\
-[Server]
-PrivateKey = {SERVER_PRIVATE}
-Addresses = 10.0.0.9/32
-
-[Peer.gateway]
-PublicKey = {GATEWAY}
-Endpoint = 198.51.100.20:51820
-Addresses = 10.0.0.1/32
-
-[Peer.laptop]
-PublicKey = {LAPTOP}
-Addresses = 10.0.0.5/32
-
-[Group.clients]
-Peers = laptop
-
-[Group.gateways]
-Peers = gateway
-"
-        );
-        let loaded = config::parse(&text, Path::new("test.conf")).expect("initial config loads");
-        let state = AppState::new(loaded.registry);
-        let (client, server) = tokio::io::duplex(8192);
-        tokio::spawn(serve_connection(server, Arc::clone(&state), LAPTOP_KEY));
-
-        let (reader, writer) = tokio::io::split(client);
-        let (changed_tx, mut changed_rx) = mpsc::unbounded_channel();
-        let mut connection: RpcConnection<_, _, _, RECORD_FRAME_LEN, QUERY_FRAME_LEN> =
-            RpcConnection::from_tokio(reader, writer, CaptureInvalidation(changed_tx));
-
-        // A hidden target is an authoritative miss and, importantly, does not
-        // get inserted into the keyed watch index.
-        let hidden: LookupResult = connection
-            .call(
-                METHOD_WATCH,
-                Some(&KeyParams {
-                    public_key: GATEWAY,
-                }),
-            )
-            .await
-            .expect("hidden watch completes");
-        assert!(found(hidden).is_none());
-
-        let replacement = text.replace("198.51.100.20:51820", "198.51.100.99:51820");
-        let loaded =
-            config::parse(&replacement, Path::new("test.conf")).expect("replacement config loads");
-        state.registry().replace(loaded.registry);
-
-        let poll =
-            tokio::time::timeout(std::time::Duration::from_millis(50), connection.poll()).await;
-        assert!(poll.is_err(), "hidden peer change produced a notification");
-        assert!(changed_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1129,7 +1027,7 @@ Peers = gateway
         let record = by_address(&state, "10.0.0.5").await.expect("laptop");
         assert_eq!(record.public_key.as_str(), LAPTOP);
 
-        // 10.0.0.9/32 from [Server] also beats the laptop's /24.
+        // 10.0.0.9/32 from the server's [Tunnel] record also beats the laptop's /24.
         let record = by_address(&state, "10.0.0.9").await.expect("server");
         assert_eq!(
             record.public_key.as_str(),
@@ -1175,7 +1073,7 @@ Peers = gateway
         assert_eq!(peer.public_key, GATEWAY_KEY);
         assert_eq!(peer.endpoint, Some("198.51.100.20:51820".parse().unwrap()));
         assert_eq!(peer.relay, None);
-        assert_eq!(peer.addresses.len(), 2);
+        assert_eq!(peer.address, "10.0.0.1/32".parse().unwrap());
 
         let record = by_key(&state, LAPTOP_KEY, LAPTOP).await.expect("laptop");
         let peer = microtun_api::decode_peer(&record).expect("client codec decodes");
@@ -1188,7 +1086,7 @@ Peers = gateway
         let queried: IpAddr = "10.0.0.5".parse().unwrap();
         let record = by_address(&state, "10.0.0.5").await.expect("laptop");
         let peer = microtun_api::decode_peer(&record).expect("client codec decodes");
-        assert!(peer.addresses.iter().any(|cidr| cidr.contains(&queried)));
+        assert!(peer.address.contains(&queried));
     }
 
     #[tokio::test]
@@ -1317,16 +1215,13 @@ Peers = gateway
     /// current registry state.
     #[tokio::test]
     async fn removal_is_a_removed_notification_and_then_a_not_found_lookup() {
-        // This test is about the RPC invalidation protocol, not config-file
-        // visibility defaults. Use an explicitly unrestricted registry so
-        // removing the gateway does not also change the link policy and close
-        // the connection before the key-only removal notification is sent.
+        // This test is about the RPC invalidation protocol.
         let server_record = || {
             PeerRecord::new(
                 server_public(),
                 Some("203.0.113.10:51820".parse().unwrap()),
                 None,
-                vec!["10.0.0.9/32".parse().unwrap()],
+                "10.0.0.9/32".parse().unwrap(),
                 None,
             )
         };
@@ -1335,7 +1230,7 @@ Peers = gateway
                 LAPTOP_KEY,
                 None,
                 Some(server_public()),
-                vec!["10.0.0.0/24".parse().unwrap()],
+                "10.0.0.0/24".parse().unwrap(),
                 None,
             )
         };
@@ -1343,10 +1238,7 @@ Peers = gateway
             GATEWAY_KEY,
             Some("198.51.100.20:51820".parse().unwrap()),
             None,
-            vec![
-                "10.0.0.1/32".parse().unwrap(),
-                "10.5.0.0/24".parse().unwrap(),
-            ],
+            "10.0.0.1/32".parse().unwrap(),
             None,
         );
         let state = AppState::new(
@@ -1372,7 +1264,7 @@ Peers = gateway
             .expect("watch completes");
         assert!(found(hit).is_some());
 
-        // Drop the gateway while preserving the same unrestricted policy.
+        // Drop the gateway from the shared registry.
         state.registry().replace(
             Registry::build(vec![server_record(), laptop_record()])
                 .expect("gateway-less registry builds"),
@@ -1402,7 +1294,7 @@ Peers = gateway
 
         let replacement = config_text()
             .replace("198.51.100.20:51820", "198.51.100.99:51820")
-            .replace("10.5.0.0/24", "10.6.0.0/24");
+            .replace("Address = 10.0.0.1/32", "Address = 10.6.0.1/32");
         let loaded =
             config::parse(&replacement, Path::new("test.conf")).expect("replacement config loads");
         state.registry().replace(loaded.registry);
@@ -1410,8 +1302,17 @@ Peers = gateway
         let record = by_key(&state, LAPTOP_KEY, GATEWAY).await.expect("gateway");
         assert_eq!(record.endpoint.as_deref(), Some("198.51.100.99:51820"));
 
-        assert!(by_address(&state, "10.5.0.1").await.is_none());
-        assert!(by_address(&state, "10.6.0.1").await.is_some());
+        // The gateway moved away from 10.0.0.1, so that address now falls
+        // back to the laptop's covering /24 while the new /32 names gateway.
+        let old_address = by_address(&state, "10.0.0.1")
+            .await
+            .expect("laptop now owns the old gateway address by prefix");
+        assert_eq!(old_address.public_key.as_str(), LAPTOP);
+
+        let new_address = by_address(&state, "10.6.0.1")
+            .await
+            .expect("gateway owns its replacement address");
+        assert_eq!(new_address.public_key.as_str(), GATEWAY);
     }
 
     /// An unadmitted caller must never receive `not_found`.
@@ -1468,18 +1369,8 @@ Peers = gateway
 
         // Drop the laptop — the caller itself — from the registry.
         let without_laptop = format!(
-            "\
-[Server]
-PrivateKey = {SERVER_PRIVATE}
-ListenPort = 51820
-Endpoint = 203.0.113.10:51820
-Addresses = 10.0.0.9/32
-
-[Peer.gateway]
-PublicKey = {GATEWAY}
-Endpoint = 198.51.100.20:51820
-Addresses = 10.0.0.1/32, 10.5.0.0/24
-"
+            "{}[Peer]\nName = gateway\nPublicKey = {GATEWAY}\nEndpoint = 198.51.100.20:51820\nAddress = 10.0.0.1/32\n",
+            server_config("10.0.0.9/32")
         );
         let loaded = config::parse(&without_laptop, Path::new("test.conf")).expect("config loads");
         registry.replace(loaded.registry);

@@ -9,10 +9,10 @@ license = "BUSL-1.1"
 
 [dependencies]
 microtun-embassy = { path = "../../microtun-embassy", features = ["defmt"] }
-microtun-provision = { path = "../../microtun-provision", default-features = false }
+microtun-device-config = { path = "../../microtun-device-config" }
 
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
-embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "udp", "dhcpv4", "dns", "medium-ethernet", "medium-ip", "proto-ipv4"] }
+embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "udp", "dhcpv4", "dns", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6"] }
 embassy-net-driver-channel = { version = "0.4", default-features = false }
 embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32h753zi", "time-driver-tim2", "memory-x", "chrono"] }
 embassy-sync = { version = "0.8.0", default-features = false, features = ["defmt"] }

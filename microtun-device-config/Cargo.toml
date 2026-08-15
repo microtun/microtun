@@ -1,0 +1,16 @@
+[package]
+name = "microtun-device-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+cidr = { workspace = true }
+crc = { version = "3.4", default-features = false }
+heapless = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+wary = { workspace = true }
+microtun-ini = { workspace = true }
