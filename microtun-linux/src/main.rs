@@ -7,11 +7,13 @@
 //! Run: `microtun /etc/microtun/microtun.conf` (defaults to `mtun0`; needs `CAP_NET_ADMIN`).
 
 use std::{
-    env, fs, io,
+    fs, io,
     net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
     time::Duration as StdDuration,
 };
 
+use clap::Parser;
 use microtun_device_config::{DeviceConfig, decode_ini};
 use microtun_std::{
     PeersApiResolver, PeersApiTransport, TunnelDevice, TunnelRunner,
@@ -103,147 +105,58 @@ async fn main() {
         .init();
     tracing::debug!("linux logger initialized");
 
-    let cli = match parse_cli(env::args().skip(1)) {
-        Ok(cli) => cli,
-        Err(CliError::Help) => {
-            print_usage();
-            return;
-        }
-        Err(CliError::Message(message)) => {
-            tracing::error!(%message, "invalid command line");
-            print_usage();
-            std::process::exit(2);
-        }
-    };
+    let args = Args::parse();
     let device_config = {
-        let config_bytes = match fs::read(&cli.config_path) {
+        let config_bytes = match fs::read(&args.config) {
             Ok(bytes) => Zeroizing::new(bytes),
             Err(error) => {
-                tracing::error!(path = %cli.config_path, %error, "cannot read configuration");
+                tracing::error!(
+                    path = %args.config.display(),
+                    %error,
+                    "cannot read configuration"
+                );
                 std::process::exit(1);
             }
         };
         match decode_ini(&config_bytes) {
             Ok(config) => config,
             Err(error) => {
-                tracing::error!(path = %cli.config_path, %error, "configuration failed");
+                tracing::error!(
+                    path = %args.config.display(),
+                    %error,
+                    "configuration failed"
+                );
                 std::process::exit(1);
             }
         }
     };
 
-    if let Err(error) = run(device_config, cli.tun_name).await {
+    if let Err(error) = run(device_config, args.interface).await {
         tracing::error!(%error, "fatal tunnel error");
         std::process::exit(1);
     }
 }
 
-const USAGE: &str = concat!(
-    "usage: microtun [--interface <name>] <config.conf>\n",
-    "       microtun [-i <name>] <config.conf>\n",
-    "\n",
-    "Defaults to interface `mtun0` when --interface/-i is omitted."
-);
+#[derive(Debug, Parser)]
+#[command(
+    name = "microtun",
+    about = "Runs a microtun tunnel on a Linux TUN interface",
+    version
+)]
+struct Args {
+    /// Name of the Linux TUN interface to create.
+    #[arg(
+        short = 'i',
+        long,
+        default_value = DEFAULT_TUN_NAME,
+        value_name = "NAME",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    interface: String,
 
-#[derive(Debug)]
-struct Cli {
-    tun_name: String,
-    config_path: String,
-}
-
-#[derive(Debug)]
-enum CliError {
-    Help,
-    Message(String),
-}
-
-fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli, CliError> {
-    let mut tun_name = None;
-    let mut config_path = None;
-    let mut args = args.into_iter();
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => return Err(CliError::Help),
-            "-i" | "--interface" => {
-                let value = args.next().ok_or_else(|| {
-                    CliError::Message(format!("`{arg}` requires an interface name"))
-                })?;
-                set_interface(&mut tun_name, value)?;
-            }
-            _ if arg.starts_with("--interface=") => {
-                let value = arg["--interface=".len()..].to_string();
-                set_interface(&mut tun_name, value)?;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::Message(format!("unknown option `{arg}`")));
-            }
-            _ => {
-                if config_path.replace(arg).is_some() {
-                    return Err(CliError::Message(
-                        "expected exactly one configuration file".into(),
-                    ));
-                }
-            }
-        }
-    }
-
-    let tun_name = tun_name.unwrap_or_else(|| DEFAULT_TUN_NAME.to_owned());
-    let config_path =
-        config_path.ok_or_else(|| CliError::Message("missing configuration file".into()))?;
-
-    Ok(Cli {
-        tun_name,
-        config_path,
-    })
-}
-
-fn set_interface(slot: &mut Option<String>, value: String) -> Result<(), CliError> {
-    if value.is_empty() {
-        return Err(CliError::Message("interface name must not be empty".into()));
-    }
-    if slot.replace(value).is_some() {
-        return Err(CliError::Message(
-            "`--interface` may only be specified once".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn print_usage() {
-    eprintln!("{USAGE}");
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::*;
-
-    #[test]
-    fn parses_interface_flag_and_config_path() {
-        let cli = parse_cli([
-            "--interface".to_string(),
-            "mtun7".to_string(),
-            "client.conf".to_string(),
-        ])
-        .expect("valid command line");
-        assert_eq!(cli.tun_name, "mtun7");
-        assert_eq!(cli.config_path, "client.conf");
-    }
-
-    #[test]
-    fn accepts_short_and_equals_interface_forms() {
-        let short = parse_cli([
-            "client.conf".to_string(),
-            "-i".to_string(),
-            "mtun7".to_string(),
-        ])
-        .expect("short interface option");
-        assert_eq!(short.tun_name, "mtun7");
-
-        let equals = parse_cli(["--interface=mtun8".to_string(), "client.conf".to_string()])
-            .expect("equals interface option");
-        assert_eq!(equals.tun_name, "mtun8");
-    }
+    /// Path to the microtun device configuration file.
+    #[arg(value_name = "CONFIG")]
+    config: PathBuf,
 }
 
 async fn run(

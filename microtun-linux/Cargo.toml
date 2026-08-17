@@ -10,6 +10,7 @@ license.workspace = true
 microtun-std = { workspace = true }
 microtun-device-config = { workspace = true }
 socket2 = { version = "0.5", features = ["all"] }
+clap = { version = "4.5", features = ["derive"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tun-rs = { version = "2.8", features = ["async_tokio"] }

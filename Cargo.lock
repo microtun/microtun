@@ -1088,6 +1088,7 @@ dependencies = [
 name = "microtun-linux"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "microtun-device-config",
  "microtun-std",
  "rand",
