@@ -1,6 +1,6 @@
 //! The cryptokey routing cache (§2, adapted for dynamic peers).
 //!
-//! A classic WireGuard device has a static cryptokey-routing table; microtun has a
+//! A classic tunnel device has a static cryptokey-routing table; microtun has a
 //! resolver-filled cache, pre-seeded with the pinned peers' CIDRs. Dynamic
 //! records stay usable while change invalidations reconcile them; integrations
 //! without pushed changes retain periodic by-key refresh as a fallback.

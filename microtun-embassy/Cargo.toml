@@ -8,10 +8,10 @@ license.workspace = true
 
 [dependencies]
 microtun-core = { workspace = true, features = ["async"] }
-microtun-api = { workspace = true, features = ["embedded-client"] }
-microtun-jsonrpc = { workspace = true, features = ["async"] }
+microtun-api = { workspace = true, features = ["session"] }
 
 rand_core = { workspace = true }
+rand_chacha = { workspace = true }
 heapless = { workspace = true }
 embedded-io-async = { workspace = true }
 defmt-or-log = { workspace = true }
@@ -34,7 +34,7 @@ embassy-futures = { version = "0.1", default-features = false }
 [features]
 default = []
 # Move microtun-core's large protocol state to the global allocator. This is
-# useful on heap-capable MCUs such as ESP32-C3 where task stacks are scarce.
+# useful on heap-capable MCUs such as ESP32-C3/ESP32-C6 where task stacks are scarce.
 # The default remains fully allocator-free for bare-metal Embassy targets.
 alloc = ["microtun-core/alloc"]
 defmt = ["dep:defmt", "microtun-core/defmt", "defmt-or-log/defmt", "embassy-net/defmt", "embassy-time/defmt"]

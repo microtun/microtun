@@ -139,7 +139,7 @@ mod tests {
         let top = 20_000u64;
         assert!(window.check_and_update(top));
 
-        // wireguard-go rejects only when the distance is greater than the
+        // reference implementation rejects only when the distance is greater than the
         // usable window, so the exact trailing edge remains valid.
         assert!(
             window.check_and_update(top - WINDOW),

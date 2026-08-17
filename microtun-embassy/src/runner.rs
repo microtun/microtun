@@ -28,6 +28,7 @@ use crate::{
     MAX_SESSIONS, MTU, PEER_EVICTION_GHOSTS, PEER_EVICTION_INTERVAL, RATE_LIMIT_BURST,
     RATE_LIMIT_ENTRIES, RATE_LIMIT_PER_SEC, REPLAY_WORDS, UNDER_LOAD_HANDSHAKES_PER_SEC,
     resolver::{CommandSender, EventReceiver},
+    status::{TunnelSnapshot, TunnelStatus},
 };
 
 /// Maximum encrypted outer UDP payload.
@@ -171,6 +172,7 @@ impl Sink for TunnelSink<'_, '_, '_, '_> {
 pub struct TunnelRunner<'a, RNG: RngCore + CryptoRng> {
     engine: TunnelCore<RNG>,
     device: ChannelRunner<'a, MTU>,
+    status: TunnelStatus<'a>,
     listen_port: u16,
 }
 
@@ -179,6 +181,7 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
         mut config: Config<'_>,
         rng: RNG,
         device: ChannelRunner<'a, MTU>,
+        status: TunnelStatus<'a>,
         listen_port: u16,
         enable_forwarding: bool,
         now: Instant,
@@ -192,16 +195,20 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
             listen_port
         );
 
-        Ok(Self {
-            engine: Core::new(
-                config,
-                rng,
-                StaticRelayPolicy::forwarding(enable_forwarding),
-                now,
-            )?,
+        let engine = Core::new(
+            config,
+            rng,
+            StaticRelayPolicy::forwarding(enable_forwarding),
+            now,
+        )?;
+        let runner = Self {
+            engine,
             device,
+            status,
             listen_port,
-        })
+        };
+        runner.publish_status();
+        Ok(runner)
     }
 
     pub fn public_key(&self) -> [u8; 32] {
@@ -210,6 +217,10 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
 
     pub fn set_unix_time(&mut self, unix_secs: u64, nanos: u32, now: Instant) {
         self.engine.set_unix_time(unix_secs, nanos, now);
+    }
+
+    fn publish_status(&self) {
+        publish_status(self.status, &self.engine, self.listen_port);
     }
 
     /// Run the tunnel forever.
@@ -241,6 +252,8 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
         let mut pending_forgets = Deque::<[u8; 32], MAX_PEERS>::new();
         // Split the borrow once: the device is both an awaited event source
         // and a sink destination, so it cannot live inside a long-lived sink.
+        let status = self.status;
+        let listen_port = self.listen_port;
         let engine = &mut self.engine;
         let device = &mut self.device;
 
@@ -324,6 +337,8 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
                 }
             }
 
+            publish_status(status, engine, listen_port);
+
             while let Some(public_key) = pending_forgets.front().copied() {
                 if resolve_tx
                     .try_send(ResolverCommand::Forget(public_key))
@@ -335,6 +350,22 @@ impl<'a, RNG: RngCore + CryptoRng> TunnelRunner<'a, RNG> {
             }
         }
     }
+}
+
+fn publish_status<RNG: RngCore + CryptoRng>(
+    status: TunnelStatus<'_>,
+    engine: &TunnelCore<RNG>,
+    listen_port: u16,
+) {
+    let mut peers = [const { None }; MAX_PEERS];
+    for (slot, peer) in peers.iter_mut().zip(engine.peer_snapshots()) {
+        *slot = Some(peer);
+    }
+    status.publish(TunnelSnapshot {
+        public_key: engine.public_key(),
+        listen_port,
+        peers,
+    });
 }
 
 /// The core's monotonic clock, taken from embassy's.

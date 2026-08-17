@@ -4,7 +4,7 @@
 //! configuration surface, but the psk2 KDF step **must** still be executed —
 //! the construction string names `IKpsk2` and omitting the `Kdf₃(C, Q)` step
 //! would produce a wire-incompatible protocol. With `Q = 0³²` we are
-//! compatible with any standard WireGuard peer that has no PSK set.
+//! compatible with any peer implementing the same base protocol that has no PSK set.
 //!
 //! These functions are pure: they take key material in and produce message
 //! bodies (without `mac1`/`mac2`, which are the cookie layer's job — see
@@ -21,6 +21,7 @@ use crate::{
 };
 
 const CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+// Protocol domain-separation identifier; interoperability requires these exact bytes.
 const IDENTIFIER: &[u8] = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
 /// `Q` — the (unused) pre-shared key, fixed all-zero. See module docs.
 const PSK_Q: [u8; 32] = [0u8; 32];
@@ -195,7 +196,7 @@ impl core::fmt::Debug for IdentifiedInitiation {
 }
 
 /// Recover the initiator's claimed static identity, stopping before the
-/// static-static DH. This mirrors wireguard-go's lookup point and allows the
+/// static-static DH. This mirrors the reference implementation's lookup point and allows the
 /// caller to reject or budget unknown identities before doing the second DH.
 pub fn identify_initiation(
     s_priv_r: &[u8; 32],

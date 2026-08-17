@@ -1,8 +1,8 @@
 //! The textual form of a 32-byte static key.
 //!
-//! WireGuard writes a key as standard base64 — 44 characters ending in `=` —
-//! and every tool an operator already has speaks that form: `wg genkey`,
-//! `wg show`, a `wg.conf`. microtun uses exactly the same spelling, so a key
+//! The tunnel protocol writes a key as standard base64 — 44 characters ending in `=` —
+//! and every tool an operator already has speaks that form: `tunnel key generation`,
+//! `tunnel show`, a tunnel configuration file. microtun uses exactly the same spelling, so a key
 //! can be moved between the two without conversion.
 //!
 //! # One spelling
@@ -10,9 +10,11 @@
 //! There used to be a second one. Standard base64 uses `+` and `/`, and `/` is
 //! a path separator, so while the Peers API was REST the `by-key`
 //! lookup put a key in a URL path segment and needed the URL-safe alphabet of
-//! RFC 4648 §5 for that one place. The protocol is JSON-RPC now and has no
-//! paths, so the second alphabet went with them: a key has exactly one form
-//! everywhere — configuration files, parameters, results, and logs.
+//! RFC 4648 §5 for that one place. Keys travel in JSON payloads now — the
+//! Peers API is a WebSocket protocol, and the one path it has is the fixed
+//! endpoint the handshake upgrades — so the second alphabet went with the
+//! path segments: a key has exactly one form everywhere, in configuration
+//! files, parameters, results, and logs.
 //!
 //! Decoding is strict. A key is 32 bytes, which is not a multiple of three, so
 //! the last character carries four data bits and two that are unused. Those
@@ -30,7 +32,7 @@ use core::fmt;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use zeroize::Zeroizing;
 
-/// Characters in a key's standard base64 form, as `wg` prints one.
+/// Characters in a key's standard base64 form, in the canonical text form.
 pub const KEY_TEXT_LEN: usize = 44;
 
 /// Bytes `decode_slice` must be handed, which is not the 32 it writes.
@@ -42,7 +44,7 @@ pub const KEY_TEXT_LEN: usize = 44;
 /// decoded are ever copied out.
 const DECODE_SCRATCH_LEN: usize = 33;
 
-/// A key in WireGuard's standard base64: 44 characters ending in `=`.
+/// A key in the tunnel protocol's standard base64: 44 characters ending in `=`.
 ///
 /// Owns its characters, so it can be built and returned on a `no_std` target
 /// with nothing to allocate. This is only an encoding of bytes the caller
@@ -91,7 +93,7 @@ impl fmt::Debug for KeyBase64 {
 #[error("not a base64-encoded 32-byte key")]
 pub struct InvalidKey;
 
-/// Encode a key the way WireGuard writes one.
+/// Encode a key in the protocol’s canonical text form.
 pub fn encode_key(key: &[u8; 32]) -> KeyBase64 {
     let mut text = [0u8; KEY_TEXT_LEN];
     let written = STANDARD
@@ -101,14 +103,14 @@ pub fn encode_key(key: &[u8; 32]) -> KeyBase64 {
     KeyBase64(text)
 }
 
-/// Decode a key from WireGuard's standard base64.
+/// Decode a key from the tunnel protocol's standard base64.
 pub fn decode_key(text: &str) -> Result<[u8; 32], InvalidKey> {
     let mut key = [0u8; 32];
     decode_key_into(text, &mut key)?;
     Ok(key)
 }
 
-/// Decode a key from WireGuard's standard base64 directly into `key`.
+/// Decode a key from the tunnel protocol's standard base64 directly into `key`.
 ///
 /// The `_into` form exists for private keys: it writes through to a buffer the
 /// caller can wipe, rather than returning a copy of the secret by value and
@@ -161,7 +163,7 @@ mod tests {
     const MIXED_URL: &str = "wtPk9QYXKDlKW2x9jp8KGyw9Tl9gcYKTpLXG1-j5oLE";
 
     #[test]
-    fn encodes_the_same_text_wireguard_does() {
+    fn encodes_the_same_text_tunnel_does() {
         assert_eq!(encode_key(&MIXED).as_str(), MIXED_TEXT);
         assert_eq!(
             encode_key(&[0u8; 32]).as_str(),

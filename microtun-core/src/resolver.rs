@@ -69,7 +69,7 @@ pub struct ResolvedPeer {
     pub address: IpCidr,
     /// Ingress policy applied to authenticated inner packets from this peer.
     pub inbound_policy: InboundPolicy,
-    /// WireGuard-style persistent keepalive interval. `None` disables it.
+    /// Persistent keepalive interval. `None` disables it.
     pub persistent_keepalive: Option<Duration>,
 }
 
@@ -143,7 +143,7 @@ pub enum ResolverCommand {
 /// Authoritative state for a peer the core already holds.
 ///
 /// A resolver integration produces one of these when it reconciles a held
-/// record — because the Peers API server named the key in a peer invalidation
+/// record — because the Tracker named the key in a peer invalidation
 /// notification, or because a reconnect replayed the whole held set. Either
 /// way the state here came from a `v1.peer.by_key` reconciliation, so it is
 /// subject to the same validation as a first answer.
@@ -178,7 +178,7 @@ enum InstallSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerAdmission {
-    /// The remote has proved possession of the claimed WireGuard static key.
+    /// The remote has proved possession of the claimed tunnel static key.
     /// This is the only new-peer admission allowed to consume protected slots.
     AuthenticatedInitiator,
     /// A local outbound packet caused a by-address lazy lookup.
@@ -409,7 +409,7 @@ impl<
     ///
     /// Returns the resolver id only when a live lookup was successfully queued;
     /// the caller may use it to bind bounded pending handshake state to the
-    /// completion. Failure to queue is intentionally lossy because WireGuard
+    /// completion. Failure to queue is intentionally lossy because tunnel protocol
     /// retransmission preserves the previous recovery behavior.
     pub(super) fn request_peer_install(
         &mut self,
@@ -1147,7 +1147,7 @@ impl<
     /// traffic for any tunnel address on this device, including the resolver's
     /// own. A resolver that is compromised, or that is reached over a path
     /// this device cannot authenticate, can therefore reroute everything and —
-    /// by claiming a prefix covering the Peers API server itself — make the
+    /// by claiming a prefix covering the Tracker itself — make the
     /// misdirection self-sustaining across held-peer updates. That is accepted
     /// deliberately: the resolver is already the authority that names peers,
     /// and layering partial address-space restrictions on top bought

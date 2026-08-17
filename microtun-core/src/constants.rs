@@ -22,7 +22,7 @@ pub const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Minimum interval between accepted initiation messages from one authenticated peer.
 pub const HANDSHAKE_INITIATION_MIN_INTERVAL: Duration = Duration::from_millis(20);
 /// Maximum random delay added to each handshake retransmission deadline.
-/// WireGuard specifies a random jitter in `0..=333 ms` to keep
+/// The protocol specifies a random jitter in `0..=333 ms` to keep
 /// peers recovering from a shared outage from retransmitting in lockstep.
 pub const REKEY_TIMEOUT_JITTER_MAX: Duration = Duration::from_millis(333);
 
@@ -119,7 +119,7 @@ pub const DEFAULT_RELAY_RESOLVE_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Peer-table slots unavailable to unauthenticated lazy-cache installs,
 /// including local by-address resolution and relay destinations. They remain
-/// available to initiators that prove possession of their WireGuard static key.
+/// available to initiators that prove possession of their tunnel static key.
 pub const DEFAULT_LAZY_PEER_RESERVE: usize = 1;
 
 /// Stateful ingress-firewall flow lifetimes.
@@ -152,7 +152,7 @@ pub const DEFAULT_UNDER_LOAD_HANDSHAKES_PER_SEC: u32 = 8;
 pub const DEFAULT_UNDER_LOAD_FREE_SLOTS: usize = 1;
 
 /// Post-cookie-attribution rate limit (per source): sustained rate and burst,
-/// in handshake messages. These match the wireguard-go reference
+/// in handshake messages. These match the reference implementation reference
 /// implementation. Resource-constrained backends may select tighter values
 /// through [`crate::CoreConfig`].
 pub const DEFAULT_RATE_LIMIT_PER_SEC: u32 = 20;
@@ -167,8 +167,8 @@ pub const DEFAULT_RATE_LIMIT_BURST: u32 = 5;
 /// private key and carry *some* static key the sender holds — minting a fresh
 /// Curve25519 keypair costs an attacker nothing and produces a key that is by
 /// construction absent from both the in-flight dedup check and the negative
-/// cache, so every attempt would otherwise become a fresh Peers API server query.
-/// Across a fleet that aims a great many devices at one Peers API server.
+/// cache, so every attempt would otherwise become a fresh Tracker query.
+/// Across a fleet that aims a great many devices at one Tracker.
 ///
 /// The cookie machinery does bound this, but only once
 /// [`DEFAULT_UNDER_LOAD_HANDSHAKES_PER_SEC`] is exceeded; below that threshold
@@ -252,7 +252,7 @@ pub const DEFAULT_INFLIGHT_RESOLVES: usize = 12;
 /// their `by-key` resolver lookups are in flight.
 ///
 /// Overflow is intentionally lossy: the resolver lookup still proceeds, and
-/// normal WireGuard retransmission remains the fallback, so exceeding this
+/// normal tunnel retransmission remains the fallback, so exceeding this
 /// costs an extra [`REKEY_TIMEOUT`] rather than a failure. Sized against the
 /// storage backend, since the array is inline in the `Core` value without
 /// `alloc`.

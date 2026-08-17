@@ -241,11 +241,11 @@ pub fn dh_generate<R: rand_core::RngCore + rand_core::CryptoRng>(
 /// big-endian seconds since the TAI epoch label, then 4 bytes big-endian
 /// nanoseconds.
 ///
-/// WireGuard uses the conventional TAI64N label offset of
+/// The protocol uses the conventional TAI64N label offset of
 /// `0x4000_0000_0000_000a` for Unix timestamps. Peers only compare our
 /// timestamps against our own previous ones, but matching that encoding
 /// avoids a needless interoperability window when an identity moves between
-/// implementations. As in wireguard-go, the low 24 bits of the nanoseconds
+/// implementations. As in reference implementation, the low 24 bits of the nanoseconds
 /// field are cleared to reduce wall-clock precision leakage.
 pub fn tai64n(unix_secs: u64, nanos: u32) -> Result<[u8; TIMESTAMP_LEN], Error> {
     let seconds = 0x4000_0000_0000_000au64
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn tai64n_encodes_the_conventional_label_and_orders_bytewise() {
-        // WireGuard uses the TAI64N label offset 0x4000_0000_0000_000a for
+        // The protocol uses the TAI64N label offset 0x4000_0000_0000_000a for
         // Unix timestamps: eight big-endian seconds then four big-endian
         // nanoseconds.
         assert_eq!(

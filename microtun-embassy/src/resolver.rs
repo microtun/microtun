@@ -1,13 +1,13 @@
 //! The peer-resolution task.
 //!
-//! A single long-lived TCP/JSON-RPC session carries lookups, explicit peer
-//! watches, and `v1.peer.changed` / `v1.peer.removed` invalidations. The server
+//! A single long-lived WebSocket session carries lookups, explicit peer
+//! watches, and `peer.changed` / `peer.removed` invalidations. The server
 //! dispatches invalidations only for keys this resolver watches. While the core
-//! has no command ready the task continuously polls the same RPC connection.
+//! has no command ready the task continuously polls the same session.
 //!
-//! `v1.peer.changed` / `v1.peer.removed` name a key and carry nothing else, so they cannot be
+//! `peer.changed` / `peer.removed` name a key and carry nothing else, so they cannot be
 //! applied directly. If the key is locally held, the resolver answers it with
-//! an ordinary `v1.peer.by_key`; otherwise it discards the notification. On
+//! an ordinary `peer.by_key`; otherwise it discards the notification. On
 //! reconnect it re-watches every held key, which reconciles invalidations lost
 //! with the previous connection.
 //!
@@ -27,11 +27,13 @@ use embassy_sync::{
 use embassy_time::{Instant, Timer};
 use heapless::Vec;
 use microtun_api::{
-    Jitter, QUERY_FRAME_LEN, RECORD_FRAME_LEN, REFRESH_BURST_WINDOW_MS,
-    client::{self as peer_api, ChangeHandler as ApiChangeHandler, ClientError, Connection},
+    Jitter, QUERY_MESSAGE_LEN, RECORD_MESSAGE_LEN, REFRESH_BURST_WINDOW_MS,
+    client::{self as peer_api, ChangeHandler as ApiChangeHandler, ClientError},
+    session::{Session, SessionError},
 };
 use microtun_core::{PeerUpdate, ResolveOutcome, ResolveQuery, ResolverCommand, ResolverEvent};
-use microtun_jsonrpc::Error as RpcError;
+use rand_chacha::ChaCha20Rng;
+use rand_core::SeedableRng;
 
 /// Transport budget for one lookup.
 ///
@@ -54,7 +56,7 @@ const REQUEST_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_sec
 const TCP_KEEP_ALIVE: embassy_time::Duration = embassy_time::Duration::from_secs(15);
 const TCP_IDLE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(45);
 /// Base reconnect delay, spread over `[500ms, 1500ms)` by the resolver's
-/// jitter. A Peers API server restart drops every client at once, so an unjittered
+/// jitter. A Tracker restart drops every client at once, so an unjittered
 /// delay would reconnect the whole fleet in one spike.
 const RECONNECT_DELAY_MS: u32 = 1_000;
 /// One watch entry per peer the runner can hold, plus one queued
@@ -110,10 +112,10 @@ pub struct ResolverBuffers<'a> {
     pub socket_tx: &'a mut [u8],
 }
 
-/// Static Peers API server address configuration.
+/// Static Tracker address configuration.
 #[derive(Clone, Copy)]
 pub struct ResolverConfig {
-    /// Peers API server's inner IP endpoint.
+    /// Tracker's inner IP endpoint.
     pub server: IpEndpoint,
     /// Pacing seed for reconnect and refresh jitter.
     ///
@@ -141,26 +143,30 @@ type ChangeHandler = ApiChangeHandler<MAX_HELD_PEERS>;
 type HeldSet = Vec<[u8; 32], MAX_HELD_PEERS>;
 
 /// Run the multiplexed Peers API resolver forever.
+///
+/// `websocket_seed` must be 32 bytes drawn from a cryptographic hardware or
+/// platform RNG. It seeds a ChaCha20 CSPRNG retained by this task so reconnects
+/// can give every WebSocket connection fresh masking entropy without sharing
+/// the tunnel runner's RNG across tasks.
 pub async fn resolver_task<'stack, 'channels, 'buffers>(
     stack: Stack<'stack>,
     cfg: ResolverConfig,
     ch: ResolverChannels<'channels>,
     buffers: ResolverBuffers<'buffers>,
+    websocket_seed: [u8; 32],
 ) -> ! {
     let mut desired = HeldSet::new();
     let mut jitter = Jitter::new(cfg.jitter_seed);
+    let mut rng = ChaCha20Rng::from_seed(websocket_seed);
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut *buffers.socket_rx, &mut *buffers.socket_tx);
         // Keep a quiet keyed-invalidation session alive without application polling, but
-        // still detect a Peers API server or path that disappears without a FIN/RST.
+        // still detect a Tracker or path that disappears without a FIN/RST.
         // The timeout intentionally exceeds the TCP keep-alive interval.
         socket.set_keep_alive(Some(TCP_KEEP_ALIVE));
         socket.set_timeout(Some(TCP_IDLE_TIMEOUT));
-        trace!(
-            "resolver connecting to Peers API server: port={}",
-            cfg.server.port
-        );
+        trace!("resolver connecting to Tracker: port={}", cfg.server.port);
 
         let connected = matches!(
             embassy_time::with_timeout(TCP_CONNECT_TIMEOUT, socket.connect(cfg.server)).await,
@@ -172,19 +178,41 @@ pub async fn resolver_task<'stack, 'channels, 'buffers>(
             continue;
         }
 
-        debug!("resolver session connected");
+        debug!("resolver TCP connected; upgrading");
         let session_ok = {
             let (reader, writer) = socket.split();
-            let mut connection: Connection<_, _, _, RECORD_FRAME_LEN, QUERY_FRAME_LEN> =
-                Connection::new(reader, writer, ChangeHandler::default());
-
-            // A replacement socket may have missed invalidations while the old
-            // session was down. Re-watch every locally held key to reconcile it.
-            debug!("resolver reconciling {} records", desired.len());
-            if reconcile(&mut connection, &ch, &mut desired).await {
-                run_session(&mut connection, &ch, &mut desired, &mut jitter).await
-            } else {
-                false
+            // The upgrade is part of connecting, so it shares the connect
+            // budget rather than adding to it: a server that accepts TCP and
+            // then never answers the handshake must not be able to hold the
+            // resolver past the core's resolve deadline.
+            type ResolverSession<R, W> =
+                Session<R, W, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>;
+            let opened: Result<Result<ResolverSession<_, _>, _>, _> = embassy_time::with_timeout(
+                TCP_CONNECT_TIMEOUT,
+                peer_api::connect(reader, writer, &mut rng, ChangeHandler::default()),
+            )
+            .await;
+            match opened {
+                Ok(Ok(mut connection)) => {
+                    debug!("resolver session established");
+                    // A replacement socket may have missed invalidations while
+                    // the old session was down. Re-watch every locally held key
+                    // to reconcile it.
+                    debug!("resolver reconciling {} records", desired.len());
+                    if reconcile(&mut connection, &ch, &mut desired).await {
+                        run_session(&mut connection, &ch, &mut desired, &mut jitter).await
+                    } else {
+                        false
+                    }
+                }
+                Ok(Err(_)) => {
+                    warn!("resolver WebSocket handshake failed");
+                    false
+                }
+                Err(_) => {
+                    warn!("resolver WebSocket handshake timed out");
+                    false
+                }
             }
         };
 
@@ -200,7 +228,7 @@ pub async fn resolver_task<'stack, 'channels, 'buffers>(
 }
 
 async fn run_session<R, W>(
-    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    connection: &mut Session<R, W, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>,
     ch: &ResolverChannels<'_>,
     desired: &mut HeldSet,
     jitter: &mut Jitter,
@@ -211,7 +239,7 @@ where
 {
     enum Ready {
         Command(ResolverCommand),
-        Incoming(Result<(), RpcError>),
+        Incoming(Result<(), SessionError>),
     }
 
     // embassy-futures' two-way select is ordered, so alternate the poll order
@@ -241,7 +269,7 @@ where
                 connection.handler_mut().forget(public_key);
                 let was_desired = forget_desired(desired, public_key);
                 if was_desired && peer_api::unwatch(connection, public_key).await.is_err() {
-                    warn!("Peers API server unwatch failed; reconnecting");
+                    warn!("tracker unwatch failed; reconnecting");
                     return false;
                 }
             }
@@ -266,7 +294,7 @@ where
 /// Resolve one core query and establish an explicit watch before returning a
 /// positive result.
 async fn resolve<R, W>(
-    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    connection: &mut Session<R, W, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>,
     desired: &mut HeldSet,
     query: ResolveQuery,
 ) -> (ResolveOutcome, bool)
@@ -293,7 +321,7 @@ where
 
 /// Perform one side-effect-free lookup.
 async fn lookup<R, W>(
-    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    connection: &mut Session<R, W, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>,
     query: ResolveQuery,
 ) -> (ResolveOutcome, bool)
 where
@@ -305,7 +333,7 @@ where
 
 /// Explicitly subscribe to one key and return the atomically sampled state.
 async fn watch<R, W>(
-    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    connection: &mut Session<R, W, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>,
     desired: &mut HeldSet,
     public_key: [u8; 32],
 ) -> (ResolveOutcome, bool)
@@ -333,7 +361,7 @@ where
 
 /// Refresh a locally held key after an invalidation.
 async fn refresh<R, W>(
-    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    connection: &mut Session<R, W, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>,
     public_key: [u8; 32],
 ) -> (ResolveOutcome, bool)
 where
@@ -354,30 +382,31 @@ where
     match embassy_time::with_timeout(REQUEST_TIMEOUT, future).await {
         Ok(Ok(outcome)) => {
             debug!(
-                "Peers API server answered: found={}",
+                "tracker answered: found={}",
                 matches!(outcome, ResolveOutcome::Found(_))
             );
             (outcome, false)
         }
         Ok(Err(ClientError::Codec(_))) => {
-            error!("failed to render Peers API server request");
+            error!("failed to render tracker request");
             (ResolveOutcome::Failed, false)
         }
         Ok(Err(ClientError::UnexpectedPublicKey { .. })) => {
-            warn!("Peers API server response returned a different public key");
+            warn!("tracker response returned a different public key");
             (ResolveOutcome::Failed, true)
         }
-        Ok(Err(ClientError::Rpc(_))) => {
-            warn!("Peers API server call failed: {}", operation);
-            (ResolveOutcome::Failed, true)
+        Ok(Err(error)) => {
+            // A remote error object leaves the session synchronized; anything
+            // else means this connection can no longer be trusted to be at a
+            // message boundary.
+            let reconnect = !error.keeps_connection();
+            warn!("tracker call failed: {}", operation);
+            (ResolveOutcome::Failed, reconnect)
         }
         Err(_) => {
-            // Cancellation can leave a partial frame in the connection's receive
-            // buffer, so a timed-out request always discards the session.
-            warn!(
-                "Peers API server request exceeded total timeout: {}",
-                operation
-            );
+            // Cancellation can leave a half-read frame on the socket, so a
+            // timed-out request always discards the session.
+            warn!("tracker request exceeded total timeout: {}", operation);
             (ResolveOutcome::Failed, true)
         }
     }
@@ -386,14 +415,14 @@ where
 /// Re-look-up every key a peer invalidation notification has named.
 ///
 /// A notification carries no state, so this is where its only effect happens:
-/// one ordinary `v1.peer.by_key`, whose result installs the new record or
+/// one ordinary `peer.by_key`, whose result installs the new record or
 /// authoritatively removes the peer. A key the core no longer holds is
 /// discarded instead; the local held set is the final authority on whether a
 /// invalidation is relevant.
 ///
 /// Returns `false` when the session must be discarded.
 async fn reconcile_invalidated<R, W>(
-    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    connection: &mut Session<R, W, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>,
     ch: &ResolverChannels<'_>,
     desired: &mut HeldSet,
     jitter: &mut Jitter,
@@ -436,7 +465,7 @@ where
 /// locally held peer after any notifications lost with the previous session.
 /// Returns `false` when the session dies partway through.
 async fn reconcile<R, W>(
-    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    connection: &mut Session<R, W, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>,
     ch: &ResolverChannels<'_>,
     desired: &mut HeldSet,
 ) -> bool
@@ -455,7 +484,7 @@ where
 
 /// Refresh one locally held key after a peer invalidation.
 async fn refresh_one<R, W>(
-    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    connection: &mut Session<R, W, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>,
     ch: &ResolverChannels<'_>,
     public_key: [u8; 32],
 ) -> bool
@@ -478,7 +507,7 @@ where
 
 /// Re-establish one explicit watch on a replacement connection.
 async fn rewatch_one<R, W>(
-    connection: &mut Connection<R, W, ChangeHandler, RECORD_FRAME_LEN, QUERY_FRAME_LEN>,
+    connection: &mut Session<R, W, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>,
     ch: &ResolverChannels<'_>,
     desired: &mut HeldSet,
     public_key: [u8; 32],

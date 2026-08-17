@@ -1,4 +1,4 @@
-//! Peer-owned WireGuard state.
+//! Peer-owned tunnel state.
 
 use core::net::SocketAddr;
 
@@ -20,7 +20,7 @@ pub(crate) enum PeerKind {
     Dynamic,
 }
 
-/// WireGuard session generations and their protocol timers for one peer.
+/// tunnel session generations and their protocol timers for one peer.
 ///
 /// Generation rotation, handshake installation, and slot cleanup are kept
 /// here so callers cannot update only part of those transitions.
@@ -114,7 +114,7 @@ impl PeerSessions {
 #[derive(Clone)]
 pub(crate) struct PeerEntry {
     pub(crate) public_key: [u8; 32],
-    /// Precomputed X25519(local static, remote static), matching wireguard-go.
+    /// Precomputed X25519(local static, remote static), matching reference implementation.
     pub(crate) precomputed_static_static: [u8; 32],
     pub(crate) kind: PeerKind,
     pub(crate) endpoint: Option<SocketAddr>,
@@ -137,13 +137,13 @@ pub(crate) struct PeerEntry {
     /// Optional stateful ingress filtering supplied by either the pinned
     /// configuration or the trusted resolver record.
     pub(crate) inbound_policy: InboundPolicy,
-    /// Configured WireGuard-style idle keepalive interval.
+    /// Configured idle keepalive interval.
     pub(crate) persistent_keepalive: Option<Duration>,
     /// Last authoritative tunnel address, used to make refreshes no-ops.
     pub(crate) address: IpCidr,
     pub(crate) greatest_ts: [u8; TIMESTAMP_LEN],
     /// Monotonic time at which the last authenticated initiation was accepted.
-    /// Kept independently of cookie/rate limiting, as in wireguard-go.
+    /// Kept independently of cookie/rate limiting, as in reference implementation.
     pub(crate) last_initiation_consumption: Option<Instant>,
     pub(crate) cookie: Option<([u8; 16], Instant)>,
     /// `mac1` of the most recent handshake message we sent to this peer —
@@ -162,6 +162,12 @@ pub(crate) struct PeerEntry {
     /// Last unknown-destination resolver lookup accepted from this peer while
     /// it acted as an authenticated relay submitter.
     pub(crate) last_relay_resolve: Option<Instant>,
+    /// Most recent successful tunnel handshake/key derivation with this peer.
+    pub(crate) latest_handshake: Option<Instant>,
+    /// Authenticated encrypted tunnel transport bytes accepted from this peer.
+    pub(crate) rx_bytes: u64,
+    /// encrypted tunnel transport bytes sealed for this peer.
+    pub(crate) tx_bytes: u64,
     pub(crate) last_activity: Instant,
 }
 
@@ -202,6 +208,9 @@ impl PeerEntry {
                 ..PeerSessions::default()
             },
             last_relay_resolve: None,
+            latest_handshake: None,
+            rx_bytes: 0,
+            tx_bytes: 0,
             last_activity: now,
         }
     }

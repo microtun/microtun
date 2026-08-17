@@ -1,4 +1,4 @@
-//! Allocation-free reverse mapping from random WireGuard receiver indices to
+//! Allocation-free reverse mapping from random tunnel receiver indices to
 //! session slots.
 //!
 //! The assigned receiver index lives with the slot state itself. This map only
@@ -12,7 +12,7 @@ use heapless::index_map::{Entry, IndexMap};
 
 use crate::{error::Error, session::SlotIdx};
 
-/// Hasher for uniformly random WireGuard receiver indices.
+/// Hasher for uniformly random tunnel receiver indices.
 ///
 /// Session indices are already sampled from a CSPRNG, so they do not need an
 /// additional mixing step. `IndexMap` only requires a `u64` hash value; the

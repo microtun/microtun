@@ -4,7 +4,7 @@
 //! [`embassy_net_driver_channel::Device`]. The application builds an ordinary
 //! inner `embassy-net` [`Stack`](embassy_net::Stack) on top of this device
 //! and thereby gets TCP/UDP sockets whose traffic is transparently
-//! WireGuard-encapsulated.
+//! secure-tunnel-encapsulated.
 //!
 //! Data flow:
 //!
@@ -25,7 +25,10 @@ use embassy_net_driver_channel::{
     driver::{Capabilities, Driver, HardwareAddress, LinkState},
 };
 
-use crate::MTU;
+use crate::{
+    MTU,
+    status::{TunnelStatus, TunnelStatusState},
+};
 
 /// Backing storage for the tunnel device's zero-copy channels. Allocate one
 /// of these `'static` (typically via `static_cell::StaticCell`) and pass it to
@@ -35,6 +38,7 @@ use crate::MTU;
 /// * `MAX_TX_PACKETS` — maximum plaintext outbound packets queued
 pub struct TunnelState<const MAX_RX_PACKETS: usize, const MAX_TX_PACKETS: usize> {
     inner: State<MTU, MAX_RX_PACKETS, MAX_TX_PACKETS>,
+    status: TunnelStatusState,
 }
 
 impl<const MAX_RX_PACKETS: usize, const MAX_TX_PACKETS: usize> Default
@@ -51,6 +55,7 @@ impl<const MAX_RX_PACKETS: usize, const MAX_TX_PACKETS: usize>
     pub const fn new() -> Self {
         Self {
             inner: State::new(),
+            status: TunnelStatusState::new(),
         }
     }
 }
@@ -102,29 +107,36 @@ impl<'d> Driver for TunnelDevice<'d> {
 /// Create the tunnel device and its runner half.
 ///
 /// The returned [`Device`] is handed to `embassy_net::new` to build the inner
-/// stack. The returned [`Runner`] is owned by [`TunnelRunner`](crate::runner::TunnelRunner), which uses it
-/// to move packets between the channels and the crypto core.
+/// stack. The returned [`Runner`] is owned by
+/// [`TunnelRunner`](crate::runner::TunnelRunner), which uses it to move packets
+/// between the channels and the crypto core. The returned [`TunnelStatus`] is a
+/// read-only snapshot handle for diagnostics such as a `tunnel show` command.
 ///
-/// A WireGuard tunnel is a point-to-point IP link with no L2 addressing, so
+/// A secure tunnel is a point-to-point IP link with no L2 addressing, so
 /// the hardware address is [`HardwareAddress::Ip`] and the inner stack must be
 /// configured with `medium-ip`.
 pub fn new_tunnel<'d, const MAX_RX_PACKETS: usize, const MAX_TX_PACKETS: usize>(
     state: &'d mut TunnelState<MAX_RX_PACKETS, MAX_TX_PACKETS>,
-) -> (Runner<'d, MTU>, Device<'d, MTU>) {
-    embassy_net_driver_channel::new(&mut state.inner, HardwareAddress::Ip)
+) -> (Runner<'d, MTU>, Device<'d, MTU>, TunnelStatus<'d>) {
+    let status = TunnelStatus::new(&state.status);
+    let (runner, device) = embassy_net_driver_channel::new(&mut state.inner, HardwareAddress::Ip);
+    (runner, device, status)
 }
 
 /// Create a tunnel device that advertises a runtime-selected MTU.
 ///
 /// `mtu` may lower the link MTU from the compile-time buffer size [`MTU`], but
 /// cannot exceed it because the driver-channel packet buffers are fixed-size.
+/// The third tuple item is the same read-only [`TunnelStatus`] handle returned
+/// by [`new_tunnel`].
 pub fn new_tunnel_with_mtu<'d, const MAX_RX_PACKETS: usize, const MAX_TX_PACKETS: usize>(
     state: &'d mut TunnelState<MAX_RX_PACKETS, MAX_TX_PACKETS>,
     mtu: usize,
-) -> (Runner<'d, MTU>, TunnelDevice<'d>) {
+) -> (Runner<'d, MTU>, TunnelDevice<'d>, TunnelStatus<'d>) {
     assert!(mtu > 0, "tunnel MTU must be non-zero");
     assert!(mtu <= MTU, "tunnel MTU exceeds the embedded buffer size");
 
+    let status = TunnelStatus::new(&state.status);
     let (runner, device) = embassy_net_driver_channel::new(&mut state.inner, HardwareAddress::Ip);
-    (runner, TunnelDevice { inner: device, mtu })
+    (runner, TunnelDevice { inner: device, mtu }, status)
 }

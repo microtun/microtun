@@ -1,6 +1,6 @@
 # Security Policy
 
-Security is a core property of microtun. The project implements WireGuard-compatible protocol machinery and handles cryptographic key material, authenticated peer state, replay protection, routing, relaying, and tunnel access control across both host and embedded targets.
+Security is a core property of microtun. The project implements protocol-compatible protocol machinery and handles cryptographic key material, authenticated peer state, replay protection, routing, relaying, and tunnel access control across both host and embedded targets.
 
 If you believe you have found a security vulnerability, please report it privately so it can be investigated and fixed before public disclosure.
 
@@ -35,7 +35,7 @@ Please include as much of the following as is reasonably available:
 - clear reproduction steps or a minimal proof of concept;
 - relevant logs, packet traces, or stack traces, with secrets removed;
 - whether the issue appears remotely exploitable or can cause key disclosure, authentication bypass, plaintext exposure, denial of service, or persistent compromise;
-- for protocol or cryptographic issues, the expected behavior and any relevant WireGuard specification/reference behavior;
+- for protocol or cryptographic issues, the expected behavior and any relevant tunnel protocol specification/reference behavior;
 - any proposed mitigation or patch, if you have one.
 
 Do **not** send real production private keys, credentials, peer registries, or other secrets. Use generated test material and redact unrelated data.
@@ -52,7 +52,7 @@ Examples include, but are not limited to:
 - authentication or peer-identity bypasses;
 - acceptance of unauthenticated or incorrectly attributed traffic;
 - routing, AllowedIPs, firewall, or peer-resolution behavior that lets one peer access traffic or state belonging to another;
-- relay behavior that breaks the intended end-to-end confidentiality or integrity of inner WireGuard traffic;
+- relay behavior that breaks the intended end-to-end confidentiality or integrity of inner tunnel traffic;
 - Peers API admission, authorization, framing, or state-consistency flaws with security impact;
 - parsing or state-machine bugs reachable from untrusted network input that cause memory unsafety, persistent corruption, or exploitable panics;
 - remotely triggerable resource exhaustion or denial of service that bypasses intended bounds or rate limits;

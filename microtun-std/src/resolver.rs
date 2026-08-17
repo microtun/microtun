@@ -1,16 +1,16 @@
 //! Tokio/`std` Peers API resolver.
 //!
-//! Lookups and key-only peer invalidations share one long-lived
-//! newline-delimited JSON-RPC connection. The resolver explicitly watches the
-//! peer keys the core currently holds, and the server dispatches invalidations
-//! only for those watched keys.
+//! Lookups and key-only peer invalidations share one long-lived WebSocket
+//! connection. The resolver explicitly watches the peer keys the core
+//! currently holds, and the server dispatches invalidations only for those
+//! watched keys.
 //!
 //! # One re-lookup queue
 //!
-//! `v1.peer.changed` / `v1.peer.removed` name a key and carry nothing else, so they cannot be
+//! `peer.changed` / `peer.removed` name a key and carry nothing else, so they cannot be
 //! applied directly: it means *whatever we hold for this key may no longer be
 //! current*. If the key is locally held, the resolver answers the invalidation
-//! with an ordinary `v1.peer.by_key`, whose result installs the new record or
+//! with an ordinary `peer.by_key`, whose result installs the new record or
 //! authoritatively removes the peer.
 //!
 //! Reconnect recovery re-watches every locally held key on the replacement
@@ -25,7 +25,7 @@
 //!
 //! * exactly `{"not_found":{}}` — [`ResolveOutcome::NotFound`];
 //! * `{"found":{...}}` whose record decodes — [`ResolveOutcome::Found`];
-//! * anything else, including a JSON-RPC `error` object, an absent or `null`
+//! * anything else, including an `error` object, an absent or `null`
 //!   `result`, an unknown or missing variant, a malformed record, a dead
 //!   connection, and a timeout — [`ResolveOutcome::Failed`].
 //!
@@ -48,14 +48,15 @@ use std::{
 };
 
 use microtun_api::{
-    Jitter, QUERY_FRAME_LEN, RECORD_FRAME_LEN, REFRESH_BURST_WINDOW_MS,
-    client::{self as peer_api, ChangeHandler, ClientError},
+    Jitter, QUERY_MESSAGE_LEN, RECORD_MESSAGE_LEN, REFRESH_BURST_WINDOW_MS,
+    client::{self as peer_api, ChangeHandler, ClientError, TokioIo, TokioSession},
+    session::SessionError,
 };
 use microtun_core::{
     PeerUpdate, ResolveOutcome, ResolveQuery, ResolveRequest, ResolveResponse, ResolverCommand,
     ResolverEvent,
 };
-use microtun_jsonrpc::Error as RpcError;
+use rand_core::OsRng;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf},
     sync::mpsc,
@@ -66,19 +67,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Base reconnect delay, spread by [`Jitter::spread_ms`] over
 /// `[500ms, 1500ms)`.
 ///
-/// A Peers API server restart drops every client at the same instant, so an
+/// A Tracker restart drops every client at the same instant, so an
 /// unjittered delay would reconnect the whole fleet in one spike. See
 /// `docs/microtun-peers-api.md` §10.3.
 const RECONNECT_DELAY_MS: u32 = 1_000;
 
-/// JSON-RPC connection over the read/write halves of the Tokio transport.
-type RpcConnection<S> = peer_api::TokioConnection<
-    ReadHalf<S>,
-    WriteHalf<S>,
-    ChangeHandler,
-    RECORD_FRAME_LEN,
-    QUERY_FRAME_LEN,
->;
+/// Peers API session over the read/write halves of the Tokio transport.
+type ApiSession<S> =
+    TokioSession<ReadHalf<S>, WriteHalf<S>, ChangeHandler, RECORD_MESSAGE_LEN, QUERY_MESSAGE_LEN>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reconcile {
@@ -96,7 +92,7 @@ impl Reconcile {
     }
 }
 
-/// How the resolver reaches the Peers API server.
+/// How the resolver reaches the Tracker.
 ///
 /// See [`PeersApiResolver`]: the route a lookup takes is the whole of its security,
 /// so opening the connection is the caller's job and this crate ships no
@@ -105,7 +101,7 @@ pub trait PeersApiTransport: Clone + Send + Sync + 'static {
     /// The connected byte stream.
     type Stream: AsyncRead + AsyncWrite + Send + Unpin + 'static;
 
-    /// Open a connection to the Peers API server's inner address.
+    /// Open a connection to the Tracker's inner address.
     ///
     /// The resulting connection is retained for lookups and pushed updates
     /// until either side closes it. TCP implementations must enable
@@ -119,9 +115,9 @@ pub trait PeersApiTransport: Clone + Send + Sync + 'static {
 ///
 /// # Transport security
 ///
-/// Peers API server traffic carries **no transport authentication of its own**. Its
+/// Tracker traffic carries **no transport authentication of its own**. Its
 /// integrity rests entirely on the shared connection being carried inside the
-/// tunnel to the pinned Peers API server peer, whose WireGuard session authenticates
+/// tunnel to the pinned Tracker peer, whose tunnel session authenticates
 /// it.
 ///
 /// That is not a property this type can check, so it is not one it will
@@ -136,7 +132,7 @@ pub trait PeersApiTransport: Clone + Send + Sync + 'static {
 ///
 /// Two conditions make a deployment sound, and both belong to the caller:
 ///
-/// 1. `api` is the Peers API server's **tunnel** address, so the route to it is the
+/// 1. `api` is the Tracker's **tunnel** address, so the route to it is the
 ///    pinned peer's cryptokey route. Deriving it from the pinned peer's own
 ///    configured prefix rather than from separate configuration keeps the two
 ///    from drifting apart.
@@ -156,12 +152,14 @@ pub struct PeersApiResolver<T: PeersApiTransport> {
     replay: VecDeque<Reconcile>,
     /// Pacing source for reconnect delays and reconciliation bursts.
     jitter: Jitter,
+    /// Operating-system entropy used to seed each WebSocket connection.
+    rng: OsRng,
     /// When the current change-driven burst may issue its first refresh.
     ///
     /// `None` outside a burst, and always `None` for reconnect replay, which
     /// the jittered reconnect delay has already spread.
     burst_at: Option<tokio::time::Instant>,
-    connection: Option<RpcConnection<T::Stream>>,
+    connection: Option<ApiSession<T::Stream>>,
 }
 
 impl<T: PeersApiTransport> core::fmt::Debug for PeersApiResolver<T> {
@@ -204,12 +202,13 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
             desired: HashSet::new(),
             replay: VecDeque::new(),
             jitter: Jitter::new(seed),
+            rng: OsRng,
             burst_at: None,
             connection: None,
         }
     }
 
-    /// The Peers API server's inner address.
+    /// The Tracker's inner address.
     pub fn api(&self) -> SocketAddr {
         self.api
     }
@@ -222,7 +221,7 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
             Err(_) => {
                 // A canceled call may have consumed part of a frame. Never
                 // reuse that stream.
-                log::warn!("Peers API server lookup exceeded the request timeout");
+                log::warn!("tracker lookup exceeded the request timeout");
                 self.connection = None;
                 ResolveOutcome::Failed
             }
@@ -232,16 +231,26 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
 
     async fn establish(&mut self) -> Result<(), ()> {
         let stream = self.transport.connect(self.api).await.map_err(|error| {
-            log::warn!("Peers API server connect to {} failed: {error}", self.api);
+            log::warn!("tracker connect to {} failed: {error}", self.api);
         })?;
         let (reader, writer) = tokio::io::split(stream);
-        self.connection = Some(peer_api::TokioConnection::from_tokio(
-            reader,
-            writer,
-            ChangeHandler::default(),
-        ));
+        self.connection = Some(
+            peer_api::connect(
+                TokioIo::new(reader),
+                TokioIo::new(writer),
+                &mut self.rng,
+                ChangeHandler::default(),
+            )
+            .await
+            .map_err(|error| {
+                log::warn!(
+                    "tracker peers API handshake with {} failed: {error}",
+                    self.api
+                );
+            })?,
+        );
         // Watches live on the connection. A replacement connection starts
-        // empty, so replay every held key with `v1.peer.watch`; each response
+        // empty, so replay every held key with `peer.watch`; each response
         // both restores the subscription and reconciles current state.
         self.replay = self
             .desired
@@ -253,7 +262,7 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
         // that preceded it, so it starts immediately.
         self.burst_at = None;
         log::debug!(
-            "Peers API server session connected; {} records to reconcile",
+            "tracker session connected; {} records to reconcile",
             self.replay.len()
         );
         Ok(())
@@ -332,23 +341,21 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
     ) -> ResolveOutcome {
         match result {
             Ok(outcome) => outcome,
-            // A JSON-RPC error response is application-level: the complete
-            // frame was received, so the session remains synchronized.
-            Err(ClientError::Rpc(RpcError::Remote(error))) => {
-                log::warn!("Peers API server {operation} call failed: {error}");
-                ResolveOutcome::Failed
-            }
-            Err(ClientError::Codec(error)) => {
-                log::error!("failed to render Peers API server {operation}: {error:?}");
-                ResolveOutcome::Failed
-            }
             Err(ClientError::UnexpectedPublicKey { .. }) => {
-                log::warn!("Peers API server {operation} returned a different public key");
+                // A well-formed answer to a question nobody asked. The session
+                // is synchronized, but this server just said something it
+                // should not be able to say, so stop believing this one.
+                log::warn!("tracker {operation} returned a different public key");
+                self.connection = None;
                 ResolveOutcome::Failed
             }
-            Err(ClientError::Rpc(error)) => {
-                log::warn!("Peers API server {operation} call failed: {error}");
-                self.connection = None;
+            Err(error) => {
+                if error.keeps_connection() {
+                    log::warn!("tracker {operation} call failed: {error}");
+                } else {
+                    log::warn!("tracker {operation} session failed: {error}");
+                    self.connection = None;
+                }
                 ResolveOutcome::Failed
             }
         }
@@ -366,7 +373,7 @@ impl<T: PeersApiTransport> PeersApiResolver<T> {
         let result =
             peer_api::unwatch(self.connection.as_mut().expect("checked above"), public_key).await;
         if let Err(error) = result {
-            log::warn!("Peers API server unwatch failed: {error:?}");
+            log::warn!("tracker unwatch failed: {error:?}");
             self.connection = None;
         }
     }
@@ -439,7 +446,7 @@ pub async fn resolver_task<T: PeersApiTransport>(
 
         // A change-driven burst waits out its jittered offset before issuing
         // its first refresh. Commands are still served meanwhile, so the delay
-        // paces the Peers API server without stalling the core.
+        // paces the Tracker without stalling the core.
         if resolver.connection.is_some()
             && !resolver.replay.is_empty()
             && let Some(ready_at) = resolver.burst_at
@@ -500,7 +507,7 @@ pub async fn resolver_task<T: PeersApiTransport>(
 
         enum Ready {
             Command(Option<ResolverCommand>),
-            Incoming(Result<(), RpcError>),
+            Incoming(Result<(), SessionError>),
         }
 
         let ready = {
@@ -520,7 +527,7 @@ pub async fn resolver_task<T: PeersApiTransport>(
             Ready::Command(None) => return,
             Ready::Incoming(Ok(())) => {}
             Ready::Incoming(Err(error)) => {
-                log::warn!("Peers API server session ended: {error}");
+                log::warn!("tracker session ended: {error}");
                 resolver.connection = None;
             }
         }
@@ -631,12 +638,15 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use microtun_api::{KeyParams, LookupResult, METHOD_CHANGED, METHOD_REMOVED, METHOD_WATCH};
+    use microtun_api::{
+        KeyParams, LookupResult, METHOD_CHANGED, METHOD_REMOVED, METHOD_WATCH,
+        session::{Handler, Params, Reply, Responder, Session},
+    };
     use microtun_core::{
         ResolveQuery,
         key::{decode_key, encode_key},
     };
-    use microtun_jsonrpc::{Connection, Handler, Params, Reply, Responder, TokioIo};
+    use microtun_ws::{Connection as WsConnection, ServerConfig};
     use tokio::{io::DuplexStream, sync::Mutex};
 
     use super::*;
@@ -681,7 +691,7 @@ mod tests {
                     responder.ok(&LookupResult::Found(record))
                 }
                 Script::Missing => responder.ok(&LookupResult::NotFound {}),
-                // A result that is well-formed JSON-RPC but not a conforming
+                // A result that is a well-formed response but not a conforming
                 // `LookupResult`. It must never read as an authoritative miss.
                 Script::Untagged(json) => {
                     let (record, _) = serde_json_core::from_str::<microtun_api::PeerInfo>(json)
@@ -689,10 +699,42 @@ mod tests {
                     responder.ok(&record)
                 }
                 Script::NullResult => responder.ok(&Option::<()>::None),
-                Script::Error => responder.error(-32000, "unavailable"),
+                Script::Error => responder.error(microtun_api::codes::RATE_LIMITED, "unavailable"),
                 Script::Hangup => unreachable!("a hung-up connection serves no request"),
             }
         }
+    }
+
+    /// The server half of a scripted connection: a real WebSocket handshake,
+    /// then a real session. The tests exercise the resolver through the same
+    /// two layers a Tracker puts in front of it.
+    type ServerSession<H> = Session<
+        TokioIo<ReadHalf<DuplexStream>>,
+        TokioIo<WriteHalf<DuplexStream>>,
+        H,
+        QUERY_MESSAGE_LEN,
+        RECORD_MESSAGE_LEN,
+    >;
+
+    async fn accept<H: Handler>(stream: DuplexStream, handler: H) -> ServerSession<H> {
+        let (reader, writer) = tokio::io::split(stream);
+        let mut reader = TokioIo::new(reader);
+        let mut writer = TokioIo::new(writer);
+        let mut scratch = [0u8; microtun_api::SERVER_HANDSHAKE_LEN];
+        let upgrade = microtun_ws::request_upgrade(
+            &mut reader,
+            &ServerConfig {
+                path: microtun_api::PEERS_API_PATH,
+            },
+            &mut scratch,
+        )
+        .await
+        .expect("the resolver sends a conforming handshake");
+        upgrade
+            .accept(&mut writer)
+            .await
+            .expect("the upgrade is accepted");
+        Session::new(WsConnection::server(reader, writer), handler)
     }
 
     #[derive(Clone)]
@@ -735,14 +777,12 @@ mod tests {
             }
 
             tokio::spawn(async move {
-                let (reader, writer) = tokio::io::split(server);
-                let mut connection: Connection<_, _, _, QUERY_FRAME_LEN, RECORD_FRAME_LEN> =
-                    Connection::from_tokio(reader, writer, ScriptedHandler(script));
+                let mut session = accept(server, ScriptedHandler(script)).await;
                 match script {
                     Script::RecordThenClose(_) => {
-                        let _ = connection.poll().await;
+                        let _ = session.poll().await;
                     }
-                    _ => while connection.poll().await.is_ok() {},
+                    _ => while session.poll().await.is_ok() {},
                 }
             });
             Ok(client)
@@ -885,7 +925,7 @@ mod tests {
             responder: Responder<'_>,
         ) -> Reply {
             if method != microtun_api::METHOD_BY_KEY && method != METHOD_WATCH {
-                return responder.method_not_found();
+                return responder.unknown_method();
             }
             let Ok(args) = params.parse::<KeyParams<'_>>() else {
                 return responder.invalid_params();
@@ -934,19 +974,12 @@ mod tests {
     async fn server_connection(
         stream: DuplexStream,
     ) -> (
-        Connection<
-            TokioIo<ReadHalf<DuplexStream>>,
-            TokioIo<WriteHalf<DuplexStream>>,
-            CombinedHandler,
-            QUERY_FRAME_LEN,
-            RECORD_FRAME_LEN,
-        >,
+        ServerSession<CombinedHandler>,
         mpsc::UnboundedReceiver<[u8; 32]>,
     ) {
-        let (reader, writer) = tokio::io::split(stream);
         let (lookup_tx, lookup_rx) = mpsc::unbounded_channel();
         (
-            Connection::from_tokio(reader, writer, CombinedHandler { lookups: lookup_tx }),
+            accept(stream, CombinedHandler { lookups: lookup_tx }).await,
             lookup_rx,
         )
     }

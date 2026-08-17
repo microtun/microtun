@@ -1,6 +1,6 @@
 [package]
 name = "microtun-core"
-description = "Sans-IO WireGuard engine for microtun"
+description = "Sans-IO tunnel engine for microtun"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 maybe-async = { workspace = true }
-heapless = { workspace = true }
+heapless = { workspace = true, features = ["serde"] }
 hashbrown = { workspace = true, optional = true }
 rand_core = { workspace = true }
 subtle = { workspace = true }
@@ -24,6 +24,9 @@ digest = { workspace = true }
 zerocopy = { workspace = true }
 cidr = { workspace = true }
 base64 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+wary = { workspace = true }
+microtun-ini = { workspace = true }
 
 defmt-or-log = { workspace = true }
 defmt = { workspace = true, optional = true }

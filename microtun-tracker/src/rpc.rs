@@ -1,0 +1,1597 @@
+//! Peers API lookups and keyed peer invalidations.
+//!
+//! ```text
+//! GET /v1/peers
+//!
+//! peer.by_key      {"public_key": "<44-char base64>"}  -> LookupResult
+//! peer.by_address  {"address": "10.0.0.5"}             -> LookupResult
+//! peer.watch       {"public_key": "<44-char base64>"}  -> LookupResult
+//! peer.unwatch     {"public_key": "<44-char base64>"}  -> client notification
+//! peer.changed     {"public_key": "<44-char base64>"}  -> server notification
+//! peer.removed     {"public_key": "<44-char base64>"}  -> server notification
+//! ```
+//!
+//! A `LookupResult` is externally tagged: `{"found":{...}}` or
+//! `{"not_found":{}}`. Nothing else is an authoritative lookup result.
+//!
+//! Ordinary lookups are side-effect free. `peer.watch` atomically registers
+//! a configured key in a server-side keyed dispatch index and returns its current
+//! record. Config reloads and authenticated endpoint observations dispatch
+//! `peer.changed` / `peer.removed` only to connections watching the
+//! changed key. A client confirms either invalidation with ordinary
+//! `peer.by_key`, and `peer.unwatch` drops interest.
+//!
+//! Each connection has a coalescing pending-key queue. Reconnect re-establishes
+//! watches for the peer keys the client still holds. Removal of the caller closes
+//! the subscription so reconnect can re-establish admission and watches.
+//!
+//! Because notifications carry no peer record and only trigger a fresh lookup,
+//! they cannot directly install stale state. The server therefore owes no
+//! cross-task write ordering between lookup responses and invalidations.
+//!
+//! Every method is gated on admission, and there is no ungated probe: a
+//! connection that establishes at all has already proved a tunnel session,
+//! which is a stronger liveness signal than anything this layer could answer.
+//!
+//! # The connection is a WebSocket
+//!
+//! A session begins as an HTTP upgrade on [`microtun_api::PEERS_API_PATH`],
+//! which is what lets a
+//! browser be a client of this API without a shim. It also gives this server a
+//! place to say no *before* there is a session at all: an unadmitted caller is
+//! answered `403` and never upgraded, so it is turned away by something it can
+//! read rather than by a socket that closes for no stated reason.
+//!
+//! # How a request is attributed to a peer
+//!
+//! Every Peers API operation must come from a configured peer. The Tracker terminates
+//! the tunnel itself, so a connection arrives already bound to the static
+//! public key whose tunnel session carried its packets: the accept loop
+//! attaches that key to the connection's handler, and admission is a `by_key`
+//! lookup against the same peer list the API serves. A key with no record is
+//! refused.
+//!
+//! This is not an inference from the source address. The core delivers only
+//! cryptokey-routed packets, so the address would also be trustworthy, but a
+//! peer may legitimately own a prefix that contains another peer's address —
+//! `10.0.0.0/24` and `10.0.0.1/32` can belong to different peers — and a
+//! longest-prefix match on the source would then credit the wrong one. The key
+//! has no such ambiguity.
+//!
+//! Identity is per *connection*, not per request, which is a small tightening
+//! over the request-scoped extension this replaces: a handler is constructed
+//! with the accepted key and has no way to be told about another.
+//!
+//! Resource accounting uses that same authenticated key. Configured peers may
+//! hold at most [`MAX_CONNECTIONS_PER_PEER`] simultaneous API connections and
+//! share a token bucket across those connections. Exceeding the request budget
+//! returns a transient error rather than the authoritative `not_found`
+//! sentinel, so overload cannot poison a client's negative cache.
+//!
+//! # `not_found` describes the shared registry
+//!
+//! `{"not_found":{}}` means exactly one thing: *the registry has no record for
+//! the target it named*. The client treats the result as authoritative, negative
+//! caches it, and — on a refresh for a record it already holds — deletes that
+//! record. So the sentinel must be reserved for statements about the target,
+//! and three other outcomes that are not such statements answer differently:
+//!
+//! * **The caller has no record of its own.** Refused at accept, so the usual
+//!   case never reaches a handler at all. A request that slips through the
+//!   window between a reload removing the caller and the notifier closing the
+//!   connection answers [`microtun_api::codes::NOT_ADMITTED`]. Answering a miss
+//!   here would tell a client whose admission had just lapsed that every peer
+//!   it holds had been deleted, and one bad config push would delete every
+//!   client's routing state fleet-wide instead of merely disconnecting it.
+//! * **The argument is not a key or an address.** Answered
+//!   [`microtun_api::codes::INVALID_PARAMS`]. A caller
+//!   that cannot spell a key has learned nothing about who exists, so there is
+//!   nothing to conceal and a silent negative cache entry would hide the bug.
+//! * **Overload.** Answered [`microtun_api::codes::RATE_LIMITED`].
+//!
+//! All three are transient in the client's classification, so an installed
+//! record survives them. An unknown key and an unclaimed address are the same
+//! authoritative miss.
+//!
+//! Reload failures likewise keep serving the previous validated snapshot rather
+//! than briefly turning every record into a miss.
+//!
+//! Because the sentinel is explicit, this server must never answer a lookup
+//! with a bare `null`, an omitted `result`, or a record placed directly in
+//! `result`: a client reads all three as a transient failure and keeps
+//! whatever it already had.
+
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    net::IpAddr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
+
+use microtun_api::{
+    ByAddressParams, KeyParams, LookupResult, METHOD_BY_ADDRESS, METHOD_BY_KEY, METHOD_CHANGED,
+    METHOD_REMOVED, METHOD_UNWATCH, METHOD_WATCH, PEERS_API_PATH, PeerInfo, QUERY_MESSAGE_LEN,
+    RECORD_MESSAGE_LEN, SERVER_HANDSHAKE_LEN, codes,
+    session::{Handler, Params, Reply, Responder, Session},
+};
+use microtun_core::key::{decode_key, encode_key};
+use microtun_ws::{CloseCode, Sender, ServerConfig, Status, TokioIo};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+use crate::registry::{
+    KEY_PREFIX_LEN, KeyedSubscription, PeerRecord, Registry, RegistryChangeKind, SharedRegistry,
+};
+
+/// Maximum simultaneous Peers API TCP connections accepted from one
+/// configured, authenticated tunnel key. Multiple connections are useful for
+/// reconnect overlap, but an unbounded number multiplies subscription and refresh
+/// work during registry churn.
+pub(crate) const MAX_CONNECTIONS_PER_PEER: usize = 4;
+/// Sustained Peers API request budget per configured, authenticated tunnel key.
+const REQUESTS_PER_SEC: u32 = 20;
+/// Short request bursts allowed before the sustained budget takes effect.
+const REQUEST_BURST: u32 = 40;
+const REQUEST_COST_MT: u32 = 1000;
+
+/// Cloneable embedded-I/O writer that serializes the session's reader task and
+/// an asynchronous notification task onto one stream half.
+///
+/// The lock is taken on the first write of a message and released by its
+/// flush, so a whole WebSocket frame — header, then payload — is written
+/// without another sender interleaving one of its own. Two senders sharing a
+/// writer at frame granularity would produce bytes that are not a valid frame
+/// sequence at all, which is a stronger failure than the interleaved *lines*
+/// the newline framing before it could have produced.
+struct SharedWriter<W: 'static> {
+    inner: Arc<tokio::sync::Mutex<W>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<W>>,
+}
+
+impl<W: 'static> core::fmt::Debug for SharedWriter<W> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("SharedWriter")
+            .field("locked", &self.guard.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<W: 'static> Clone for SharedWriter<W> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            guard: None,
+        }
+    }
+}
+
+impl<W: 'static> SharedWriter<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(writer)),
+            guard: None,
+        }
+    }
+}
+
+impl<W> embedded_io_async::ErrorType for SharedWriter<W>
+where
+    W: AsyncWrite + Unpin + 'static,
+{
+    type Error = io::Error;
+}
+
+impl<W> embedded_io_async::Write for SharedWriter<W>
+where
+    W: AsyncWrite + Unpin + 'static,
+{
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        if self.guard.is_none() {
+            self.guard = Some(Arc::clone(&self.inner).lock_owned().await);
+        }
+        let result = self
+            .guard
+            .as_mut()
+            .expect("writer lock was just acquired")
+            .write(buf)
+            .await;
+        if matches!(result, Ok(0) | Err(_)) {
+            self.guard = None;
+        }
+        result
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        if self.guard.is_none() {
+            self.guard = Some(Arc::clone(&self.inner).lock_owned().await);
+        }
+        let result = self
+            .guard
+            .as_mut()
+            .expect("writer lock was just acquired")
+            .flush()
+            .await;
+        self.guard = None;
+        result
+    }
+}
+
+#[derive(Debug)]
+struct PeerUsage {
+    connections: usize,
+    request_tokens_mt: u32,
+    last_refill: Instant,
+}
+
+impl PeerUsage {
+    fn new(now: Instant) -> Self {
+        Self {
+            connections: 0,
+            request_tokens_mt: REQUEST_BURST.saturating_mul(REQUEST_COST_MT),
+            last_refill: now,
+        }
+    }
+
+    fn allow_request(&mut self, now: Instant) -> bool {
+        let elapsed_ms = now.saturating_duration_since(self.last_refill).as_millis();
+        let gained = elapsed_ms
+            .saturating_mul(u128::from(REQUESTS_PER_SEC))
+            .min(u128::from(u32::MAX)) as u32;
+        self.request_tokens_mt = self
+            .request_tokens_mt
+            .saturating_add(gained)
+            .min(REQUEST_BURST.saturating_mul(REQUEST_COST_MT));
+        self.last_refill = now;
+
+        if self.request_tokens_mt < REQUEST_COST_MT {
+            return false;
+        }
+        self.request_tokens_mt -= REQUEST_COST_MT;
+        true
+    }
+}
+
+/// RAII accounting for one accepted connection.
+struct ConnectionPermit {
+    state: Arc<AppState>,
+    key: [u8; 32],
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.state.close_connection(self.key);
+    }
+}
+
+/// Everything the connection handlers share.
+///
+/// The peer list is a replaceable validated snapshot. RPC handlers and the
+/// tunnel's local resolver read the same snapshot, so a successful config
+/// reload changes both sets of answers together.
+#[derive(Debug)]
+pub struct AppState {
+    registry: SharedRegistry,
+    /// Which configured peers have been heard from during this process. The
+    /// set is historical, so it can include a peer later removed by reload.
+    seen: Mutex<HashSet<[u8; 32]>>,
+    /// Requests from keys with no record. Counted, never recorded per key — an
+    /// unconfigured caller must not be able to grow a table here.
+    refused: AtomicU64,
+    /// Per-configured-peer connection and request accounting. Entries are
+    /// created only for keys present in the registry, so an unconfigured
+    /// authenticated caller cannot grow this table.
+    usage: Mutex<HashMap<[u8; 32], PeerUsage>>,
+    rate_limited: AtomicU64,
+    connection_limited: AtomicU64,
+}
+
+impl AppState {
+    pub fn new(registry: Registry) -> Arc<Self> {
+        Arc::new(Self {
+            registry: SharedRegistry::new(registry),
+            seen: Mutex::new(HashSet::new()),
+            refused: AtomicU64::new(0),
+            usage: Mutex::new(HashMap::new()),
+            rate_limited: AtomicU64::new(0),
+            connection_limited: AtomicU64::new(0),
+        })
+    }
+
+    /// Shared registry handle used by the config-backed tunnel resolver.
+    pub fn registry(&self) -> SharedRegistry {
+        self.registry.clone()
+    }
+
+    /// Distinct peers heard from.
+    pub fn known_count(&self) -> usize {
+        self.seen().len()
+    }
+
+    /// Peers API operations refused for coming from an unconfigured key.
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    pub fn rate_limited(&self) -> u64 {
+        self.rate_limited.load(Ordering::Relaxed)
+    }
+
+    pub fn connection_limited(&self) -> u64 {
+        self.connection_limited.load(Ordering::Relaxed)
+    }
+
+    /// Reserve one connection slot for a configured authenticated key.
+    ///
+    /// Unconfigured keys remain untracked so they cannot grow `usage`; their
+    /// ordinary request admission still returns the protocol's indistinguishable
+    /// `not_found` result.
+    fn open_connection(self: &Arc<Self>, key: [u8; 32]) -> Option<ConnectionPermit> {
+        let registry = self.registry.config_snapshot();
+        if registry.lookup_key(&key).is_none() {
+            return Some(ConnectionPermit {
+                state: Arc::clone(self),
+                key,
+            });
+        }
+
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        usage.retain(|public_key, peer| {
+            peer.connections != 0 || registry.lookup_key(public_key).is_some()
+        });
+        let peer = usage
+            .entry(key)
+            .or_insert_with(|| PeerUsage::new(Instant::now()));
+        if peer.connections >= MAX_CONNECTIONS_PER_PEER {
+            let count = self.connection_limited.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                "dropping Peers API connection from {}: per-peer connection limit {} reached ({count} dropped so far)",
+                &encode_key(&key).as_str()[..KEY_PREFIX_LEN],
+                MAX_CONNECTIONS_PER_PEER,
+            );
+            return None;
+        }
+        peer.connections += 1;
+        Some(ConnectionPermit {
+            state: Arc::clone(self),
+            key,
+        })
+    }
+
+    fn close_connection(&self, key: [u8; 32]) {
+        let configured = self.registry.config_snapshot().lookup_key(&key).is_some();
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(peer) = usage.get_mut(&key) else {
+            return;
+        };
+        peer.connections = peer.connections.saturating_sub(1);
+        // Once a key disappears from the registry and has no live connection,
+        // forget its limiter state rather than retaining historical keys.
+        if peer.connections == 0 && !configured {
+            usage.remove(&key);
+        }
+    }
+
+    fn allow_request(&self, key: [u8; 32]) -> bool {
+        let registry = self.registry.config_snapshot();
+        if registry.lookup_key(&key).is_none() {
+            return true;
+        }
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        usage.retain(|public_key, peer| {
+            peer.connections != 0 || registry.lookup_key(public_key).is_some()
+        });
+        let peer = usage
+            .entry(key)
+            .or_insert_with(|| PeerUsage::new(Instant::now()));
+        if peer.allow_request(Instant::now()) {
+            return true;
+        }
+        let count = self.rate_limited.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::debug!(
+            "rate limiting Peers API request from {} ({count} limited so far)",
+            &encode_key(&key).as_str()[..KEY_PREFIX_LEN]
+        );
+        false
+    }
+
+    /// Note an API operation from a peer. Returns `true` the first time each key is
+    /// seen, which the caller uses to log arrivals once rather than per
+    /// request.
+    fn note(&self, record: &PeerRecord) -> bool {
+        self.seen().insert(record.public_key)
+    }
+
+    /// Account for an API operation from a key with no record.
+    ///
+    /// The first one is worth an operator's attention — a peer the tunnel
+    /// accepted is missing from the map. The rest are counted and logged at
+    /// `debug`, so a persistent caller cannot turn this into a log amplifier.
+    fn refuse(&self, source: [u8; 32]) {
+        let count = self.refused.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 {
+            tracing::warn!(
+                "refusing a Peers API operation from authenticated peer {}: it has no peer registry record. It can open a tunnel session but cannot resolve",
+                encode_key(&source)
+            );
+        } else {
+            tracing::debug!(
+                "refusing a Peers API operation from {} ({count} refused so far)",
+                encode_key(&source)
+            );
+        }
+    }
+
+    /// A poisoned lock only means a previous holder panicked while holding a
+    /// set of keys; the server has no reason to stop answering API operations over it.
+    fn seen(&self) -> std::sync::MutexGuard<'_, HashSet<[u8; 32]>> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// The RPC dispatcher for one accepted connection.
+#[derive(Debug)]
+pub(crate) struct PeersApiHandler {
+    state: Arc<AppState>,
+    peer_key: [u8; 32],
+    /// The caller's key prefix for log lines. Connection identity is fixed at
+    /// accept, so this is rendered once rather than per request.
+    caller: String,
+    subscription: Arc<KeyedSubscription>,
+}
+
+/// What one lookup asks for. The two methods differ only in this.
+#[derive(Debug, Clone, Copy)]
+enum Lookup<'a> {
+    Key(&'a str),
+    Address(&'a str),
+}
+
+/// What the registry had to say about one request.
+///
+/// The three non-record outcomes are kept apart deliberately. Only
+/// [`Answer::Miss`] is a statement about the *target*, and only a statement
+/// about the target may become the authoritative `{"not_found":{}}` a client
+/// deletes a held record on.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum Answer {
+    /// The registry contains this record.
+    Record(PeerInfo),
+    /// The registry authoritatively has no record for the target.
+    Miss,
+    /// The caller's own key has no registry record.
+    NotAdmitted,
+    /// The parameter was well-shaped JSON but not a decodable key or address.
+    BadArgument,
+}
+
+impl PeersApiHandler {
+    pub(crate) fn new(
+        state: Arc<AppState>,
+        peer_key: [u8; 32],
+        subscription: Arc<KeyedSubscription>,
+    ) -> Self {
+        let caller = encode_key(&peer_key).as_str()[..KEY_PREFIX_LEN].to_string();
+        Self {
+            state,
+            peer_key,
+            caller,
+            subscription,
+        }
+    }
+
+    /// Admit the caller and resolve one side-effect-free lookup.
+    fn lookup(&self, query: Lookup<'_>) -> Answer {
+        self.state.registry.read(|published| {
+            if admit(&self.state, published.config(), self.peer_key).is_none() {
+                return Answer::NotAdmitted;
+            }
+            let record = match query {
+                Lookup::Key(text) => {
+                    let Ok(key) = decode_key(text) else {
+                        return Answer::BadArgument;
+                    };
+                    published.lookup_key(&key)
+                }
+                Lookup::Address(text) => {
+                    let Ok(address) = text.parse::<IpAddr>() else {
+                        return Answer::BadArgument;
+                    };
+                    published.lookup_address(microtun_api::unmap_address(address))
+                }
+            };
+            match record {
+                Some(record) => Answer::Record(published.info(record)),
+                None => Answer::Miss,
+            }
+        })
+    }
+
+    /// Subscribe to one peer and return the snapshot protected by that
+    /// subscription.
+    ///
+    /// Registration happens while the shared registry read lock is held. A
+    /// registry writer therefore cannot publish and dispatch a later change in
+    /// the gap between the returned state and the watch becoming visible.
+    fn watch(&self, text: &str) -> Answer {
+        self.state.registry.read(|published| {
+            if admit(&self.state, published.config(), self.peer_key).is_none() {
+                return Answer::NotAdmitted;
+            }
+            let Ok(public_key) = decode_key(text) else {
+                return Answer::BadArgument;
+            };
+            let Some(record) = published.lookup_key(&public_key) else {
+                // If this was an idempotent re-watch of a key that has since
+                // disappeared, do not leave stale interest indexed forever.
+                self.subscription.unwatch(public_key);
+                return Answer::Miss;
+            };
+            self.subscription.watch(public_key);
+            Answer::Record(published.info(record))
+        })
+    }
+
+    /// Turn one resolved answer into a response.
+    fn respond(&self, method: &str, answer: Answer, responder: Responder<'_>) -> Reply {
+        match answer {
+            Answer::Record(record) => {
+                tracing::debug!(
+                    "{method} from {} answered with peer {}",
+                    self.caller,
+                    &record.public_key.as_str()[..KEY_PREFIX_LEN]
+                );
+                responder.ok(&LookupResult::Found(record))
+            }
+            Answer::Miss => {
+                tracing::debug!("{method} from {} not found", self.caller);
+                miss(responder)
+            }
+            // Never a miss: see the module header. The caller's own admission
+            // says nothing about whether the peer it asked about exists.
+            Answer::NotAdmitted => {
+                tracing::debug!("{method} from unadmitted caller {}", self.caller);
+                responder.error(codes::NOT_ADMITTED, "caller is not a configured peer")
+            }
+            Answer::BadArgument => {
+                tracing::debug!("{method} from {} had an undecodable argument", self.caller);
+                responder.error(
+                    codes::INVALID_PARAMS,
+                    "params member is not a valid public key or address",
+                )
+            }
+        }
+    }
+}
+
+impl Handler for PeersApiHandler {
+    fn handle_request(
+        &mut self,
+        method: &str,
+        params: Params<'_>,
+        responder: Responder<'_>,
+    ) -> Reply {
+        if !self.state.allow_request(self.peer_key) {
+            // A rate limit is transient. Never turn it into `not_found`, which
+            // clients are required to negative-cache as authoritative.
+            return responder.error(codes::RATE_LIMITED, "request rate limit exceeded");
+        }
+        match method {
+            METHOD_BY_KEY => {
+                let Ok(args) = params.parse::<KeyParams<'_>>() else {
+                    return responder.invalid_params();
+                };
+                let record = self.lookup(Lookup::Key(args.public_key));
+                self.respond(METHOD_BY_KEY, record, responder)
+            }
+            METHOD_BY_ADDRESS => {
+                let Ok(args) = params.parse::<ByAddressParams<'_>>() else {
+                    return responder.invalid_params();
+                };
+                let record = self.lookup(Lookup::Address(args.address));
+                self.respond(METHOD_BY_ADDRESS, record, responder)
+            }
+            METHOD_WATCH => {
+                let Ok(args) = params.parse::<KeyParams<'_>>() else {
+                    return responder.invalid_params();
+                };
+                let record = self.watch(args.public_key);
+                self.respond(METHOD_WATCH, record, responder)
+            }
+            _ => responder.unknown_method(),
+        }
+    }
+
+    fn handle_notification(&mut self, method: &str, params: Params<'_>) {
+        if method != METHOD_UNWATCH {
+            return;
+        }
+        let Ok(args) = params.parse::<KeyParams<'_>>() else {
+            tracing::debug!("ignoring {method} with invalid params");
+            return;
+        };
+        let registry = self.state.registry.config_snapshot();
+        if admit(&self.state, &registry, self.peer_key).is_none() {
+            return;
+        }
+        let Ok(public_key) = decode_key(args.public_key) else {
+            tracing::debug!("ignoring {method} from {} with invalid key", self.caller);
+            return;
+        };
+        self.subscription.unwatch(public_key);
+        tracing::debug!(
+            "{METHOD_UNWATCH} from {} for {}",
+            self.caller,
+            encode_key(&public_key)
+        );
+    }
+}
+
+/// Resolve the caller by the authenticated tunnel peer key.
+fn admit<'a>(state: &AppState, registry: &'a Registry, source: [u8; 32]) -> Option<&'a PeerRecord> {
+    match registry.lookup_key(&source) {
+        Some(caller) => {
+            if state.note(caller) {
+                tracing::info!("first Peers API operation from {}", caller.key_prefix());
+            }
+            Some(caller)
+        }
+        None => {
+            state.refuse(source);
+            None
+        }
+    }
+}
+
+/// The authoritative miss.
+///
+/// An unknown key and an address nobody claims are the same `{"not_found":{}}`.
+/// An unadmitted
+/// caller, an undecodable argument, and an overloaded server are *not* misses
+/// and never reach here; see the module header.
+fn miss(responder: Responder<'_>) -> Reply {
+    responder.ok(&LookupResult::NotFound {})
+}
+
+/// What this server upgrades.
+///
+/// This is the constant `microtun-api` defines, so the endpoint a client dials
+/// and the endpoint this server answers cannot drift apart without a compile
+/// error.
+const UPGRADE: ServerConfig<'static> = ServerConfig {
+    path: PEERS_API_PATH,
+};
+
+/// Serve the Peers API on one connection until it ends.
+///
+/// A reply that does not fit the transmit buffer degrades to an internal-error
+/// response inside the session layer rather than desynchronizing the
+/// conversation, and [`microtun_api::RECORD_MESSAGE_LEN`] is sized so that a
+/// worst-case record never reaches that path.
+pub async fn serve_connection<S>(stream: S, state: Arc<AppState>, peer_key: [u8; 32])
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (reader, writer) = tokio::io::split(stream);
+    let mut reader = TokioIo::new(reader);
+    let writer = SharedWriter::new(writer);
+    let mut handshake_writer = writer.clone();
+
+    // Read the upgrade request before deciding anything. The decision needs no
+    // part of it — the caller's identity comes from the tunnel — but answering
+    // before the request has been read leaves a client writing into a socket
+    // that is already closing, which it reports as a transport failure rather
+    // than as the status this server actually chose.
+    let mut scratch = [0u8; SERVER_HANDSHAKE_LEN];
+    let upgrade = match microtun_ws::request_upgrade(&mut reader, &UPGRADE, &mut scratch).await {
+        Ok(upgrade) => upgrade,
+        Err(error) => {
+            tracing::debug!("Peers API handshake rejected: {error}");
+            let _ = microtun_ws::reject(&mut handshake_writer, Status::BadRequest).await;
+            return;
+        }
+    };
+
+    // Refuse an unadmitted caller before the upgrade rather than by serving it
+    // misses. A client classifies a refused connection as transient and keeps
+    // the records it holds; it would classify a `not_found` replay as
+    // authoritative and delete all of them. The two are indistinguishable to a
+    // caller that was never admitted, and decisively different to one whose
+    // admission lapsed because of a bad config push.
+    //
+    // Refusing at the handshake rather than after it is what makes the refusal
+    // legible: `403` names the reason, where a close frame on an established
+    // session is one more way for a connection to end.
+    if state
+        .registry
+        .config_snapshot()
+        .lookup_key(&peer_key)
+        .is_none()
+    {
+        state.refuse(peer_key);
+        let _ = microtun_ws::reject(&mut handshake_writer, Status::Forbidden).await;
+        return;
+    }
+    let Some(_connection_permit) = state.open_connection(peer_key) else {
+        let _ = microtun_ws::reject(&mut handshake_writer, Status::ServiceUnavailable).await;
+        return;
+    };
+    if let Err(error) = upgrade.accept(&mut handshake_writer).await {
+        tracing::debug!("Peers API upgrade failed: {error}");
+        return;
+    }
+
+    let registry = state.registry();
+    let subscription = registry.subscribe_keyed(peer_key);
+
+    let reader_writer = writer.clone();
+    let reader_state = Arc::clone(&state);
+    let reader_subscription = Arc::clone(&subscription);
+    let mut reader_task = tokio::spawn(async move {
+        let ws = microtun_ws::Connection::server(reader, reader_writer);
+        let mut session: Session<_, _, _, QUERY_MESSAGE_LEN, RECORD_MESSAGE_LEN> = Session::new(
+            ws,
+            PeersApiHandler::new(reader_state, peer_key, reader_subscription),
+        );
+        loop {
+            session.poll().await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), microtun_api::session::SessionError>(())
+    });
+    let mut notifier = Sender::server(writer);
+
+    loop {
+        tokio::select! {
+            result = &mut reader_task => {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::debug!("Peers API session ended: {error}"),
+                    Err(error) => tracing::debug!("Peers API reader task ended: {error}"),
+                }
+                return;
+            }
+            change = subscription.recv() => {
+                match change {
+                    Some(change) => {
+                        // A caller removed by the same publication must not see
+                        // an authoritative target invalidation that happened to
+                        // be queued before its own removal was dispatched.
+                        let current = registry.config_snapshot();
+                        if current.lookup_key(&peer_key).is_none() {
+                            let _ = notifier
+                                .close(CloseCode::POLICY_VIOLATION, "caller is no longer configured")
+                                .await;
+                            reader_task.abort();
+                            return;
+                        }
+                        if send_peer_invalidation(&mut notifier, change.public_key, change.kind)
+                            .await
+                            .is_err()
+                        {
+                            reader_task.abort();
+                            return;
+                        }
+                    }
+                    None => {
+                        // Caller removal closes the keyed subscription. Reconnect
+                        // replay re-establishes watches only after admission.
+                        let _ = notifier
+                            .close(CloseCode::POLICY_VIOLATION, "caller is no longer configured")
+                            .await;
+                        reader_task.abort();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Tell one watching connection that a peer key may no longer be current.
+///
+/// Added/modified peers use `peer.changed`; disappeared peers use
+/// `peer.removed`. Both notifications are key-only invalidations. Interested
+/// clients confirm the current state with an ordinary `peer.by_key`, so a
+/// remove/re-add race converges on the registry's latest state rather than on
+/// whichever notification happened to be written last.
+///
+/// The notification is serialized here rather than through the session,
+/// because the session lives in the reader task. Both write through the same
+/// `SharedWriter`, which holds its lock for a whole message, so the two never
+/// interleave frames on the wire.
+async fn send_peer_invalidation<W>(
+    notifier: &mut Sender<W>,
+    public_key: [u8; 32],
+    kind: RegistryChangeKind,
+) -> Result<(), microtun_api::session::SessionError>
+where
+    W: embedded_io_async::Write,
+{
+    let text = encode_key(&public_key);
+    let params = KeyParams {
+        public_key: text.as_str(),
+    };
+    let method = match kind {
+        RegistryChangeKind::Changed => METHOD_CHANGED,
+        RegistryChangeKind::Removed => METHOD_REMOVED,
+    };
+    let mut buffer = [0u8; RECORD_MESSAGE_LEN];
+    let len = microtun_api::session::encode_notification(&mut buffer, method, &params)?;
+    notifier.send_text(&buffer[..len]).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use microtun_api::{
+        PeerInfo,
+        session::{NoHandler, SessionError},
+    };
+    use serde::Serialize;
+    use tokio::{
+        io::{DuplexStream, ReadHalf, WriteHalf},
+        sync::mpsc,
+    };
+
+    use super::*;
+    use crate::config::{
+        self,
+        tests::{server_config, server_public},
+    };
+
+    const GATEWAY_KEY: [u8; 32] = [0xAA; 32];
+    const LAPTOP_KEY: [u8; 32] = [0xBB; 32];
+    const ABSENT_KEY: [u8; 32] = [0xCC; 32];
+
+    /// The same three keys as a configuration file, a parameter, and a result
+    /// spell them: the tunnel protocol's base64, which is now the only spelling there is.
+    const GATEWAY: &str = "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=";
+    const LAPTOP: &str = "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s=";
+    const ABSENT: &str = "zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw=";
+
+    /// Collects key-only peer invalidations and whether each one was removal.
+    #[derive(Debug)]
+    struct CaptureInvalidation(mpsc::UnboundedSender<(bool, [u8; 32])>);
+
+    impl Handler for CaptureInvalidation {
+        fn handle_request(
+            &mut self,
+            _method: &str,
+            _params: Params<'_>,
+            responder: Responder<'_>,
+        ) -> Reply {
+            responder.unknown_method()
+        }
+
+        fn handle_notification(&mut self, method: &str, params: Params<'_>) {
+            let removed = match method {
+                METHOD_CHANGED => false,
+                METHOD_REMOVED => true,
+                _ => return,
+            };
+            let args = params
+                .parse::<KeyParams<'_>>()
+                .expect("server sends valid peer invalidations");
+            let key = decode_key(args.public_key).expect("server names a valid key");
+            let _ = self.0.send((removed, key));
+        }
+    }
+
+    /// The test network: the server and gateway each own a /32, while the
+    /// laptop owns the /24 around them, so longest-prefix behavior is exercised
+    /// — and so a source-address attribution would get the laptop wrong.
+    fn config_text() -> String {
+        format!(
+            "{}[Peer]\nName = gateway\nPublicKey = {GATEWAY}\nEndpoint = 198.51.100.20:51820\nAddress = 10.0.0.1/32\n\n\
+             [Peer]\nName = laptop\nPublicKey = {LAPTOP}\nAddress = 10.0.0.0/24\nRelay = gateway\n",
+            server_config("10.0.0.9/32")
+        )
+    }
+
+    fn app_state() -> Arc<AppState> {
+        let loaded =
+            config::parse(&config_text(), Path::new("test.conf")).expect("test config loads");
+        AppState::new(loaded.registry)
+    }
+
+    /// A client-side session over one half of a duplex, as a resolver builds
+    /// one: through the real handshake, against the real endpoint constants.
+    type ClientSession<H> = Session<
+        TokioIo<ReadHalf<DuplexStream>>,
+        TokioIo<WriteHalf<DuplexStream>>,
+        H,
+        RECORD_MESSAGE_LEN,
+        QUERY_MESSAGE_LEN,
+    >;
+
+    async fn open<H: Handler>(
+        client: DuplexStream,
+        handler: H,
+    ) -> Result<ClientSession<H>, microtun_api::client::ClientError> {
+        let (reader, writer) = tokio::io::split(client);
+        let mut rng = rand::rngs::OsRng;
+        microtun_api::client::connect(
+            TokioIo::new(reader),
+            TokioIo::new(writer),
+            &mut rng,
+            handler,
+        )
+        .await
+    }
+
+    /// Connect to a server serving `peer_key`, and expect the handshake to
+    /// succeed.
+    async fn connect<H: Handler>(
+        state: &Arc<AppState>,
+        peer_key: [u8; 32],
+        handler: H,
+    ) -> ClientSession<H> {
+        let (client, server) = tokio::io::duplex(8192);
+        tokio::spawn(serve_connection(server, Arc::clone(state), peer_key));
+        open(client, handler).await.expect("the handshake succeeds")
+    }
+
+    /// Issue one call over a real connection, as if it arrived over a session
+    /// authenticated to `from`.
+    async fn call<P, T>(
+        state: &Arc<AppState>,
+        from: [u8; 32],
+        method: &str,
+        params: Option<&P>,
+    ) -> Result<T, SessionError>
+    where
+        P: Serialize + ?Sized,
+        T: serde::de::DeserializeOwned,
+    {
+        let mut session = connect(state, from, NoHandler).await;
+        session.call(method, params).await
+    }
+
+    /// Reduce a lookup result to the record it carries, asserting on the way
+    /// through that the server emitted one of the two conforming shapes.
+    ///
+    /// Every test that only cares about hit-or-miss goes through here, so the
+    /// wire shape is checked on every lookup the suite makes rather than in
+    /// one dedicated test.
+    fn found(result: LookupResult) -> Option<PeerInfo> {
+        match result {
+            LookupResult::Found(peer) => Some(peer),
+            LookupResult::NotFound {} => None,
+        }
+    }
+
+    /// A `by_key` lookup, built exactly as a client builds one.
+    async fn by_key(state: &Arc<AppState>, from: [u8; 32], key: &str) -> Option<PeerInfo> {
+        let result: LookupResult = call(
+            state,
+            from,
+            METHOD_BY_KEY,
+            Some(&microtun_api::QueryParams::ByKey { public_key: key }),
+        )
+        .await
+        .expect("the call completes");
+        found(result)
+    }
+
+    /// The error code a call was rejected with.
+    ///
+    /// Undecodable arguments and unadmitted callers are now errors rather than
+    /// misses, so the suite has to be able to look at the code.
+    fn error_code<T: std::fmt::Debug>(result: Result<T, SessionError>) -> u16 {
+        match result {
+            Err(SessionError::Remote(error)) => error.code,
+            other => panic!("expected a remote error, got {other:?}"),
+        }
+    }
+
+    /// A `by_key` call that is expected to be rejected.
+    async fn by_key_error(state: &Arc<AppState>, from: [u8; 32], key: &str) -> u16 {
+        error_code(
+            call::<_, LookupResult>(
+                state,
+                from,
+                METHOD_BY_KEY,
+                Some(&microtun_api::QueryParams::ByKey { public_key: key }),
+            )
+            .await,
+        )
+    }
+
+    /// A `by_address` lookup from the laptop.
+    async fn by_address(state: &Arc<AppState>, address: &str) -> Option<PeerInfo> {
+        let result: LookupResult = call(
+            state,
+            LAPTOP_KEY,
+            METHOD_BY_ADDRESS,
+            Some(&microtun_api::QueryParams::ByAddress { address }),
+        )
+        .await
+        .expect("the call completes");
+        found(result)
+    }
+
+    #[tokio::test]
+    async fn by_key_hits_and_misses() {
+        let state = app_state();
+
+        let record = by_key(&state, LAPTOP_KEY, GATEWAY)
+            .await
+            .expect("the gateway is configured");
+        assert_eq!(record.public_key.as_str(), GATEWAY);
+        assert_eq!(record.endpoint.as_deref(), Some("198.51.100.20:51820"));
+
+        // The Tracker's own record is keyed by the key derived from
+        // Tunnel.PrivateKey.
+        let server_text = encode_key(&server_public());
+        let record = by_key(&state, LAPTOP_KEY, server_text.as_str())
+            .await
+            .expect("the server has its own record");
+        assert_eq!(record.public_key.as_str(), server_text.as_str());
+        assert_eq!(record.endpoint, None);
+
+        // A well-formed key nobody holds is the authoritative miss.
+        assert!(by_key(&state, LAPTOP_KEY, ABSENT).await.is_none());
+
+        // A string that is not a key at all is not a statement about the peer
+        // table, so it is a caller error rather than a negative-cached miss.
+        for key in [
+            "not-a-key",
+            // The URL-safe, unpadded spelling was a property of a path
+            // segment. There are no paths, and it is not a key.
+            &GATEWAY[..43],
+            // Base64 is case-sensitive, and re-casing this key also leaves
+            // non-canonical trailing bits, so it does not decode.
+            &GATEWAY.to_uppercase(),
+        ] {
+            assert_eq!(
+                by_key_error(&state, LAPTOP_KEY, key).await,
+                codes::INVALID_PARAMS,
+                "expected invalid-params for {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_admitted_peer_can_resolve_every_other_peer() {
+        let state = app_state();
+        assert!(by_key(&state, LAPTOP_KEY, GATEWAY).await.is_some());
+        assert!(by_address(&state, "10.0.0.1").await.is_some());
+
+        let server_text = encode_key(&server_public());
+        assert!(by_key(&state, GATEWAY_KEY, LAPTOP).await.is_some());
+        assert!(
+            by_key(&state, GATEWAY_KEY, server_text.as_str())
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn learned_endpoint_overrides_config_in_rpc_answers() {
+        let state = app_state();
+        let learned: std::net::SocketAddr = "203.0.113.20:42424".parse().unwrap();
+        state.registry().observe_endpoint(GATEWAY_KEY, learned);
+
+        let by_key_record = by_key(&state, LAPTOP_KEY, GATEWAY).await.expect("gateway");
+        assert_eq!(
+            by_key_record.endpoint.as_deref(),
+            Some("203.0.113.20:42424")
+        );
+
+        let by_address_record = by_address(&state, "10.0.0.1").await.expect("gateway");
+        assert_eq!(
+            by_address_record.endpoint.as_deref(),
+            Some("203.0.113.20:42424")
+        );
+    }
+
+    #[tokio::test]
+    async fn by_address_uses_the_longest_prefix() {
+        let state = app_state();
+
+        // 10.0.0.1/32 (gateway) beats 10.0.0.0/24 (laptop).
+        let record = by_address(&state, "10.0.0.1").await.expect("gateway");
+        assert_eq!(record.public_key.as_str(), GATEWAY);
+
+        let record = by_address(&state, "10.0.0.5").await.expect("laptop");
+        assert_eq!(record.public_key.as_str(), LAPTOP);
+
+        // 10.0.0.9/32 from the server's [Tunnel] record also beats the laptop's /24.
+        let record = by_address(&state, "10.0.0.9").await.expect("server");
+        assert_eq!(
+            record.public_key.as_str(),
+            encode_key(&server_public()).as_str()
+        );
+
+        // IPv4-mapped IPv6 finds the same v4 prefix.
+        let record = by_address(&state, "::ffff:10.0.0.1")
+            .await
+            .expect("gateway");
+        assert_eq!(record.public_key.as_str(), GATEWAY);
+
+        // An address nobody claims is a miss; a string that is not an address
+        // is a caller error.
+        for address in ["192.0.2.1", "fd00::1"] {
+            assert!(
+                by_address(&state, address).await.is_none(),
+                "expected a miss for {address}"
+            );
+        }
+        let rejected = error_code(
+            call::<_, LookupResult>(
+                &state,
+                LAPTOP_KEY,
+                METHOD_BY_ADDRESS,
+                Some(&microtun_api::QueryParams::ByAddress {
+                    address: "not-an-address",
+                }),
+            )
+            .await,
+        );
+        assert_eq!(rejected, codes::INVALID_PARAMS);
+    }
+
+    /// The answer this server produces must decode with the codec every client
+    /// uses. This is the contract test; the rest is plumbing.
+    #[tokio::test]
+    async fn answers_decode_with_the_client_codec() {
+        let state = app_state();
+
+        let record = by_key(&state, LAPTOP_KEY, GATEWAY).await.expect("gateway");
+        let peer = microtun_api::decode_peer(&record).expect("client codec decodes");
+        assert_eq!(peer.public_key, GATEWAY_KEY);
+        assert_eq!(peer.endpoint, Some("198.51.100.20:51820".parse().unwrap()));
+        assert_eq!(peer.relay, None);
+        assert_eq!(peer.address, "10.0.0.1/32".parse().unwrap());
+
+        let record = by_key(&state, LAPTOP_KEY, LAPTOP).await.expect("laptop");
+        let peer = microtun_api::decode_peer(&record).expect("client codec decodes");
+        assert_eq!(peer.public_key, LAPTOP_KEY);
+        assert_eq!(peer.endpoint, None);
+        assert_eq!(peer.relay, Some(GATEWAY_KEY));
+
+        // A by-address answer must cover the queried address, or the core
+        // discards it as a mismatched positive.
+        let queried: IpAddr = "10.0.0.5".parse().unwrap();
+        let record = by_address(&state, "10.0.0.5").await.expect("laptop");
+        let peer = microtun_api::decode_peer(&record).expect("client codec decodes");
+        assert!(peer.address.contains(&queried));
+    }
+
+    #[tokio::test]
+    async fn ordinary_by_key_lookup_does_not_register_interest() {
+        let state = app_state();
+        let (changed_tx, _changed_rx) = mpsc::unbounded_channel();
+        let mut connection = connect(&state, LAPTOP_KEY, CaptureInvalidation(changed_tx)).await;
+
+        let hit: LookupResult = connection
+            .call(
+                METHOD_BY_KEY,
+                Some(&KeyParams {
+                    public_key: GATEWAY,
+                }),
+            )
+            .await
+            .expect("lookup completes");
+        assert!(found(hit).is_some());
+
+        let replacement = config_text().replace("198.51.100.20:51820", "198.51.100.99:51820");
+        let loaded =
+            config::parse(&replacement, Path::new("test.conf")).expect("replacement loads");
+        state.registry().replace(loaded.registry);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), connection.poll())
+                .await
+                .is_err(),
+            "side-effect-free by_key unexpectedly registered a watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_peer_changes_are_keyed_and_relooked_up() {
+        let state = app_state();
+        let (changed_tx, mut changed_rx) = mpsc::unbounded_channel();
+        let mut connection = connect(&state, LAPTOP_KEY, CaptureInvalidation(changed_tx)).await;
+
+        let initial_peer: LookupResult = connection
+            .call(
+                METHOD_WATCH,
+                Some(&microtun_api::QueryParams::ByKey {
+                    public_key: GATEWAY,
+                }),
+            )
+            .await
+            .expect("watch completes");
+        assert_eq!(
+            found(initial_peer)
+                .as_ref()
+                .and_then(|peer| peer.endpoint.as_deref()),
+            Some("198.51.100.20:51820")
+        );
+
+        let replacement = config_text().replace("198.51.100.20:51820", "198.51.100.99:51820");
+        let loaded =
+            config::parse(&replacement, Path::new("test.conf")).expect("replacement loads");
+        state.registry().replace(loaded.registry);
+
+        // Only a connection that explicitly watched the gateway receives this
+        // key-only invalidation.
+        connection.poll().await.expect("notification arrives");
+        assert_eq!(
+            changed_rx.recv().await.expect("captured changed key"),
+            (false, GATEWAY_KEY)
+        );
+
+        // Learning the new state is always an ordinary side-effect-free lookup.
+        let refreshed: LookupResult = connection
+            .call(
+                METHOD_BY_KEY,
+                Some(&microtun_api::QueryParams::ByKey {
+                    public_key: GATEWAY,
+                }),
+            )
+            .await
+            .expect("re-lookup completes");
+        assert_eq!(
+            found(refreshed).and_then(|peer| peer.endpoint.map(|text| text.as_str().to_string())),
+            Some("198.51.100.99:51820".to_string())
+        );
+
+        connection
+            .notify(
+                METHOD_UNWATCH,
+                Some(&KeyParams {
+                    public_key: GATEWAY,
+                }),
+            )
+            .await
+            .expect("unwatch is sent");
+        // A following request is an ordering barrier: the server has consumed
+        // the unwatch before it can answer this lookup.
+        let _: LookupResult = connection
+            .call(
+                METHOD_BY_KEY,
+                Some(&microtun_api::QueryParams::ByKey { public_key: ABSENT }),
+            )
+            .await
+            .expect("lookup ordering barrier completes");
+
+        let replacement = replacement.replace("198.51.100.99:51820", "198.51.100.77:51820");
+        let loaded =
+            config::parse(&replacement, Path::new("test.conf")).expect("second replacement loads");
+        state.registry().replace(loaded.registry);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), connection.poll())
+                .await
+                .is_err(),
+            "unwatched keys must not receive later notifications"
+        );
+    }
+
+    /// A removed peer gets its own key-only notification. The client still
+    /// confirms it with `by_key`, so a concurrent remove/re-add converges on the
+    /// current registry state.
+    #[tokio::test]
+    async fn removal_is_a_removed_notification_and_then_a_not_found_lookup() {
+        // This test is about the RPC invalidation protocol.
+        let server_record = || {
+            PeerRecord::new(
+                server_public(),
+                Some("203.0.113.10:51820".parse().unwrap()),
+                None,
+                "10.0.0.9/32".parse().unwrap(),
+                None,
+            )
+        };
+        let laptop_record = || {
+            PeerRecord::new(
+                LAPTOP_KEY,
+                None,
+                Some(server_public()),
+                "10.0.0.0/24".parse().unwrap(),
+                None,
+            )
+        };
+        let gateway_record = PeerRecord::new(
+            GATEWAY_KEY,
+            Some("198.51.100.20:51820".parse().unwrap()),
+            None,
+            "10.0.0.1/32".parse().unwrap(),
+            None,
+        );
+        let state = AppState::new(
+            Registry::build(vec![server_record(), gateway_record, laptop_record()])
+                .expect("initial registry builds"),
+        );
+        let (changed_tx, mut changed_rx) = mpsc::unbounded_channel();
+        let mut connection = connect(&state, LAPTOP_KEY, CaptureInvalidation(changed_tx)).await;
+
+        let hit: LookupResult = connection
+            .call(
+                METHOD_WATCH,
+                Some(&KeyParams {
+                    public_key: GATEWAY,
+                }),
+            )
+            .await
+            .expect("watch completes");
+        assert!(found(hit).is_some());
+
+        // Drop the gateway from the shared registry.
+        state.registry().replace(
+            Registry::build(vec![server_record(), laptop_record()])
+                .expect("gateway-less registry builds"),
+        );
+
+        connection.poll().await.expect("notification arrives");
+        assert_eq!(
+            changed_rx.recv().await.expect("captured removed key"),
+            (true, GATEWAY_KEY)
+        );
+
+        let gone: LookupResult = connection
+            .call(
+                METHOD_BY_KEY,
+                Some(&microtun_api::QueryParams::ByKey {
+                    public_key: GATEWAY,
+                }),
+            )
+            .await
+            .expect("re-lookup completes");
+        assert!(found(gone).is_none(), "the not_found result is the removal");
+    }
+
+    #[tokio::test]
+    async fn published_registry_replacement_changes_answers() {
+        let state = app_state();
+
+        let replacement = config_text()
+            .replace("198.51.100.20:51820", "198.51.100.99:51820")
+            .replace("Address = 10.0.0.1/32", "Address = 10.6.0.1/32");
+        let loaded =
+            config::parse(&replacement, Path::new("test.conf")).expect("replacement config loads");
+        state.registry().replace(loaded.registry);
+
+        let record = by_key(&state, LAPTOP_KEY, GATEWAY).await.expect("gateway");
+        assert_eq!(record.endpoint.as_deref(), Some("198.51.100.99:51820"));
+
+        // The gateway moved away from 10.0.0.1, so that address now falls
+        // back to the laptop's covering /24 while the new /32 names gateway.
+        let old_address = by_address(&state, "10.0.0.1")
+            .await
+            .expect("laptop now owns the old gateway address by prefix");
+        assert_eq!(old_address.public_key.as_str(), LAPTOP);
+
+        let new_address = by_address(&state, "10.6.0.1")
+            .await
+            .expect("gateway owns its replacement address");
+        assert_eq!(new_address.public_key.as_str(), GATEWAY);
+    }
+
+    /// An unadmitted caller must never receive `not_found`.
+    ///
+    /// This is the whole point of refusing at the handshake. A client
+    /// classifies a refused connection as transient and keeps its records; it
+    /// classifies `not_found` as authoritative and deletes them. If admission
+    /// lapses because of a bad config push, the difference between those two
+    /// behaviours is the difference between a fleet that reconnects and a
+    /// fleet that has erased its routing state.
+    ///
+    /// Since the refusal now happens before the upgrade, the caller cannot
+    /// reach a method at all: there is no session on which a miss could be
+    /// sent. That is the strongest form this invariant can take, and it is
+    /// what this asserts.
+    #[tokio::test]
+    async fn unconfigured_callers_are_refused_without_an_authoritative_miss() {
+        let state = app_state();
+
+        // A configured peer is served.
+        assert!(by_key(&state, GATEWAY_KEY, GATEWAY).await.is_some());
+
+        // A key with no record never gets past the handshake, three times over.
+        for _ in 0..3 {
+            let (client, server) = tokio::io::duplex(8192);
+            tokio::spawn(serve_connection(server, Arc::clone(&state), ABSENT_KEY));
+            let refused = open(client, NoHandler).await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(microtun_api::client::ClientError::Session(
+                        SessionError::Transport(microtun_ws::Error::Handshake)
+                    ))
+                ),
+                "an unadmitted caller must be refused at the handshake"
+            );
+        }
+
+        // One refusal per refused connection.
+        assert_eq!(state.refused(), 3);
+        assert_eq!(state.known_count(), 1);
+    }
+
+    /// A caller removed by a reload mid-connection is disconnected, and any
+    /// request that races the close is a transient error rather than a miss.
+    #[tokio::test]
+    async fn a_caller_removed_mid_connection_never_sees_a_miss() {
+        let state = app_state();
+        let registry = state.registry();
+        let subscription = registry.subscribe_keyed(LAPTOP_KEY);
+        let handler = PeersApiHandler::new(Arc::clone(&state), LAPTOP_KEY, subscription);
+
+        // Drop the laptop — the caller itself — from the registry.
+        let without_laptop = format!(
+            "{}[Peer]\nName = gateway\nPublicKey = {GATEWAY}\nEndpoint = 198.51.100.20:51820\nAddress = 10.0.0.1/32\n",
+            server_config("10.0.0.9/32")
+        );
+        let loaded = config::parse(&without_laptop, Path::new("test.conf")).expect("config loads");
+        registry.replace(loaded.registry);
+
+        // The gateway still exists, so a miss here would be a lie about the
+        // gateway rather than a statement about the caller.
+        assert!(matches!(
+            handler.lookup(Lookup::Key(GATEWAY)),
+            Answer::NotAdmitted
+        ));
+        assert!(matches!(handler.watch(GATEWAY), Answer::NotAdmitted));
+    }
+
+    #[tokio::test]
+    async fn peers_are_tracked_once_per_key() {
+        let state = app_state();
+
+        let _ = by_key(&state, LAPTOP_KEY, GATEWAY).await;
+        let _ = by_key(
+            &state,
+            LAPTOP_KEY,
+            "zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw=",
+        )
+        .await;
+        let _ = by_key(&state, GATEWAY_KEY, LAPTOP).await;
+
+        assert_eq!(state.known_count(), 2);
+        assert_eq!(state.refused(), 0);
+    }
+
+    /// The version moved into the handshake, so a versioned method name is now
+    /// simply an unknown method — including the `v1.` spelling this protocol
+    /// used to require.
+    #[tokio::test]
+    async fn unknown_methods_are_rejected() {
+        let state = app_state();
+        for method in ["v1.peer.by_key", "peer.by_name", "by_key"] {
+            let result: Result<LookupResult, _> =
+                call(&state, LAPTOP_KEY, method, None::<&()>).await;
+            match result {
+                Err(SessionError::Remote(error)) => {
+                    assert_eq!(error.code, codes::UNKNOWN_METHOD)
+                }
+                other => panic!("expected unknown-method for {method}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A broken caller learns it is broken; the peer table stays opaque.
+    #[tokio::test]
+    async fn malformed_params_are_an_error_not_a_miss() {
+        let state = app_state();
+        let result: Result<LookupResult, _> =
+            call(&state, LAPTOP_KEY, METHOD_BY_KEY, None::<&()>).await;
+        match result {
+            Err(SessionError::Remote(error)) => {
+                assert_eq!(error.code, codes::INVALID_PARAMS)
+            }
+            other => panic!("expected invalid-params, got {other:?}"),
+        }
+    }
+
+    /// One connection carries many lookups, and its identity does not drift.
+    #[tokio::test]
+    async fn a_connection_serves_repeated_lookups() {
+        let state = app_state();
+        let mut connection = connect(&state, LAPTOP_KEY, NoHandler).await;
+
+        for _ in 0..4 {
+            let record: LookupResult = connection
+                .call(
+                    METHOD_BY_KEY,
+                    Some(&microtun_api::QueryParams::ByKey {
+                        public_key: GATEWAY,
+                    }),
+                )
+                .await
+                .expect("the call completes");
+            assert_eq!(found(record).expect("gateway").public_key.as_str(), GATEWAY);
+        }
+        assert_eq!(state.known_count(), 1);
+    }
+
+    #[test]
+    fn request_bucket_allows_burst_then_refills() {
+        let start = Instant::now();
+        let mut usage = PeerUsage::new(start);
+
+        for _ in 0..REQUEST_BURST {
+            assert!(usage.allow_request(start));
+        }
+        assert!(!usage.allow_request(start));
+
+        let one_token_later =
+            start + std::time::Duration::from_millis(1000 / u64::from(REQUESTS_PER_SEC));
+        assert!(usage.allow_request(one_token_later));
+        assert!(!usage.allow_request(one_token_later));
+    }
+
+    #[test]
+    fn connections_are_bounded_per_configured_key() {
+        let state = app_state();
+        let mut permits = Vec::new();
+
+        for _ in 0..MAX_CONNECTIONS_PER_PEER {
+            permits.push(
+                state
+                    .open_connection(LAPTOP_KEY)
+                    .expect("connection within limit is accepted"),
+            );
+        }
+        assert!(state.open_connection(LAPTOP_KEY).is_none());
+        assert_eq!(state.connection_limited(), 1);
+
+        permits.pop();
+        assert!(state.open_connection(LAPTOP_KEY).is_some());
+    }
+
+    #[tokio::test]
+    async fn excessive_requests_return_transient_errors() {
+        let state = app_state();
+        let mut connection = connect(&state, LAPTOP_KEY, NoHandler).await;
+
+        for _ in 0..REQUEST_BURST {
+            let result: LookupResult = connection
+                .call(
+                    METHOD_BY_KEY,
+                    Some(&microtun_api::QueryParams::ByKey {
+                        public_key: GATEWAY,
+                    }),
+                )
+                .await
+                .expect("burst request is accepted");
+            assert!(found(result).is_some());
+        }
+
+        let limited: Result<LookupResult, _> = connection
+            .call(
+                METHOD_BY_KEY,
+                Some(&microtun_api::QueryParams::ByKey {
+                    public_key: GATEWAY,
+                }),
+            )
+            .await;
+        match limited {
+            Err(SessionError::Remote(error)) => {
+                assert_eq!(error.code, codes::RATE_LIMITED);
+                assert_eq!(error.message, "request rate limit exceeded");
+            }
+            other => panic!("expected transient rate-limit error, got {other:?}"),
+        }
+        assert_eq!(state.rate_limited(), 1);
+    }
+}

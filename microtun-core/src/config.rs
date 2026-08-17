@@ -38,7 +38,7 @@ pub struct PinnedPeer {
     pub address: IpCidr,
     /// Ingress policy applied to authenticated inner packets from this peer.
     pub inbound_policy: InboundPolicy,
-    /// WireGuard-style persistent keepalive interval. When set, the core
+    /// Persistent keepalive interval. When set, the core
     /// periodically sends an authenticated empty transport packet while the
     /// peer is otherwise idle. `None` disables persistent keepalives.
     pub persistent_keepalive: Option<Duration>,
@@ -51,7 +51,7 @@ pub struct PinnedPeer {
 /// [`Default`] applies the recommended bounded-resource and peer-churn policy.
 /// Defaults are backend-aware: allocation-free builds retain embedded table
 /// sizes, while `alloc` builds use host-sized rate-limit and firewall tables.
-/// WireGuard protocol constants and capacities represented by [`crate::Core`]'s
+/// tunnel protocol constants and capacities represented by [`crate::Core`]'s
 /// const generic parameters deliberately do not appear here. Storage-backed
 /// implementation limits must not exceed their documented compile-time
 /// ceilings; [`crate::Core::new`] rejects configurations that do.

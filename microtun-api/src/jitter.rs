@@ -1,7 +1,7 @@
 //! Pacing jitter for reconnect and reconciliation bursts.
 //!
 //! Registry churn is a *synchronised* event: one reload invalidates a key for
-//! every interested client at the same instant, and one Peers API server restart
+//! every interested client at the same instant, and one Tracker restart
 //! drops every client's connection at the same instant. Without jitter each
 //! population answers in lockstep, so the server sees the whole fleet's
 //! refresh traffic inside one round-trip window rather than spread across the

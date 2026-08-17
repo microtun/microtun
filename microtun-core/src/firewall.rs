@@ -102,7 +102,7 @@ const ICMP_HEADER_LEN: usize = 8;
 /// Inbound filtering applied to an authenticated peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InboundPolicy {
-    /// Preserve the normal WireGuard behavior: any valid packet whose source
+    /// Preserve the normal tunnel protocol behavior: any valid packet whose source
     /// address passes cryptokey routing may be delivered.
     #[default]
     AllowAll,

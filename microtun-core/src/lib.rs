@@ -1,14 +1,14 @@
 //! # microtun-core
 //!
-//! A sans-IO WireGuard® protocol engine designed for constrained `no_std` /
+//! A sans-IO secure tunnel engine designed for constrained `no_std` /
 //! `no_alloc` targets (and equally usable on hosts).
 //!
-//! The engine implements the protocol described in the WireGuard whitepaper
-//! ("WireGuard: Next Generation Kernel Network Tunnel", Jason A. Donenfeld):
+//! The engine implements the protocol described in the original protocol whitepaper
+//! by Jason A. Donenfeld:
 //!
 //! ## Dynamic peers
 //!
-//! Unlike a classic WireGuard device, `microtun` does not require all peers to
+//! Unlike a classic tunnel device, `microtun` does not require all peers to
 //! be configured up front. Unknown peers — both inbound (unknown static key in
 //! a handshake initiation) and outbound (destination address not in the route
 //! cache) — cause the engine to emit a [`ResolveRequest`] through [`Sink::resolve`].
@@ -18,9 +18,10 @@
 //! When the core releases a resolver-backed dynamic peer record it reports
 //! [`Event::PeerEvicted`] through [`Sink::event`]; resolver integrations use that
 //! observation to forget the key locally. No Peers API unsubscribe RPC is needed.
-//! Authoritative misses use a short local negative TTL. The Peers API server wire integration — JSON-RPC methods, parameters, and
-//! record decoding — lives in the separate `microtun-api` crate; nothing in
-//! this one knows how an answer arrived.
+//! Authoritative misses use a short local negative TTL. The Tracker
+//! wire integration — the WebSocket transport, the methods, the parameters,
+//! and record decoding — lives in the separate `microtun-api` crate; nothing
+//! in this one knows how an answer arrived.
 //!
 //! ## Runtime configuration
 //!
@@ -28,9 +29,14 @@
 //! lifetimes and active capacities, overload thresholds, and rate-limit budgets.
 //! [`CoreConfig::default`] applies the hardened operational policy, while
 //! [`Config::with_core_config`] selects different operational policy for one
-//! engine. WireGuard protocol constants and const-generic peer/session/route
+//! engine. Protocol constants and const-generic peer/session/route
 //! capacities remain compile-time fixed; rate and firewall active limits are
 //! runtime settings below backend-specific compile-time ceilings.
+//!
+//! Human-facing device INI configuration is a separate concern in
+//! [`device_config`]. Its [`device_config::DeviceConfig`] schema is shared by
+//! firmware and host applications, while provisioning transport and flash-record
+//! storage live in `microtun-provisioning`.
 //!
 //! ## Sans-IO contract
 //!
@@ -84,7 +90,7 @@
 //! * `MAX_ROUTES` — maximum cached routes; on no-alloc builds the prefix trie
 //!   derives its fixed storage directly from this value
 //!
-//! A sensible ESP32-C3 starting point is `MAX_PEERS = 8`,
+//! A sensible ESP32-C3/ESP32-C6 starting point is `MAX_PEERS = 8`,
 //! `MAX_SESSIONS = 8`, `REPLAY_WORDS = 128`, and `MAX_ROUTES = 8`.
 //!
 //! ## Session indices
@@ -114,12 +120,13 @@
 //! task stacks matters. The switch is per-site `#[cfg]`, not
 //! an abstraction layer: the protocol logic is identical.
 //!
-//! WireGuard is a registered trademark of Jason A. Donenfeld. This project is
-//! not sponsored or endorsed by him.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
+
+/// `microtun-core` crate version embedded at compile time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -132,6 +139,7 @@ pub mod config;
 mod constants;
 mod cookie;
 mod crypto;
+pub mod device_config;
 mod error;
 pub mod firewall;
 pub mod ip;
@@ -252,7 +260,7 @@ pub const RECOMMENDED_MAX_MTU: usize =
 
 /// Largest tunnel MTU that is also safe for peers reached through a relay.
 ///
-/// A relayed packet carries a complete inner WireGuard datagram inside a
+/// A relayed packet carries a complete inner tunnel datagram inside a
 /// relay envelope inside an outer transport message, so it pays the 32-byte
 /// transport overhead twice plus the 36-byte envelope header, with 16-byte
 /// padding applied at both levels.
@@ -270,6 +278,64 @@ pub const RECOMMENDED_MAX_RELAYED_MTU: usize = {
     let inner_datagram = relay_plaintext - relay::ENVELOPE_HEADER_LEN;
     (inner_datagram - messages::DATA_OVERHEAD) & !15
 };
+
+/// How a peer entered the local peer table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerOrigin {
+    /// Statically configured when the core was constructed.
+    Pinned,
+    /// Learned from the configured peer resolver.
+    Dynamic,
+}
+
+/// High-level tunnel session state for one peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerConnectionState {
+    /// No established or in-flight session generation exists.
+    Idle,
+    /// An initiator handshake is in flight and there is no usable current session.
+    Handshaking,
+    /// A responder session exists but has not yet been confirmed by transport data.
+    AwaitingConfirmation,
+    /// A usable current session exists.
+    Established,
+    /// A usable session exists while another session generation is being negotiated.
+    Rekeying,
+}
+
+/// Read-only operational state for one tunnel protocol peer.
+///
+/// This is intentionally a value snapshot rather than a reference into the peer
+/// table, so embeddings can publish it to diagnostics without exposing mutable
+/// protocol internals. Transfer counters count authenticated/sealed tunnel protocol
+/// transport datagram bytes, including transport headers, padding, and tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerSnapshot {
+    /// Remote static public key.
+    pub public_key: [u8; 32],
+    /// Whether the peer is pinned configuration or resolver-managed state.
+    pub origin: PeerOrigin,
+    /// Current direct endpoint claim, when one exists.
+    pub endpoint: Option<SocketAddr>,
+    /// Whether `endpoint` has been observed on authenticated inbound traffic.
+    pub endpoint_confirmed: bool,
+    /// Configured relay static key, when this peer is reached through a relay.
+    pub relay: Option<[u8; 32]>,
+    /// Tunnel address owned by this peer.
+    pub address: IpCidr,
+    /// Configured idle persistent-keepalive interval.
+    pub persistent_keepalive: Option<Duration>,
+    /// High-level state of the peer's session generations.
+    pub connection: PeerConnectionState,
+    /// Most recent successful handshake/key derivation.
+    pub latest_handshake: Option<Instant>,
+    /// Most recent peer activity observed by the protocol engine.
+    pub last_activity: Instant,
+    /// Authenticated encrypted tunnel transport datagram bytes received.
+    pub rx_bytes: u64,
+    /// encrypted tunnel transport datagram bytes sealed for transmission.
+    pub tx_bytes: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Embedding interface
@@ -319,19 +385,19 @@ pub enum Event {
 /// in both modes so they can be implemented as non-blocking queue operations.
 ///
 /// The two packet methods are named for the layer they carry rather than for
-/// a direction: an *outer datagram* is encrypted WireGuard traffic on the
+/// a direction: an *outer datagram* is encrypted tunnel traffic on the
 /// physical network, an *inner packet* is plaintext IP inside the tunnel.
 #[allow(async_fn_in_trait)]
 #[cfg_attr(not(feature = "async"), maybe_async::must_be_sync)]
 pub trait Sink {
-    /// Send an encrypted WireGuard datagram to the outer network.
+    /// Send an encrypted tunnel datagram to the outer network.
     async fn outer_datagram(&mut self, destination: SocketAddr, datagram: &[u8]);
 
     /// Deliver a decrypted, cryptokey-routed inner IP packet to the local
     /// stack.
     ///
     /// `src_peer_key` is the authenticated static public key of the
-    /// peer whose WireGuard session carried the packet. `src_endpoint` is the
+    /// peer whose tunnel session carried the packet. `src_endpoint` is the
     /// authenticated outer UDP source for a directly connected peer, and is
     /// `None` for relayed peers. Like `packet`, the references are valid only
     /// for the duration of this call.
@@ -470,7 +536,7 @@ impl core::fmt::Debug for PendingInitiation {
     }
 }
 
-/// The sans-IO WireGuard engine. See the crate-level documentation.
+/// The sans-IO tunnel engine. See the crate-level documentation.
 ///
 /// `REPLAY_WORDS` is the number of 64-bit bitmap words retained per established
 /// session; one word is reserved for recycling, so 128 words accepts packets up
@@ -935,6 +1001,53 @@ impl<
         &self.core_config
     }
 
+    /// Iterate over a point-in-time operational view of every installed peer.
+    ///
+    /// The iterator allocates nothing and yields at most `MAX_PEERS` values.
+    /// It is suitable for diagnostics such as a `tunnel status`-style command.
+    pub fn peer_snapshots(&self) -> impl Iterator<Item = PeerSnapshot> + '_ {
+        self.peers.iter().flatten().map(|peer| {
+            let has_current = peer.sessions.current.is_some_and(|sidx| {
+                matches!(self.slots.get(sidx as usize), Some(Slot::Established(_)))
+            });
+            let has_next = peer.sessions.next.is_some_and(|sidx| {
+                matches!(self.slots.get(sidx as usize), Some(Slot::Established(_)))
+            });
+            let has_handshake = peer.sessions.handshake.is_some_and(|sidx| {
+                matches!(self.slots.get(sidx as usize), Some(Slot::Initiating(_)))
+            });
+            let connection = if has_current && (has_handshake || has_next) {
+                PeerConnectionState::Rekeying
+            } else if has_current {
+                PeerConnectionState::Established
+            } else if has_next {
+                PeerConnectionState::AwaitingConfirmation
+            } else if has_handshake {
+                PeerConnectionState::Handshaking
+            } else {
+                PeerConnectionState::Idle
+            };
+
+            PeerSnapshot {
+                public_key: peer.public_key,
+                origin: match peer.kind {
+                    PeerKind::Pinned => PeerOrigin::Pinned,
+                    PeerKind::Dynamic => PeerOrigin::Dynamic,
+                },
+                endpoint: peer.endpoint,
+                endpoint_confirmed: peer.endpoint_confirmed.is_some(),
+                relay: peer.relay,
+                address: peer.address,
+                persistent_keepalive: peer.persistent_keepalive,
+                connection,
+                latest_handshake: peer.latest_handshake,
+                last_activity: peer.last_activity,
+                rx_bytes: peer.rx_bytes,
+                tx_bytes: peer.tx_bytes,
+            }
+        })
+    }
+
     /// Inject the wall clock (Unix time). Must be called before the first
     /// handshake can be initiated (TAI64N timestamps, §5.4.2); re-call
     /// whenever the RTC is disciplined. The engine extrapolates between
@@ -1160,7 +1273,7 @@ impl<
         Ok(())
     }
 
-    /// Relayed send: seal the ordinary end-to-end packet `I = WG_{A→B}(P)`
+    /// Relayed send: seal the ordinary end-to-end packet `I = TUNNEL_{A→B}(P)`
     /// exactly as for direct delivery, then carry it in authenticated relay
     /// data on the hop-local session with the configured relay.
     async fn encrypt_via_relay<E: Sink>(
@@ -1356,6 +1469,7 @@ impl<
         let ciphertext = &mut buf[messages::data::PACKET_START..];
         aead_seal(&sess.t_send, sess.n_send, ciphertext, padded_len, ad)?;
         sess.n_send = next_send;
+        peer.tx_bytes = peer.tx_bytes.saturating_add(total as u64);
 
         let hit_msg_rekey = sess.n_send >= REKEY_AFTER_MESSAGES && !sess.rekey_triggered;
         let hit_time_rekey =
@@ -1506,7 +1620,7 @@ impl<
             .iter_mut()
             .find(|slot| slot.is_none())
         else {
-            warn!("pending initiation pool full; falling back to WireGuard retransmission");
+            warn!("pending initiation pool full; falling back to tunnel retransmission");
             return false;
         };
         *slot = Some(PendingInitiation {
@@ -1608,7 +1722,7 @@ impl<
         };
 
         if let Some(resolve_id) = pending_resolve {
-            // WireGuard retransmissions keep the sender index but use a fresh
+            // tunnel retransmissions keep the sender index but use a fresh
             // ephemeral. Keep the newest authenticated generation so a resolver
             // completion that crosses Rekey-Timeout does not answer stale state.
             let _ = self.park_pending_initiation(resolve_id, src, consumed);
@@ -1618,7 +1732,7 @@ impl<
         // The sender demonstrably holds the private key for the claimed
         // identity. Start the resolver lookup and retain this authenticated
         // initiation when bounded storage is available. If the pool or resolver
-        // queue is full, normal WireGuard retransmission preserves the previous
+        // queue is full, normal tunnel retransmission preserves the previous
         // self-healing behavior.
         info!("valid initiation from unknown peer; requesting resolution");
         if let Some(resolve_id) = self.request_peer_install(consumed.s_pub_i, now) {
@@ -1627,7 +1741,7 @@ impl<
         Ok(())
     }
 
-    /// Apply the authenticated timestamp replay check and wireguard-go's
+    /// Apply the authenticated timestamp replay check and reference implementation's
     /// independent per-peer 20 ms initiation-consumption gate. Both values are
     /// committed together before response allocation, so resource pressure
     /// cannot turn one accepted initiation into repeated expensive attempts.
@@ -1837,6 +1951,7 @@ impl<
             // exactly this value.
             peer.last_mac1 = Some(response_mac1);
             peer.sessions.commit_responder_install(sidx);
+            peer.latest_handshake = Some(now);
             // Relay spec §9: for a relayed peer, the observed UDP source is
             // the relay, not the peer — the configured relay relation stays
             // the routing authority and the source is not adopted.
@@ -1912,6 +2027,7 @@ impl<
                     return;
                 }
             };
+            peer.latest_handshake = Some(now);
             let endpoint_observed = peer
                 .observe_direct_endpoint(src, now)
                 .then_some(peer.public_key);
@@ -2081,6 +2197,7 @@ impl<
                 return;
             }
         }
+        peer.rx_bytes = peer.rx_bytes.saturating_add(data.len() as u64);
         // Roaming (§2.1): the outer source of an authenticated message is
         // the peer's new endpoint — unless the peer is routed via a
         // configured relay, which stays the outbound authority (relay spec
@@ -2232,7 +2349,7 @@ impl<
             return;
         }
         if let Some(endpoint) = dest_endpoint {
-            // Final hop: send the end-to-end WireGuard packet unchanged.
+            // Final hop: send the end-to-end tunnel packet unchanged.
             sink.outer_datagram(endpoint, envelope.inner).await;
         }
         // No direct endpoint: drop silently. The destination becomes reachable
@@ -2909,7 +3026,7 @@ impl<
     /// single-threaded, so the latency of a *separate* handshake the attacker
     /// does control is enough) or through power analysis.
     ///
-    /// wireguard-go has the opposite asymmetry — `ConsumeMessageInitiation`
+    /// reference implementation has the opposite asymmetry — `ConsumeMessageInitiation`
     /// returns at `LookupPeer` and never performs a second scalar
     /// multiplication for an unknown key — so it cannot be inherited from the
     /// reference; it is a cost of the dynamic-peer extension.
@@ -2993,7 +3110,7 @@ impl<
     }
 }
 
-/// Return the next representable timestamp while preserving WireGuard's
+/// Return the next representable timestamp while preserving the tunnel protocol's
 /// 24-bit nanosecond whitening.
 fn next_whitened_timestamp(last: [u8; TIMESTAMP_LEN]) -> Result<[u8; TIMESTAMP_LEN], Error> {
     const QUANTUM: u32 = 1 << 24;
@@ -3020,7 +3137,7 @@ fn next_whitened_timestamp(last: [u8; TIMESTAMP_LEN]) -> Result<[u8; TIMESTAMP_L
     Ok(out)
 }
 
-/// Draw WireGuard's bounded rekey-timeout jitter.
+/// Draw the tunnel protocol's bounded rekey-timeout jitter.
 ///
 /// The modulo bias over 334 millisecond values is negligible for a timer
 /// whose purpose is desynchronization rather than secrecy. Keeping this a
@@ -3032,7 +3149,7 @@ fn rekey_timeout_jitter<R: rand_core::RngCore>(rng: &mut R) -> Duration {
     Duration::from_millis(jitter_ms)
 }
 
-/// Return a stable WireGuard retransmission deadline for one initiation.
+/// Return a stable tunnel retransmission deadline for one initiation.
 fn handshake_retry_deadline<R: rand_core::RngCore>(rng: &mut R, now: Instant) -> Instant {
     now + REKEY_TIMEOUT + rekey_timeout_jitter(rng)
 }
@@ -3694,6 +3811,17 @@ mod tests {
         );
         let mut net = Net { nodes: vec![a, b] };
 
+        let initial = net.nodes[0]
+            .core
+            .peer_snapshots()
+            .next()
+            .expect("pinned peer");
+        assert_eq!(initial.public_key, b_pub);
+        assert_eq!(initial.origin, PeerOrigin::Pinned);
+        assert_eq!(initial.connection, PeerConnectionState::Idle);
+        assert_eq!(initial.latest_handshake, None);
+        assert_eq!((initial.rx_bytes, initial.tx_bytes), (0, 0));
+
         // --- One outbound packet drives the whole handshake -------------------
         let payload = ipv4(tun(1), tun(2), IPPROTO_UDP, &udp(4242, 53, b"hello tunnel"));
         net.nodes[0]
@@ -3778,6 +3906,20 @@ mod tests {
             "repeated traffic from an already-confirmed endpoint is coalesced"
         );
 
+        let a_view = net.nodes[0].core.peer_snapshots().next().expect("peer B");
+        assert_eq!(a_view.connection, PeerConnectionState::Established);
+        assert_eq!(a_view.latest_handshake, Some(T0));
+        assert!(a_view.endpoint_confirmed);
+        assert_eq!(a_view.tx_bytes, data.len() as u64);
+        assert_eq!(a_view.rx_bytes, reply_datagram.len() as u64);
+
+        let b_view = net.nodes[1].core.peer_snapshots().next().expect("peer A");
+        assert_eq!(b_view.connection, PeerConnectionState::Established);
+        assert_eq!(b_view.latest_handshake, Some(T0));
+        assert!(b_view.endpoint_confirmed);
+        assert_eq!(b_view.rx_bytes, data.len() as u64);
+        assert_eq!(b_view.tx_bytes, reply_datagram.len() as u64);
+
         // --- Replay: same bytes, same counter, already seen (§5.4.6) ----------
         net.nodes[0].sink.clear();
         net.nodes[0]
@@ -3785,6 +3927,16 @@ mod tests {
             .await
             .expect("replays are dropped silently, not reported as errors");
         assert!(net.nodes[0].sink.inner.is_empty(), "a replay was delivered");
+        assert_eq!(
+            net.nodes[0]
+                .core
+                .peer_snapshots()
+                .next()
+                .expect("peer B")
+                .rx_bytes,
+            reply_datagram.len() as u64,
+            "replayed transport bytes must not be counted twice"
+        );
 
         // --- Tamper: one flipped ciphertext byte fails the AEAD ---------------
         let mut tampered = reply_datagram.clone();

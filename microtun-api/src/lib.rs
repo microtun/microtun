@@ -1,36 +1,54 @@
-//! JSON-RPC 2.0 codec for the microtun Peers API.
+//! Peers API wire contract and typed session.
 //!
-//! This crate owns the wire contract and an optional typed async client for
-//! either `embedded-io-async` or native Tokio transports.
+//! The Peers API is a WebSocket protocol carried inside the Microtun tunnel.
+//! This crate owns the contract — the endpoint, the method
+//! names, the message envelope, and the peer record — plus an optional typed
+//! session usable over either `embedded-io-async` or native Tokio transports.
 //! Runtime-specific timeout, scheduling, logging, and reconnect policy remains
 //! outside this crate.
 //!
 //! # The calls
 //!
 //! ```text
-//! --> {"jsonrpc":"2.0","id":1,"method":"v1.peer.by_key","params":{"public_key":"<base64>"}}
-//! --> {"jsonrpc":"2.0","id":2,"method":"v1.peer.by_address","params":{"address":"10.0.0.5"}}
-//! --> {"jsonrpc":"2.0","id":3,"method":"v1.peer.watch","params":{"public_key":"<base64>"}}
-//! --> {"jsonrpc":"2.0","method":"v1.peer.unwatch","params":{"public_key":"<base64>"}}
-//! <-- {"jsonrpc":"2.0","id":1,"result":{"found":{ ...record... }}}
-//! <-- {"jsonrpc":"2.0","id":2,"result":{"not_found":{}}}     // authoritatively unknown
-//! <-- {"jsonrpc":"2.0","id":2,"error":{...}}                  // transient failure
-//! <-- {"jsonrpc":"2.0","method":"v1.peer.changed","params":{"public_key":"<base64>"}}
-//! <-- {"jsonrpc":"2.0","method":"v1.peer.removed","params":{"public_key":"<base64>"}}
+//! GET /v1/peers
+//!
+//! --> {"id":1,"method":"peer.by_key","params":{"public_key":"<base64>"}}
+//! --> {"id":2,"method":"peer.by_address","params":{"address":"10.0.0.5"}}
+//! --> {"id":3,"method":"peer.watch","params":{"public_key":"<base64>"}}
+//! --> {"method":"peer.unwatch","params":{"public_key":"<base64>"}}
+//! <-- {"id":1,"result":{"found":{ ...record... }}}
+//! <-- {"id":2,"result":{"not_found":{}}}          // authoritatively unknown
+//! <-- {"id":2,"error":{"code":6,"message":"..."}} // transient failure
+//! <-- {"method":"peer.changed","params":{"public_key":"<base64>"}}
+//! <-- {"method":"peer.removed","params":{"public_key":"<base64>"}}
 //! ```
 //!
 //! Both lookups answer questions about *another* peer; the caller's own
 //! identity is fixed by the connection and is never a parameter.
 //!
 //! Ordinary lookups are side-effect free. A retaining client uses
-//! `v1.peer.watch`, which atomically establishes per-connection interest in a
+//! `peer.watch`, which atomically establishes per-connection interest in a
 //! configured key and returns its current record. The server dispatches
-//! `v1.peer.changed` / `v1.peer.removed` only to connections watching that key.
-//! Either invalidation is confirmed with an ordinary `v1.peer.by_key` refresh.
-//! `v1.peer.unwatch` drops interest when the client evicts the peer.
+//! `peer.changed` / `peer.removed` only to connections watching that key.
+//! Either invalidation is confirmed with an ordinary `peer.by_key` refresh.
+//! `peer.unwatch` drops interest when the client evicts the peer.
 //!
 //! A reconnecting client re-watches the records it still holds. This reconciles
 //! any changes whose notifications were lost with the old connection.
+//!
+//! # Why WebSocket
+//!
+//! The protocol needs three things from a transport: message boundaries, a
+//! server that can speak without being asked, and one connection carrying
+//! both. A newline-delimited byte stream provided all three, and so does a
+//! WebSocket — but a WebSocket is additionally the one transport a browser can
+//! open itself. `new WebSocket("ws://10.0.0.9/v1/peers")`
+//! is a conforming client of this protocol; nothing else in a page is.
+//!
+//! Framing came with it, and took the framing layer with it. Message
+//! boundaries, keepalive, and an orderly close with a status code are now the
+//! transport's, so what remains above it is only [`crate::message`]: an `id`,
+//! a `method`, and a payload.
 //!
 //! # `not_found` answers a question about the registry, and nothing else
 //!
@@ -38,19 +56,20 @@
 //! record for the thing you asked about*. Two other failures that once shared
 //! that answer no longer do, because neither is a statement about the target:
 //!
-//! * a caller with no registry record of its own is refused at accept, and any
-//!   request that still reaches a handler answers
-//!   [`ERROR_NOT_ADMITTED`] — a de-admitted client must not read its own
+//! * a caller with no registry record of its own is refused at the handshake,
+//!   and any request that still reaches a handler answers
+//!   [`codes::NOT_ADMITTED`] — a de-admitted client must not read its own
 //!   removal as every peer it holds having been deleted;
-//! * a syntactically undecodable key or address answers `-32602`, because a
-//!   caller that cannot spell a key has learned nothing about who exists.
+//! * a syntactically undecodable key or address answers
+//!   [`codes::INVALID_PARAMS`], because a caller that cannot spell a key has
+//!   learned nothing about who exists.
 //!
 //! Both are transient in the client's classification, so an installed record
 //! survives them. See `docs/microtun-peers-api.md` §3.2 and §10.2.
 //!
 //! Notifications carry no peer record and are treated as invalidations rather
-//! than authoritative replacement state. Even `v1.peer.removed` is confirmed
-//! through `v1.peer.by_key`, which makes remove/re-add and in-flight lookup races
+//! than authoritative replacement state. Even `peer.removed` is confirmed
+//! through `peer.by_key`, which makes remove/re-add and in-flight lookup races
 //! converge on the registry's current state. The price is one round trip for
 //! each invalidated peer a client actually holds; unrelated connections are
 //! never dispatched the key.
@@ -59,8 +78,8 @@
 //!
 //! A lookup result uses an externally tagged shape: `{"found":{...}}` or
 //! `{"not_found":{}}`. Only the second is the old `404` — authoritative and
-//! negative-cached by the core. An `error` object, malformed frame, and dead
-//! connection are all the old `5xx`: transient, and an installed record
+//! negative-cached by the core. An `error` object, a malformed message, and a
+//! dead connection are all the old `5xx`: transient, and an installed record
 //! survives them.
 //!
 //! The explicit variant exists because absence is ambiguous and authority must
@@ -74,12 +93,12 @@
 //!
 //! # One spelling for a key
 //!
-//! The HTTP protocol this replaces carried keys in two alphabets, because a
-//! `by-key` *path segment* cannot contain the `/` of standard base64. JSON-RPC
-//! parameters have no such restriction, so a key now has exactly one spelling
-//! everywhere — the 44-character standard base64 WireGuard itself writes, in
-//! configuration files, in parameters, in results, and in logs.
-//! [`microtun_core::encode_key_url`] is no longer part of this protocol.
+//! The REST protocol two revisions ago carried keys in two alphabets, because
+//! a `by-key` *path segment* cannot contain the `/` of standard base64. A key
+//! travels in a JSON payload now, and the one path this protocol has is fixed,
+//! so a key has exactly one spelling everywhere — the 44-character standard
+//! base64 the tunnel protocol itself writes, in configuration files, in parameters, in
+//! results, and in logs.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
@@ -88,13 +107,17 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-// Client-side helpers stay out of the wire-only default build. The transport
-// features are additive because Cargo may unify them when std and Embassy
+pub mod message;
+
+// The transport-bearing layers stay out of the wire-only default build. The
+// features are additive because Cargo may unify them when the std and Embassy
 // integrations are built in the same workspace graph.
-#[cfg(any(feature = "embedded-client", feature = "tokio-client"))]
+#[cfg(feature = "session")]
 pub mod client;
-#[cfg(any(feature = "embedded-client", feature = "tokio-client"))]
+#[cfg(feature = "session")]
 pub mod jitter;
+#[cfg(feature = "session")]
+pub mod session;
 
 use core::{
     fmt::Write as _,
@@ -102,8 +125,9 @@ use core::{
 };
 
 use heapless::String;
-#[cfg(any(feature = "embedded-client", feature = "tokio-client"))]
+#[cfg(feature = "session")]
 pub use jitter::{Jitter, REFRESH_BURST_WINDOW_MS};
+pub use message::{ErrorObject, MAX_ERROR_TEXT_LEN, RemoteError};
 use microtun_core::{
     Duration, IpCidr, ResolveOutcome, ResolveQuery, ResolvedPeer,
     ip::{parse_ip_cidr, unmap_socket_addr},
@@ -112,19 +136,49 @@ use microtun_core::{
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 // ---------------------------------------------------------------------------
+// Endpoint
+// ---------------------------------------------------------------------------
+
+/// The path a Tracker upgrades.
+///
+/// The API version lives in the path, not in every method name. A client using
+/// a different version therefore fails at the HTTP upgrade path before any API
+/// messages are exchanged.
+pub const PEERS_API_PATH: &str = "/v1/peers";
+
+/// TCP port the Tracker listens on, inside the tunnel.
+pub const PEERS_API_PORT: u16 = 80;
+
+/// The `Host` header a client sends with its upgrade request.
+///
+/// HTTP requires the header; this protocol has no use for it. A client reaches
+/// exactly one server — the one its tunnel route leads to — so the value
+/// selects nothing, and the server does not read it. It is a constant rather
+/// than the dialled address so that a client is not obliged to render an
+/// address into text on a target where that costs a formatter and a buffer,
+/// and so that nothing can come to depend on a field the trust model gives no
+/// weight to.
+///
+/// A deployment that ever puts a virtual-hosting proxy in front of a Peers API
+/// server would have to revisit this. That would be a different trust model
+/// than the one this protocol is written against, in which the only thing
+/// standing between the two ends is the tunnel.
+pub const PEERS_API_HOST: &str = "microtun";
+
+// ---------------------------------------------------------------------------
 // Method names
 // ---------------------------------------------------------------------------
 
 /// Resolve a peer by its static public key.
-pub const METHOD_BY_KEY: &str = "v1.peer.by_key";
+pub const METHOD_BY_KEY: &str = "peer.by_key";
 /// Resolve the peer that owns a tunnel address (longest prefix wins).
-pub const METHOD_BY_ADDRESS: &str = "v1.peer.by_address";
+pub const METHOD_BY_ADDRESS: &str = "peer.by_address";
 /// Atomically subscribe this connection to one public key and return its
 /// current registry state.
-pub const METHOD_WATCH: &str = "v1.peer.watch";
+pub const METHOD_WATCH: &str = "peer.watch";
 /// Best-effort notification removing one public key from this connection's
 /// watch set.
-pub const METHOD_UNWATCH: &str = "v1.peer.unwatch";
+pub const METHOD_UNWATCH: &str = "peer.unwatch";
 /// Server-to-client notice that one peer's state may have changed. This is a
 /// key-only invalidation delivered only to connections watching that key.
 /// Clients answer it with an ordinary [`METHOD_BY_KEY`] lookup.
@@ -132,33 +186,59 @@ pub const METHOD_UNWATCH: &str = "v1.peer.unwatch";
 /// This method identifies an observed add/modify transition. The re-lookup is
 /// still authoritative about the peer's current state, so a later removal can
 /// safely race this notification.
-pub const METHOD_CHANGED: &str = "v1.peer.changed";
+pub const METHOD_CHANGED: &str = "peer.changed";
 /// Server-to-client notice that a peer disappeared from the published registry.
 /// Like [`METHOD_CHANGED`], this is a key-only invalidation: interested clients
 /// confirm the current state with [`METHOD_BY_KEY`] rather than treating the
 /// notification itself as replacement state.
-pub const METHOD_REMOVED: &str = "v1.peer.removed";
+pub const METHOD_REMOVED: &str = "peer.removed";
 
 // ---------------------------------------------------------------------------
-// Application error codes
+// Error codes
 // ---------------------------------------------------------------------------
 
-/// The caller's own key has no registry record, so it may not resolve peers.
+/// Codes carried in an [`ErrorObject`].
 ///
-/// This lives in JSON-RPC's implementation-defined server-error range. It is a
-/// *transient* failure in the client's classification, which is the entire
-/// reason it exists: answering `{"not_found":{}}` here would tell a client
-/// whose own admission had lapsed that every peer it holds had been deleted,
-/// and it would tear down its whole peer table on the strength of one bad
-/// config push.
-pub const ERROR_NOT_ADMITTED: i32 = -32001;
-
-/// The caller exceeded its request budget. Transient; retry later.
+/// Small positive integers used by the Peers API error namespace. The protocol
+/// has one error layer, defined in this crate and in the Peers API document.
 ///
-/// Distinct from [`ERROR_NOT_ADMITTED`] so an operator reading a client log
-/// can tell overload apart from a configuration fault. Both classify the same
-/// way, so telling them apart costs the client nothing.
-pub const ERROR_RATE_LIMITED: i32 = -32002;
+/// The set is deliberately small. What a caller can *do* differs across only
+/// three of them — fix the request, wait, or give up — and a code that no
+/// caller branches on is a code that exists to be logged, which the message
+/// already covers.
+pub mod codes {
+    /// The message was not a well-formed Peers API message.
+    pub const BAD_MESSAGE: u16 = 1;
+    /// The method is not one this version defines.
+    pub const UNKNOWN_METHOD: u16 = 2;
+    /// The `params` member is missing, malformed, or holds a value that is not
+    /// a decodable key or address.
+    ///
+    /// Never a miss: a caller that cannot spell a key has learned nothing
+    /// about who exists, so answering `{"not_found":{}}` would both hide the
+    /// bug and plant a false negative in the caller's cache.
+    pub const INVALID_PARAMS: u16 = 3;
+    /// The server failed to produce a response it intended to produce.
+    pub const INTERNAL: u16 = 4;
+    /// The caller's own key has no registry record, so it may not resolve
+    /// peers.
+    ///
+    /// A *transient* failure in the client's classification, which is the
+    /// entire reason it exists: answering `{"not_found":{}}` here would tell a
+    /// client whose own admission had lapsed that every peer it holds had been
+    /// deleted, and it would tear down its whole peer table on the strength of
+    /// one bad config push.
+    ///
+    /// The ordinary refusal happens earlier, at the handshake. This code is
+    /// for the request that races a mid-connection loss of admission.
+    pub const NOT_ADMITTED: u16 = 5;
+    /// The caller exceeded its request budget. Transient; retry later.
+    ///
+    /// Distinct from [`NOT_ADMITTED`] so an operator reading a client log can
+    /// tell overload apart from a configuration fault. Both classify the same
+    /// way, so telling them apart costs the client nothing.
+    pub const RATE_LIMITED: u16 = 6;
+}
 
 // ---------------------------------------------------------------------------
 // Wire-size budget
@@ -171,24 +251,37 @@ pub const MAX_ENDPOINT_TEXT_LEN: usize = MAX_ADDRESS_TEXT_LEN + 8;
 /// Longest CIDR: an address, a slash, and up to three prefix-length digits.
 pub const MAX_CIDR_TEXT_LEN: usize = MAX_ADDRESS_TEXT_LEN + 4;
 
-/// Frame buffer size for the direction that carries a peer record.
+/// Message buffer size for the direction that carries a peer record.
 ///
 /// A worst-case record — a 44-character key, a bracketed IPv6 endpoint, a
-/// relay key, and one IPv6 CIDR — plus the surrounding
-/// lookup response fits below this bound. This is the client's
-/// `RX_BUFFER_SIZE` and the server's `TX_BUFFER_SIZE`, and with the `alloc`
-/// feature of
-/// `microtun-jsonrpc` left off (it must be) it is also the hard ceiling on a
-/// Peers API response: a longer frame fails the read rather than growing a
-/// buffer a hostile server controls.
-pub const RECORD_FRAME_LEN: usize = 1024;
+/// relay key, and one IPv6 CIDR — plus the surrounding lookup response fits
+/// below this bound. This is the client's `RX_BUFFER_SIZE` and the server's
+/// `TX_BUFFER_SIZE`, and because a receive buffer is also the WebSocket
+/// message limit, it is the hard ceiling on a Peers API response: a larger
+/// message is refused with a `1009` close rather than read into a buffer a
+/// hostile server would be choosing the size of.
+pub const RECORD_MESSAGE_LEN: usize = 1024;
 
-/// Frame buffer size for small control traffic.
+/// Message buffer size for small control traffic.
 ///
 /// Lookup/watch messages and `unwatch` carry a method name and one short
-/// string. This also has to fit the small error responses each side emits for malformed traffic. Peer
-/// invalidation notifications travel in the record direction, not this one.
-pub const QUERY_FRAME_LEN: usize = 256;
+/// string. This also has to fit the small error responses each side emits for
+/// malformed traffic. Peer invalidation notifications travel in the record
+/// direction, not this one.
+pub const QUERY_MESSAGE_LEN: usize = 256;
+
+/// Scratch capacity a client needs for the opening handshake.
+///
+/// Holds the request this crate writes and the `101` a conforming server
+/// answers with. It is not retained after the handshake.
+pub const CLIENT_HANDSHAKE_LEN: usize = 512;
+
+/// Scratch capacity a server needs for the opening handshake.
+///
+/// Larger than the client's, because a browser's request is much larger than
+/// this crate's: `Origin`, `User-Agent`, `Accept-Language`, and cookies all
+/// arrive whether or not anything reads them.
+pub const SERVER_HANDSHAKE_LEN: usize = 2048;
 
 /// Scratch capacity for a rendered query argument: a base64 key (44) or a
 /// textual address (45), whichever is longer.
@@ -227,7 +320,7 @@ pub enum Error {
 /// was read out of.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct KeyParams<'a> {
-    /// The peer's public key, as WireGuard's base64: 44 characters.
+    /// The peer's public key, as the tunnel protocol's base64: 44 characters.
     #[serde(borrow)]
     pub public_key: &'a str,
 }
@@ -283,7 +376,7 @@ impl Serialize for QueryParams<'_> {
     }
 }
 
-/// A core resolver query rendered as a JSON-RPC method and parameters.
+/// A core resolver query rendered as a method name and parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct Query<'a> {
     /// The method to call.
@@ -299,7 +392,7 @@ pub struct Query<'a> {
 /// ```ignore
 /// let mut text = QueryText::new();
 /// let call = microtun_api::encode_query(&request.query(), &mut text)?;
-/// let record: Option<PeerInfo> = peer.call(call.method, Some(&call.params)).await?;
+/// let result: LookupResult = session.call(call.method, Some(&call.params)).await?;
 /// ```
 pub fn encode_query<'a>(query: &ResolveQuery, text: &'a mut QueryText) -> Result<Query<'a>, Error> {
     text.0.clear();
@@ -342,7 +435,7 @@ pub fn encode_query<'a>(query: &ResolveQuery, text: &'a mut QueryText) -> Result
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerInfo {
-    /// The peer's public key, as WireGuard's base64: 44 characters.
+    /// The peer's public key, as the tunnel protocol's base64: 44 characters.
     pub public_key: String<KEY_TEXT_LEN>,
     /// Optional current outer endpoint, formatted as `"ip:port"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -352,7 +445,7 @@ pub struct PeerInfo {
     pub relay: Option<String<KEY_TEXT_LEN>>,
     /// Tunnel address prefix assigned to the peer.
     pub address: String<MAX_CIDR_TEXT_LEN>,
-    /// WireGuard-style persistent keepalive interval in seconds.
+    /// Persistent keepalive interval in seconds.
     /// Absent means disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent_keepalive: Option<u16>,
@@ -523,7 +616,7 @@ pub fn unmap_address(address: IpAddr) -> IpAddr {
     }
 }
 
-/// A key as the protocol writes one: WireGuard's base64, 44 characters.
+/// A key as the protocol writes one: the tunnel protocol's base64, 44 characters.
 fn key_from_wire(value: &str) -> Result<[u8; 32], Error> {
     decode_key(value).map_err(|_| Error::InvalidSyntax)
 }
@@ -544,7 +637,7 @@ mod tests {
     fn params_json(query: &ResolveQuery) -> (&'static str, StdString) {
         let mut text = QueryText::new();
         let call = encode_query(query, &mut text).expect("query renders");
-        let mut buffer = [0u8; QUERY_FRAME_LEN];
+        let mut buffer = [0u8; QUERY_MESSAGE_LEN];
         let len = serde_json_core::to_slice(&call.params, &mut buffer).expect("params serialize");
         (
             call.method,
@@ -588,7 +681,7 @@ mod tests {
         let params = KeyParams {
             public_key: KEY_B64,
         };
-        let mut buffer = [0u8; QUERY_FRAME_LEN];
+        let mut buffer = [0u8; QUERY_MESSAGE_LEN];
         let len = serde_json_core::to_slice(&params, &mut buffer).expect("key params serialize");
         assert_eq!(
             core::str::from_utf8(&buffer[..len]).expect("params are UTF-8"),
@@ -603,17 +696,15 @@ mod tests {
         );
     }
 
-    /// Peer invalidations name a key and carry nothing else, so they sit far below
-    /// the frame they share with lookup responses.
+    /// Peer invalidations name a key and carry nothing else, so they sit far
+    /// below the budget they share with lookup responses.
     #[test]
-    fn peer_invalidations_fit_the_frame_budget() {
+    fn peer_invalidations_fit_the_message_budget() {
         for method in [METHOD_CHANGED, METHOD_REMOVED] {
-            let body = format!(
-                r#"{{"jsonrpc":"2.0","method":"{method}","params":{{"public_key":"{KEY_B64}"}}}}"#
-            );
+            let body = format!(r#"{{"method":"{method}","params":{{"public_key":"{KEY_B64}"}}}}"#);
             assert!(
-                body.len() < QUERY_FRAME_LEN,
-                "{method} notification frame is {} bytes",
+                body.len() < QUERY_MESSAGE_LEN,
+                "{method} notification is {} bytes",
                 body.len()
             );
         }
@@ -759,7 +850,7 @@ mod tests {
     fn lookup_results_round_trip() {
         let body = format!(r#"{{"public_key":"{KEY_B64}","address":"10.1.2.3/32"}}"#);
         let found = LookupResult::Found(peer_info(&body));
-        let mut buffer = [0u8; RECORD_FRAME_LEN];
+        let mut buffer = [0u8; RECORD_MESSAGE_LEN];
         let len = serde_json_core::to_slice(&found, &mut buffer).expect("found serializes");
         let text = core::str::from_utf8(&buffer[..len]).expect("utf-8");
         assert_eq!(
@@ -887,16 +978,15 @@ mod tests {
     /// The buffer budget has to hold a worst-case record *inside the tagged
     /// result*, or a legitimate answer would be unreadable in the field.
     #[test]
-    fn worst_case_record_fits_the_frame_budget() {
+    fn worst_case_record_fits_the_message_budget() {
         let v6 = "2001:0db8:0000:0000:0000:ffff:255.255.255.255";
         let record = format!(
             r#"{{"public_key":"{KEY_B64}","endpoint":"[{v6}]:65535","relay":"{RELAY_B64}","address":"{v6}/128","persistent_keepalive":65535}}"#
         );
-        let body =
-            format!(r#"{{"jsonrpc":"2.0","id":9007199254740991,"result":{{"found":{record}}}}}"#);
+        let body = format!(r#"{{"id":4294967295,"result":{{"found":{record}}}}}"#);
         assert!(
-            body.len() < RECORD_FRAME_LEN,
-            "worst-case record frame is {} bytes",
+            body.len() < RECORD_MESSAGE_LEN,
+            "worst-case record message is {} bytes",
             body.len()
         );
     }

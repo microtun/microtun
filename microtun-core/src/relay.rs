@@ -1,13 +1,13 @@
 //! Microtun relay envelope carried by transport message type 0xF0.
 //!
-//! Relay type 0xF0 uses the normal WireGuard transport header, session keys, counters,
+//! Relay type 0xF0 uses the normal encrypted tunnel transport header, session keys, counters,
 //! replay window, padding, and timers. Its authenticated plaintext is:
 //!
 //! ```text
-//! destination_public_key[32] || inner_len_le[4] || inner_wireguard_packet
+//! destination_public_key[32] || inner_len_le[4] || inner_tunnel_packet
 //! ```
 //!
-//! The inner packet is a complete standard WireGuard datagram (types 1-4) and
+//! The inner packet is a complete standard tunnel datagram (types 1-4) and
 //! is forwarded unchanged to one directly reachable destination. There is no
 //! relay version field, hop limit, route list, or relay-side re-wrapping.
 
@@ -20,25 +20,25 @@ use zerocopy::{
 
 use crate::messages::{self, Message};
 
-/// Fixed relay header preceding the inner WireGuard datagram.
+/// Fixed relay header preceding the inner tunnel datagram.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub struct EnvelopeHeader {
     /// Destination peer static X25519 public key.
     pub destination: [u8; 32],
-    /// Exact length of the inner WireGuard datagram, excluding relay-message padding.
+    /// Exact length of the inner tunnel datagram, excluding relay-message padding.
     pub inner_len: U32<LittleEndian>,
 }
 
 /// Fixed relay-envelope header size: 36 bytes. The inner datagram begins on a 4-byte boundary.
 pub const ENVELOPE_HEADER_LEN: usize = size_of::<EnvelopeHeader>();
 
-/// Largest complete inner WireGuard datagram that can fit in one relay
+/// Largest complete inner tunnel datagram that can fit in one relay
 /// packet under Microtun's 1500-byte outer UDP budget.
 pub const MAX_RELAY_INNER_SIZE: usize =
     (((crate::MAX_UDP_SIZE - messages::DATA_OVERHEAD) & !15) - ENVELOPE_HEADER_LEN) & !15;
 
-/// Largest IP plaintext that fits in a relayed type-4 WireGuard datagram.
+/// Largest IP plaintext that fits in a relayed type-4 tunnel datagram.
 /// Inner type-4 datagrams are 16-byte aligned, so round the remaining budget
 /// down before subtracting their 32-byte transport overhead.
 pub const MAX_RELAY_INNER_IP_SIZE: usize = (MAX_RELAY_INNER_SIZE - messages::DATA_OVERHEAD) & !15;
@@ -63,7 +63,7 @@ pub(crate) fn write_header(buf: &mut [u8], destination: &[u8; 32], inner_len: us
 pub struct Envelope<'a> {
     /// Destination peer static X25519 public key.
     pub destination: [u8; 32],
-    /// Complete standard WireGuard datagram, excluding relay outer padding.
+    /// Complete standard tunnel datagram, excluding relay outer padding.
     pub inner: &'a [u8],
 }
 
@@ -92,7 +92,7 @@ pub fn parse(plaintext: &[u8]) -> Option<Envelope<'_>> {
     })
 }
 
-/// Is `inner` wire-format-plausible as a standard WireGuard datagram?
+/// Is `inner` wire-format-plausible as a standard tunnel datagram?
 ///
 /// Relay type 0xF0 is deliberately excluded: this relay protocol is single-hop and a
 /// relay never forwards another relay envelope as its inner datagram.
@@ -137,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_standard_wireguard_message_types() {
+    fn parses_all_standard_tunnel_message_types() {
         for packet in [
             inner(messages::MSG_INITIATION, messages::INITIATION_LEN),
             inner(messages::MSG_RESPONSE, messages::RESPONSE_LEN),

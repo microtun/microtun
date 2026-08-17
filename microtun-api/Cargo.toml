@@ -1,6 +1,6 @@
 [package]
 name = "microtun-api"
-description = "Peers API codec and client for microtun"
+description = "Peers API codec and WebSocket client for microtun"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,27 +12,19 @@ microtun-core = { workspace = true }
 heapless = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde-json-core = { workspace = true }
-microtun-jsonrpc = { workspace = true, optional = true }
+microtun-ws = { workspace = true, optional = true }
 embedded-io-async = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
 
 [features]
 default = []
-# Typed client for `embedded-io-async` transports (Embassy and similar).
-embedded-client = [
-    "dep:microtun-jsonrpc",
-    "dep:embedded-io-async",
-    "dep:rand",
-    "microtun-jsonrpc/async",
-]
-# Native Tokio 1.x transport support for the typed client. This is additive
-# with `embedded-client` so Cargo feature unification remains valid.
-tokio-client = [
-    "dep:microtun-jsonrpc",
-    "dep:embedded-io-async",
-    "dep:rand",
-    "microtun-jsonrpc/tokio",
-]
+# The typed session and client over `embedded-io-async` transports (Embassy,
+# smoltcp, and anything else that speaks those traits).
+session = ["dep:microtun-ws", "dep:embedded-io-async", "dep:rand", "dep:rand_core"]
+# Native Tokio 1.x transport support. Additive with `session` so Cargo feature
+# unification remains valid when std and Embassy builds share a graph.
+tokio = ["session", "microtun-ws/tokio"]
 # Forwarded to `microtun-core` for host integrations that use its allocator-
 # backed peer/session/route storage. The owned wire record remains inline.
 alloc = ["microtun-core/alloc"]

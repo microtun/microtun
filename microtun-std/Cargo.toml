@@ -9,16 +9,16 @@ license.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 microtun-core = { workspace = true, features = ["async", "log", "alloc"] }
-microtun-api = { workspace = true, features = ["alloc", "tokio-client"] }
-microtun-jsonrpc = { workspace = true, features = ["tokio"] }
+microtun-api = { workspace = true, features = ["alloc", "tokio"] }
 
-rand_core = { workspace = true }
+rand_core = { workspace = true, features = ["getrandom"] }
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "io-util"] }
 log = { workspace = true }
 
 [dev-dependencies]
-# The scripted Peers API server in the resolver tests answers with the same record
-# type a real client decodes.
+# The scripted Tracker in the resolver tests answers with the same record
+# type a real client decodes, over the same WebSocket layer.
 serde-json-core = { workspace = true }
+microtun-ws = { workspace = true, features = ["tokio"] }
 microtun-core = { workspace = true, features = ["test-util"] }
 tokio = { version = "1", features = ["rt", "macros", "io-util", "sync", "time"] }

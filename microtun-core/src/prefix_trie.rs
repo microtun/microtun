@@ -1,6 +1,6 @@
 //! A path-compressed (radix / Patricia-style) prefix trie mapping
 //! [`IpCidr`] prefixes to values, with longest-prefix-match lookups —
-//! the shape needed for WireGuard cryptokey routing
+//! the shape needed for cryptokey routing
 //! (`allowed_ips -> peer`).
 //!
 //! By default nodes live in fixed-capacity inline storage sized directly from

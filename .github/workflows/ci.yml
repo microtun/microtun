@@ -85,8 +85,8 @@ jobs:
             directory: examples/nucleo-h753zi
             target: thumbv7em-none-eabi
 
-          - name: esp32-c3
-            directory: examples/esp32-c3
+          - name: esp32-c6-plc-v
+            directory: examples/esp32-c6-plc-v
             target: riscv32imc-unknown-none-elf
 
     steps:

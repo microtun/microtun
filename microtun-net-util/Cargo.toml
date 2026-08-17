@@ -1,0 +1,42 @@
+[package]
+name = "microtun-net-util"
+description = "Shared host and Embassy networking utilities for microtun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+microtun-provisioning = { path = "../microtun-provisioning", default-features = false, optional = true }
+heapless = { workspace = true, optional = true }
+embassy-net = { version = "0.9.1", default-features = false, features = [
+    "icmp",
+    "udp",
+    "proto-ipv4",
+    "proto-ipv6",
+    "multicast",
+    "medium-ethernet",
+    "medium-ip",
+], optional = true }
+embassy-time = { version = "0.5.1", default-features = false, optional = true }
+embedded-io-async = { workspace = true, optional = true }
+static_cell = { version = "2", optional = true }
+getifaddrs = { version = "0.6.2", optional = true }
+socket2 = { version = "0.6.5", optional = true }
+
+[features]
+default = ["std"]
+std = [
+    "dep:microtun-provisioning",
+    "dep:heapless",
+    "dep:getifaddrs",
+    "dep:socket2",
+]
+embassy-net = [
+    "dep:microtun-provisioning",
+    "dep:heapless",
+    "dep:embassy-net",
+    "dep:embassy-time",
+    "dep:static_cell",
+]
+ping = ["dep:embassy-net", "dep:embassy-time", "dep:embedded-io-async", "dep:heapless"]

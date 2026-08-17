@@ -6,13 +6,19 @@ members = [
     "microtun-embassy",
     "microtun-std",
     "microtun-linux",
-    "microtun-apiserver",
-    "microtun-ini",
-    "microtun-jsonrpc",
-    "microtun-device-config",
-    "microtun-provision",
+    "microtun-tracker",
+    "microtun-ws",
+    "microtun-provisioning",
+    "microtun-net-util",
+    "microtun-mcuboot",
+    "microtun-ymodem",
 ]
-exclude = ["examples/nucleo-h753zi", "examples/esp32-c3"]
+exclude = [
+    "examples/nucleo-h753zi/app",
+    "examples/nucleo-h753zi/bootloader",
+    "examples/esp32-c6-plc-v/app",
+    "examples/common",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,9 +30,10 @@ license = "BUSL-1.1"
 microtun-core = { path = "microtun-core" }
 microtun-api = { path = "microtun-api" }
 microtun-std = { path = "microtun-std" }
-microtun-jsonrpc = { path = "microtun-jsonrpc", default-features = false }
-microtun-ini = { path = "microtun-ini", default-features = false }
-microtun-device-config = { path = "microtun-device-config" }
+microtun-ws = { path = "microtun-ws", default-features = false }
+microtun-ini = { git = "https://github.com/microtun/microtun-ini", rev = "v0.2.1" }
+microtun-provisioning = { path = "microtun-provisioning" }
+microtun-net-util = { path = "microtun-net-util" }
 
 heapless = { version = "0.9.1", default-features = false }
 hashbrown = { version = "0.15", default-features = false, features = [
@@ -34,6 +41,7 @@ hashbrown = { version = "0.15", default-features = false, features = [
     "inline-more",
 ] }
 rand_core = { version = "0.6", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
 rand = { version = "0.8", default-features = false, features = ["small_rng"] }
 subtle = { version = "2.6", default-features = false }
 zeroize = { version = "1.9", default-features = false }
@@ -50,6 +58,7 @@ serde-json-core = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 cidr = { version = "0.3.2", default-features = false }
 base64 = { version = "0.22", default-features = false }
+hex = { version = "0.4.3", default-features = false }
 thiserror = { version = "2", default-features = false }
 wary = { version = "0.3.1", default-features = false, features = ["derive"] }
 
@@ -57,7 +66,7 @@ embedded-io = { version = "0.6", default-features = false }
 embedded-io-async = { version = "0.7", default-features = false }
 
 defmt-or-log = { version = "0.2.3", default-features = false }
-defmt = { version = "1.0", default-features = false }
+defmt = { version = "1.1", default-features = false }
 log = { version = "0.4", default-features = false }
 
 maybe-async = "0.2.11"

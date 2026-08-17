@@ -118,7 +118,7 @@ pub fn verify_mac1(msg: &[u8], our_mac1_key: &[u8; 32]) -> Option<[u8; 16]> {
 
 /// The responder's rotating cookie secret `R` (§5.4.7).
 ///
-/// WireGuard's reference implementations keep exactly one active secret. Once
+/// the tunnel protocol's reference implementations keep exactly one active secret. Once
 /// it reaches [`COOKIE_REFRESH_TIME`], it is replaced before deriving or
 /// validating a cookie. The secret is explicitly zeroized both on rotation and
 /// when this value is dropped.

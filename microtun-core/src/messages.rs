@@ -35,9 +35,9 @@ pub const MSG_DATA: u8 = 4;
 pub const MSG_RELAY: u8 = 0xF0;
 
 /// Relay type 0xF0 authenticates its four-byte message prefix as AEAD associated data.
-/// Type 4 remains standard WireGuard and therefore continues to use empty AD.
+/// Type 4 remains a standard base-protocol message and therefore continues to use empty AD.
 pub const RELAY_AEAD_AD: &[u8] = &[MSG_RELAY, 0, 0, 0];
-/// Common `type ‖ reserved` prefix shared by every WireGuard packet.
+/// Common `type ‖ reserved` prefix shared by every tunnel packet.
 #[repr(C)]
 #[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub struct MessagePrefix {

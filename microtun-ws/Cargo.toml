@@ -1,0 +1,28 @@
+[package]
+name = "microtun-ws"
+description = "Minimal no_std WebSocket (RFC 6455) transport for embedded I/O and Tokio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+base64 = { workspace = true }
+sha1 = { version = "0.10", default-features = false }
+httparse = { version = "1.10", default-features = false }
+embedded-io-async = { workspace = true }
+rand_core = { workspace = true }
+rand_chacha = { workspace = true }
+embedded-io-adapters = { version = "0.7", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "io-util", "time"] }
+embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
+
+[features]
+default = []
+
+# Tokio 1.x transport compatibility: re-exports the `embedded-io-adapters`
+# bridge as `TokioIo`. Additive on top of the base async API.
+tokio = ["dep:embedded-io-adapters", "embedded-io-adapters/tokio-1"]

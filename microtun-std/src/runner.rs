@@ -20,6 +20,7 @@ use crate::{
     PEER_EVICTION_GHOSTS, PEER_EVICTION_INTERVAL, REPLAY_WORDS, RESOLVER_QUEUE_DEPTH,
     UNDER_LOAD_HANDSHAKES_PER_SEC,
     resolver::{PeersApiResolver, PeersApiTransport, resolver_task},
+    status::{TunnelSnapshot, TunnelStatus},
 };
 
 /// Maximum encrypted outer UDP payload.
@@ -215,6 +216,7 @@ pub struct TunnelRunner<D, RNG: RngCore + CryptoRng> {
     outer: tokio::net::UdpSocket,
     clock_base: TokioInstant,
     observer: Box<dyn TunnelObserver>,
+    status: TunnelStatus,
 }
 
 impl<D, RNG> fmt::Debug for TunnelRunner<D, RNG>
@@ -226,6 +228,7 @@ where
             .debug_struct("TunnelRunner")
             .field("outer", &self.outer)
             .field("clock_base", &self.clock_base)
+            .field("status", &self.status)
             .finish_non_exhaustive()
     }
 }
@@ -255,13 +258,17 @@ where
             StaticRelayPolicy::forwarding(enable_forwarding),
             now(clock_base),
         )?;
-        Ok(Self {
+        let status = TunnelStatus::new();
+        let runner = Self {
             engine,
             device,
             outer,
             clock_base,
             observer: Box::new(()),
-        })
+            status,
+        };
+        runner.publish_status();
+        Ok(runner)
     }
 
     /// Bind an outer UDP socket and construct a runner.
@@ -282,6 +289,22 @@ where
         self.engine.public_key()
     }
 
+    /// Clone a read-only handle to the latest operational tunnel snapshot.
+    ///
+    /// The handle can outlive a borrow of this runner and is intended to be
+    /// retained by diagnostics while the runner is moved into its async task.
+    pub fn status(&self) -> TunnelStatus {
+        self.status.clone()
+    }
+
+    fn publish_status(&self) {
+        publish_status(&self.status, &self.engine, self.listen_port());
+    }
+
+    fn listen_port(&self) -> u16 {
+        self.outer.local_addr().map_or(0, |address| address.port())
+    }
+
     /// Install a synchronous observer for authenticated runtime state changes.
     pub fn with_observer(mut self, observer: impl TunnelObserver + 'static) -> Self {
         self.observer = Box::new(observer);
@@ -297,7 +320,7 @@ where
 
     /// Run the tunnel until `shutdown` completes or an I/O task fails.
     ///
-    /// A resolver task is created automatically. One long-lived Peers API server
+    /// A resolver task is created automatically. One long-lived Tracker
     /// connection carries ordinary lookups and dynamic-peer change updates.
     /// Resolve requests use the sink's non-blocking acceptance callback; peer
     /// eviction events are translated into forget commands and retained by the
@@ -351,6 +374,8 @@ where
         let mut outer_datagram = vec![0u8; OUTER_RECV_SIZE];
         let mut pending_forgets = VecDeque::new();
 
+        let status = self.status.clone();
+        let listen_port = self.listen_port();
         let engine = &mut self.engine;
         let device = &self.device;
         let outer = &self.outer;
@@ -492,6 +517,8 @@ where
                 }
             }
 
+            publish_status(&status, engine, listen_port);
+
             while let Some(public_key) = pending_forgets.front().copied() {
                 if resolve_tx
                     .try_send(ResolverCommand::Forget(public_key))
@@ -503,6 +530,22 @@ where
             }
         }
     }
+}
+
+fn publish_status<RNG: RngCore + CryptoRng>(
+    status: &TunnelStatus,
+    engine: &TunnelCore<RNG>,
+    listen_port: u16,
+) {
+    let mut peers = [const { None }; MAX_PEERS];
+    for (slot, peer) in peers.iter_mut().zip(engine.peer_snapshots()) {
+        *slot = Some(peer);
+    }
+    status.publish(TunnelSnapshot {
+        public_key: engine.public_key(),
+        listen_port,
+        peers,
+    });
 }
 
 #[inline]

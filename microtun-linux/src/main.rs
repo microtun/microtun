@@ -2,7 +2,7 @@
 //!
 //! Platform-independent Tokio driving and Peers API resolution live in
 //! [`microtun_std`]. This binary uses the same provisioning INI schema as
-//! `microtun-device-config`, plus Linux TUN setup, logging, and process lifecycle.
+//! `microtun-core` device configuration, plus Linux TUN setup, logging, and process lifecycle.
 //!
 //! Run: `microtun /etc/microtun/microtun.conf` (defaults to `mtun0`; needs `CAP_NET_ADMIN`).
 
@@ -14,7 +14,7 @@ use std::{
 };
 
 use clap::Parser;
-use microtun_device_config::{DeviceConfig, decode_ini};
+use microtun_core::device_config::{DeviceConfig, decode_ini};
 use microtun_std::{
     PeersApiResolver, PeersApiTransport, TunnelDevice, TunnelRunner,
     core::{
@@ -54,7 +54,7 @@ impl TunnelDevice for TunDevice {
     }
 }
 
-/// Opens Peers API server connections pinned to the tunnel interface.
+/// Opens Tracker connections pinned to the tunnel interface.
 ///
 /// This is the whole of the resolver's transport security on this side, which
 /// is why `microtun-std` refuses to supply a default: a lookup that leaves by
@@ -164,36 +164,36 @@ async fn run(
     tun_name: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let DeviceConfig {
-        tunnel, api_server, ..
+        tunnel, tracker, ..
     } = device_config;
 
-    // microtun-device-config has already validated these values. Decode them
+    // microtun-core device configuration has already validated these values. Decode them
     // here, at the boundary where the Linux runtime needs their concrete forms.
     let mut private_key = Zeroizing::new([0u8; 32]);
     decode_key_into(tunnel.private_key.as_str(), &mut private_key)?;
-    let api_server_public_key = decode_key(api_server.public_key.as_str())?;
+    let tracker_public_key = decode_key(tracker.public_key.as_str())?;
     let tun_address = parse_ip_inet(tunnel.tunnel_address.as_str())?;
-    let api_server_address = parse_ip_inet(api_server.tunnel_address.as_str())?;
-    let api_server_host = api_server_address.address();
-    // ApiServer.TunnelAddress identifies one peer. A supplied prefix is accepted
-    // as input metadata, but must not make the API server claim the whole subnet.
-    let api_server_route = host_cidr(api_server_host);
+    let tracker_address = parse_ip_inet(tracker.tunnel_address.as_str())?;
+    let tracker_host = tracker_address.address();
+    // Tracker.TunnelAddress identifies one peer. A supplied prefix is accepted
+    // as input metadata, but must not make the Tracker claim the whole subnet.
+    let tracker_route = host_cidr(tracker_host);
     let listen = SocketAddr::from((
         [0, 0, 0, 0],
         tunnel.listen_port.unwrap_or(DEFAULT_LISTEN_PORT),
     ));
     let tun_mtu = tunnel.mtu.unwrap_or(DEFAULT_MTU);
-    let peers_api = SocketAddr::new(api_server_host, PEERS_API_PORT);
+    let peers_api = SocketAddr::new(tracker_host, PEERS_API_PORT);
 
-    let api_server_endpoint =
-        resolve_api_server_endpoint(api_server.host.as_str(), api_server.port, listen).await?;
+    let tracker_endpoint =
+        resolve_tracker_endpoint(tracker.host.as_str(), tracker.port, listen).await?;
 
     let pinned = [PinnedPeer {
-        public_key: api_server_public_key,
-        endpoint: Some(api_server_endpoint),
+        public_key: tracker_public_key,
+        endpoint: Some(tracker_endpoint),
         relay: None,
-        address: api_server_route,
-        // We don't allow unsolicited inbound from the Peers API server.
+        address: tracker_route,
+        // We don't allow unsolicited inbound from the Tracker.
         inbound_policy: InboundPolicy::EstablishedOnly,
         persistent_keepalive: Some(Duration::from_secs(25)),
     }];
@@ -242,7 +242,7 @@ async fn run(
     tracing::info!(
         peers_api = %peers_api,
         tun.name = %tun_name,
-        "Peers API server RPC connections bound to the TUN interface"
+        "tracker RPC connections bound to the TUN interface"
     );
 
     runner.run(resolver, tokio::signal::ctrl_c()).await?;
@@ -256,7 +256,7 @@ async fn run(
 /// endpoint is itself required to establish the tunnel. IPv4-bound outer UDP
 /// sockets therefore select an A result; IPv6 sockets prefer AAAA and may use
 /// an A result through the runner's IPv4-mapped send path.
-async fn resolve_api_server_endpoint(
+async fn resolve_tracker_endpoint(
     host: &str,
     port: u16,
     listen: SocketAddr,
@@ -268,7 +268,7 @@ async fn resolve_api_server_endpoint(
     let resolved = lookup_host((host, port)).await.map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!("cannot resolve ApiServer Host/Port `{host}:{port}`: {error}"),
+            format!("cannot resolve Tracker Host/Port `{host}:{port}`: {error}"),
         )
     })?;
 
@@ -291,11 +291,11 @@ async fn resolve_api_server_endpoint(
         io::Error::new(
             io::ErrorKind::AddrNotAvailable,
             format!(
-                "ApiServer Host/Port `{host}:{port}` resolved to no {family} address usable by outer socket `{listen}`"
+                "Tracker Host/Port `{host}:{port}` resolved to no {family} address usable by outer socket `{listen}`"
             ),
         )
     })?;
 
-    tracing::info!(host, port, resolved = %selected, "resolved ApiServer Host");
+    tracing::info!(host, port, resolved = %selected, "resolved tracker host");
     Ok(selected)
 }

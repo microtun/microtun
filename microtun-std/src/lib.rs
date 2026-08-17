@@ -4,10 +4,12 @@
 //!
 //! This crate is the host-runtime counterpart to `microtun-embassy`: it turns
 //! the sans-IO [`Core`](microtun_core::Core) into an async tunnel runner and
-//! provides a stateful JSON-RPC Peers API resolver. It deliberately does not create or
+//! provides a stateful Peers API resolver. It deliberately does not create or
 //! configure an operating-system tunnel interface. Applications supply a
 //! [`TunnelDevice`] implementation and retain control of platform-specific
 //! setup, permissions, routing, and configuration parsing.
+//! [`TunnelStatus`] is a cheap read-only handle to a bounded operational
+//! snapshot suitable for `tunnel status`-style diagnostics.
 //!
 //! The runner owns the protocol core and drives it from four event sources:
 //!
@@ -25,9 +27,9 @@
 //! them locally if the resolver channel is temporarily full. The tunnel loop therefore never awaits resolver-channel capacity on
 //! the packet path.
 //!
-//! Lookups and pushed `v1.peer.changed` / `v1.peer.removed` keyed invalidations share
-//! one continuously serviced JSON-RPC stream to the Peers API server's inner
-//! address. After
+//! Lookups and pushed `peer.changed` / `peer.removed` keyed invalidations share
+//! one continuously serviced WebSocket connection to the Tracker's
+//! inner address. After
 //! reconnect the resolver re-watches every peer the core still holds. Opening the
 //! stream is the caller's job — see [`PeersApiTransport`] and the security notes on
 //! [`PeersApiResolver`].
@@ -136,6 +138,7 @@ pub const PEER_EVICTION_GHOSTS: usize = 64;
 
 pub mod resolver;
 pub mod runner;
+pub mod status;
 
 pub use microtun_api as peers_api;
 /// Convenience re-exports so host applications can depend on this crate alone.
@@ -145,6 +148,7 @@ pub use runner::{
     Error, MAX_IP_PACKET_SIZE, OUTER_SIZE, TunnelCore, TunnelDevice, TunnelObserver, TunnelRunner,
     host_core_config,
 };
+pub use status::{TunnelSnapshot, TunnelStatus};
 
 #[cfg(test)]
 mod tests {

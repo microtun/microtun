@@ -8,8 +8,8 @@
 //!
 //! * A single [`TunnelRunner`] task owns the
 //!   `Core` and drives it from four
-//!   event sources — the *outer* UDP socket (encrypted WireGuard traffic to
-//!   the internet-facing peer/Peers API server endpoints), the tunnel device's
+//!   event sources — the *outer* UDP socket (encrypted tunnel traffic to
+//!   the internet-facing peer/Tracker endpoints), the tunnel device's
 //!   outbound queue (plaintext IP packets the inner stack wants to send), the
 //!   resolver-event channel, and the `Core`'s own timer via
 //!   [`Core::poll_at`](microtun_core::Core::poll_at). This crate enables the
@@ -21,11 +21,14 @@
 //!   [`embassy_net_driver_channel::Device`], so the application runs an
 //!   ordinary inner `embassy-net` stack *over the tunnel* and gets sockets,
 //!   DNS, static addressing, etc. for free.
+//! * [`TunnelStatus`] is a cheap read-only handle to a bounded operational
+//!   snapshot published by the runner. Diagnostic tasks can inspect peer and
+//!   session state without borrowing the live protocol engine.
 //! * Peer resolution runs in a second task, [`resolver_task`], joined with
-//!   the tunnel loop via [`embassy_futures::join`]. One persistent JSON-RPC
+//!   the tunnel loop via [`embassy_futures::join`]. One persistent WebSocket
 //!   connection over the **inner** stack carries lookups and pushed
-//!   `v1.peer.changed` / `v1.peer.removed` keyed invalidations, so the only bootstrap
-//!   dependency is the pinned Peers API server peer. Reconnect re-watches every
+//!   `peer.changed` / `peer.removed` keyed invalidations, so the only bootstrap
+//!   dependency is the pinned Tracker peer. Reconnect re-watches every
 //!   peer the core still holds.
 //!
 //! ## Allocator-backed core state
@@ -34,7 +37,7 @@
 //! fixed-storage behavior expected by bare-metal Embassy targets. Enabling this
 //! crate's `alloc` feature forwards to `microtun-core/alloc`, moving the core's
 //! large bounded tables and packet scratch storage behind the application's
-//! global allocator. This is useful on heap-capable MCUs such as ESP32-C3 where
+//! global allocator. This is useful on heap-capable MCUs such as ESP32-C3/ESP32-C6 where
 //! async task stacks are comparatively small. The protocol capacities remain
 //! bounded by the same const generics, and the runner applies
 //! [`runner::embedded_core_config`] so active rate, firewall and under-load
@@ -104,7 +107,7 @@ pub const REPLAY_WORDS: usize = 32;
 pub const MAX_ROUTES: usize = MAX_PEERS;
 
 /// Post-cookie per-source handshake allowance. Tighter than the core's
-/// wireguard-go-matching default: a device with a handful of peers has no
+/// reference implementation-matching default: a device with a handful of peers has no
 /// legitimate need for twenty per second from one source.
 pub const RATE_LIMIT_PER_SEC: u32 = 2;
 pub const RATE_LIMIT_BURST: u32 = 4;
@@ -129,6 +132,7 @@ pub const INFLIGHT_RESOLVES: usize = 12;
 pub mod device;
 pub mod resolver;
 pub mod runner;
+pub mod status;
 
 pub use device::{TunnelDevice, TunnelState, new_tunnel, new_tunnel_with_mtu};
 pub use microtun_api as peers_api;
@@ -139,3 +143,4 @@ pub use resolver::{
     resolver_task,
 };
 pub use runner::{OUTER_SIZE, TunnelRunner};
+pub use status::{TunnelSnapshot, TunnelStatus};
