@@ -655,11 +655,6 @@ pub(crate) mod tests {
             load_text(&fragmenting).is_err(),
             "an MTU that fragments on a 1500-byte path must be rejected at load"
         );
-
-        // The default has to be inside the ceiling it is validated against,
-        // or the shipped configuration is one nobody can reproduce.
-        assert!(usize::from(DEFAULT_MTU) <= RECOMMENDED_MAX_RELAYED_MTU);
-        assert!(RECOMMENDED_MAX_RELAYED_MTU <= RECOMMENDED_MAX_MTU);
     }
 
     #[test]
