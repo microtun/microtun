@@ -1,4 +1,4 @@
-//! mDNS/DNS-SD support for provisioning mode.
+//! mDNS/DNS-SD support for microtun service discovery.
 //!
 //! The DNS wire format is shared by the host (`std`) and Embassy integrations.
 //! There are deliberately no separate discovery/responder submodules: only the
@@ -7,9 +7,10 @@
 //! `embassy-net` selects the async Embassy signatures.
 
 use heapless::{String as HString, Vec as HVec};
-use microtun_provisioning::{
-    DEVICE_HOSTNAME_PREFIX, DeviceIdentity, PROVISION_MDNS_IPV4, PROVISION_MDNS_PORT,
-    PROVISION_MDNS_SERVICE, PROVISION_PORT, device_hostname,
+
+use crate::{
+    DEVICE_HOSTNAME_PREFIX, MAX_DEVICE_HOSTNAME_LEN, MDNS_MULTICAST_IPV4, MDNS_PORT,
+    MICROTUN_MDNS_SERVICE, device_hostname,
 };
 
 const DNS_PACKET_BUFFER: usize = 768;
@@ -27,9 +28,9 @@ const DNS_TTL_SECONDS: u32 = 120;
 const DNS_SD_ENUMERATION: &str = "_services._dns-sd._udp.local";
 const MAX_DNS_NAME_LEN: usize = 192;
 
-/// Maximum device ID carried by the provisioning mDNS TXT record.
-pub const MAX_MDNS_DEVICE_ID_LEN: usize = microtun_provisioning::DEVICE_ID_LEN;
-/// Maximum model string retained from a provisioning mDNS TXT record.
+/// Maximum device ID carried by the microtun mDNS TXT record.
+pub const MAX_MDNS_DEVICE_ID_LEN: usize = MAX_DEVICE_HOSTNAME_LEN - DEVICE_HOSTNAME_PREFIX.len();
+/// Maximum model string retained from a microtun mDNS TXT record.
 pub const MAX_MDNS_MODEL_LEN: usize = 192;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,7 +53,7 @@ fn build_discovery_query(packet: &mut [u8]) -> Option<usize> {
     write_u16(packet, 4, 1)?;
 
     let mut offset = DNS_HEADER_LEN;
-    offset = write_name(packet, offset, PROVISION_MDNS_SERVICE)?;
+    offset = write_name(packet, offset, MICROTUN_MDNS_SERVICE)?;
     offset = write_u16_at(packet, offset, DNS_TYPE_PTR)?;
     offset = write_u16_at(packet, offset, DNS_CLASS_IN | DNS_CLASS_QU)?;
     Some(offset)
@@ -154,7 +155,7 @@ fn parse_discovery_response(packet: &[u8]) -> Option<ParsedDevice> {
         }
 
         match record_type {
-            DNS_TYPE_PTR if eq_dns_name(name.as_str(), PROVISION_MDNS_SERVICE) => {
+            DNS_TYPE_PTR if eq_dns_name(name.as_str(), MICROTUN_MDNS_SERVICE) => {
                 let mut target: HString<MAX_DNS_NAME_LEN> = HString::new();
                 read_name(packet, rdata, &mut target)?;
                 service_instance = Some(target);
@@ -255,6 +256,7 @@ fn build_service_response(
     hostname: &str,
     device_id: &str,
     model: &str,
+    port: u16,
     ip: [u8; 4],
 ) -> Option<usize> {
     packet.fill(0);
@@ -264,19 +266,18 @@ fn build_service_response(
 
     let mut offset = DNS_HEADER_LEN;
     offset = write_ptr_record(packet, offset, service, instance, false)?;
-    offset = write_srv_record(packet, offset, instance, hostname, PROVISION_PORT)?;
+    offset = write_srv_record(packet, offset, instance, hostname, port)?;
     offset = write_txt_record(packet, offset, instance, device_id, model)?;
     write_a_record(packet, offset, hostname, ip)
 }
 
 fn service_names(
-    identity: DeviceIdentity,
+    device_id: &str,
 ) -> Option<(HString<72>, HString<128>, HString<MAX_MDNS_DEVICE_ID_LEN>)> {
-    let identity_id = identity.device_id();
-    let mut device_id: HString<MAX_MDNS_DEVICE_ID_LEN> = HString::new();
-    device_id.push_str(identity_id.as_str()).ok()?;
+    let mut device_id_value: HString<MAX_MDNS_DEVICE_ID_LEN> = HString::new();
+    device_id_value.push_str(device_id).ok()?;
 
-    let host_label = device_hostname(&identity);
+    let host_label = device_hostname(device_id)?;
 
     let mut hostname: HString<72> = HString::new();
     hostname.push_str(host_label.as_str()).ok()?;
@@ -285,9 +286,9 @@ fn service_names(
     let mut instance: HString<128> = HString::new();
     instance.push_str(host_label.as_str()).ok()?;
     instance.push('.').ok()?;
-    instance.push_str(PROVISION_MDNS_SERVICE).ok()?;
+    instance.push_str(MICROTUN_MDNS_SERVICE).ok()?;
 
-    Some((hostname, instance, device_id))
+    Some((hostname, instance, device_id_value))
 }
 
 fn write_ptr_record(
@@ -514,7 +515,7 @@ use std::{
     vec::Vec,
 };
 
-/// A provisioning-mode device discovered by the host-side `std` implementation.
+/// A microtun device discovered by the host-side `std` implementation.
 #[cfg(feature = "std")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredDevice {
@@ -524,7 +525,7 @@ pub struct DiscoveredDevice {
     pub port: u16,
 }
 
-/// Discover provisioning-mode devices using standard-library UDP sockets.
+/// Discover microtun devices using standard-library UDP sockets.
 ///
 /// When `std` is enabled, this is the host-side form of the unified `discover` API.
 #[cfg(feature = "std")]
@@ -532,7 +533,7 @@ pub fn discover(timeout: Duration) -> Result<Vec<DiscoveredDevice>, String> {
     const QUERY_RETRY: Duration = Duration::from_millis(350);
 
     let sockets = std_discovery_sockets()?;
-    let destination = SocketAddrV4::new(Ipv4Addr::from(PROVISION_MDNS_IPV4), PROVISION_MDNS_PORT);
+    let destination = SocketAddrV4::new(Ipv4Addr::from(MDNS_MULTICAST_IPV4), MDNS_PORT);
     let mut query = [0u8; DNS_PACKET_BUFFER];
     let query_len =
         build_discovery_query(&mut query).ok_or_else(|| "build mDNS discovery query".to_owned())?;
@@ -590,14 +591,14 @@ pub fn discover(timeout: Duration) -> Result<Vec<DiscoveredDevice>, String> {
 /// the mDNS multicast group is joined. This keeps the response's A record
 /// deterministic on multi-homed hosts.
 #[cfg(feature = "std")]
-pub fn run(identity: DeviceIdentity, model: &str, address: Ipv4Addr) -> Result<(), String> {
+pub fn run(device_id: &str, model: &str, port: u16, address: Ipv4Addr) -> Result<(), String> {
     let socket = std_responder_socket(address)?;
     let multicast = SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::from(PROVISION_MDNS_IPV4),
-        PROVISION_MDNS_PORT,
+        Ipv4Addr::from(MDNS_MULTICAST_IPV4),
+        MDNS_PORT,
     ));
     let (hostname, instance, device_id) =
-        service_names(identity).ok_or_else(|| "build mDNS service names".to_owned())?;
+        service_names(device_id).ok_or_else(|| "build mDNS service names".to_owned())?;
     let mut packet = [0u8; DNS_PACKET_BUFFER];
 
     loop {
@@ -606,29 +607,30 @@ pub fn run(identity: DeviceIdentity, model: &str, address: Ipv4Addr) -> Result<(
             .map_err(|error| format!("receive mDNS query: {error}"))?;
         let Some(query) = matching_query(
             &packet[..len],
-            PROVISION_MDNS_SERVICE,
+            MICROTUN_MDNS_SERVICE,
             instance.as_str(),
             hostname.as_str(),
         ) else {
             continue;
         };
 
-        let response_id = if source.port() == PROVISION_MDNS_PORT {
+        let response_id = if source.port() == MDNS_PORT {
             0
         } else {
             query.id
         };
         let response_len = if query.enumeration {
-            build_enumeration_response(&mut packet, response_id, PROVISION_MDNS_SERVICE)
+            build_enumeration_response(&mut packet, response_id, MICROTUN_MDNS_SERVICE)
         } else {
             build_service_response(
                 &mut packet,
                 response_id,
-                PROVISION_MDNS_SERVICE,
+                MICROTUN_MDNS_SERVICE,
                 instance.as_str(),
                 hostname.as_str(),
                 device_id.as_str(),
                 model,
+                port,
                 address.octets(),
             )
         };
@@ -636,7 +638,7 @@ pub fn run(identity: DeviceIdentity, model: &str, address: Ipv4Addr) -> Result<(
             continue;
         };
 
-        let destination = if source.port() != PROVISION_MDNS_PORT || query.prefer_unicast {
+        let destination = if source.port() != MDNS_PORT || query.prefer_unicast {
             source
         } else {
             multicast
@@ -700,14 +702,14 @@ fn std_discovery_socket(address: Ipv4Addr) -> Result<UdpSocket, String> {
 fn std_responder_socket(address: Ipv4Addr) -> Result<UdpSocket, String> {
     use socket2::{Domain, Protocol, Socket, Type};
 
-    let multicast = Ipv4Addr::from(PROVISION_MDNS_IPV4);
+    let multicast = Ipv4Addr::from(MDNS_MULTICAST_IPV4);
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .map_err(|error| format!("create mDNS responder socket: {error}"))?;
     socket
         .set_reuse_address(true)
         .map_err(|error| format!("set mDNS responder SO_REUSEADDR: {error}"))?;
     socket
-        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PROVISION_MDNS_PORT).into())
+        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT).into())
         .map_err(|error| format!("bind mDNS responder socket: {error}"))?;
     socket
         .join_multicast_v4(&multicast, &address)
@@ -738,7 +740,7 @@ use static_cell::StaticCell;
 #[cfg(all(feature = "embassy-net", not(feature = "std")))]
 const DISCOVERY_PORT: u16 = 53530;
 
-/// A provisioning-mode device discovered by the Embassy implementation.
+/// A microtun device discovered by the Embassy implementation.
 #[cfg(all(feature = "embassy-net", not(feature = "std")))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredDevice {
@@ -757,14 +759,15 @@ static RESPONDER_RX_BUFFER: StaticCell<[u8; DNS_PACKET_BUFFER]> = StaticCell::ne
 #[cfg(all(feature = "embassy-net", not(feature = "std")))]
 static RESPONDER_TX_BUFFER: StaticCell<[u8; DNS_PACKET_BUFFER]> = StaticCell::new();
 
-/// Run the provisioning-mode mDNS responder on an Embassy network stack.
+/// Run the mDNS responder on an Embassy network stack.
 ///
 /// This signature is selected when `embassy-net` is enabled without `std`.
 #[cfg(all(feature = "embassy-net", not(feature = "std")))]
 pub async fn run(
     stack: Stack<'static>,
-    identity: DeviceIdentity,
+    device_id: &str,
     model: &'static str,
+    port: u16,
 ) -> Result<(), ()> {
     let rx_meta = RESPONDER_RX_META.init([PacketMetadata::EMPTY; 2]);
     let tx_meta = RESPONDER_TX_META.init([PacketMetadata::EMPTY; 2]);
@@ -772,25 +775,25 @@ pub async fn run(
     let tx_buffer = RESPONDER_TX_BUFFER.init([0; DNS_PACKET_BUFFER]);
 
     let multicast = Ipv4Address::new(
-        PROVISION_MDNS_IPV4[0],
-        PROVISION_MDNS_IPV4[1],
-        PROVISION_MDNS_IPV4[2],
-        PROVISION_MDNS_IPV4[3],
+        MDNS_MULTICAST_IPV4[0],
+        MDNS_MULTICAST_IPV4[1],
+        MDNS_MULTICAST_IPV4[2],
+        MDNS_MULTICAST_IPV4[3],
     );
     stack.join_multicast_group(multicast).map_err(|_| ())?;
 
     let mut socket = UdpSocket::new(stack, rx_meta, rx_buffer, tx_meta, tx_buffer);
     socket.set_hop_limit(Some(255));
-    socket.bind(PROVISION_MDNS_PORT).map_err(|_| ())?;
+    socket.bind(MDNS_PORT).map_err(|_| ())?;
 
-    let (hostname, instance, device_id) = service_names(identity).ok_or(())?;
+    let (hostname, instance, device_id) = service_names(device_id).ok_or(())?;
     let mut packet = [0u8; DNS_PACKET_BUFFER];
 
     loop {
         let (len, source) = socket.recv_from(&mut packet).await.map_err(|_| ())?;
         let Some(query) = matching_query(
             &packet[..len],
-            PROVISION_MDNS_SERVICE,
+            MICROTUN_MDNS_SERVICE,
             instance.as_str(),
             hostname.as_str(),
         ) else {
@@ -801,23 +804,24 @@ pub async fn run(
             continue;
         };
         let ip = config.address.address().octets();
-        let response_id = if source.endpoint.port == PROVISION_MDNS_PORT {
+        let response_id = if source.endpoint.port == MDNS_PORT {
             0
         } else {
             query.id
         };
 
         let response_len = if query.enumeration {
-            build_enumeration_response(&mut packet, response_id, PROVISION_MDNS_SERVICE)
+            build_enumeration_response(&mut packet, response_id, MICROTUN_MDNS_SERVICE)
         } else {
             build_service_response(
                 &mut packet,
                 response_id,
-                PROVISION_MDNS_SERVICE,
+                MICROTUN_MDNS_SERVICE,
                 instance.as_str(),
                 hostname.as_str(),
                 device_id.as_str(),
                 model,
+                port,
                 ip,
             )
         };
@@ -825,10 +829,10 @@ pub async fn run(
             continue;
         };
 
-        let destination = if source.endpoint.port != PROVISION_MDNS_PORT || query.prefer_unicast {
+        let destination = if source.endpoint.port != MDNS_PORT || query.prefer_unicast {
             source.endpoint
         } else {
-            IpEndpoint::new(multicast.into(), PROVISION_MDNS_PORT)
+            IpEndpoint::new(multicast.into(), MDNS_PORT)
         };
         socket
             .send_to(&packet[..response_len], destination)
@@ -837,7 +841,7 @@ pub async fn run(
     }
 }
 
-/// Discover provisioning-mode devices using an Embassy network stack.
+/// Discover microtun devices using an Embassy network stack.
 ///
 /// Results use fixed-capacity strings and a caller-selected maximum `N`, so the
 /// operation stays allocation-free. A unicast-response query is retried every
@@ -859,7 +863,7 @@ async fn discover_on_port<const N: usize>(
 ) -> Result<HVec<DiscoveredDevice, N>, ()> {
     let retry = Duration::from_millis(350);
 
-    if local_port == 0 || local_port == PROVISION_MDNS_PORT {
+    if local_port == 0 || local_port == MDNS_PORT {
         return Err(());
     }
 
@@ -883,12 +887,12 @@ async fn discover_on_port<const N: usize>(
     socket.bind(local_port).map_err(|_| ())?;
 
     let multicast = Ipv4Address::new(
-        PROVISION_MDNS_IPV4[0],
-        PROVISION_MDNS_IPV4[1],
-        PROVISION_MDNS_IPV4[2],
-        PROVISION_MDNS_IPV4[3],
+        MDNS_MULTICAST_IPV4[0],
+        MDNS_MULTICAST_IPV4[1],
+        MDNS_MULTICAST_IPV4[2],
+        MDNS_MULTICAST_IPV4[3],
     );
-    let destination = IpEndpoint::new(multicast.into(), PROVISION_MDNS_PORT);
+    let destination = IpEndpoint::new(multicast.into(), MDNS_PORT);
     let mut query = [0u8; DNS_PACKET_BUFFER];
     let query_len = build_discovery_query(&mut query).ok_or(())?;
     let mut packet = [0u8; DNS_PACKET_BUFFER];
@@ -946,14 +950,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovery_query_targets_the_provisioning_service() {
+    fn discovery_query_targets_the_microtun_service() {
         let mut query = [0u8; DNS_PACKET_BUFFER];
         let len = build_discovery_query(&mut query).unwrap();
         assert_eq!(&query[4..6], &1u16.to_be_bytes());
 
         let mut name: HString<MAX_DNS_NAME_LEN> = HString::new();
         let next = read_name(&query[..len], DNS_HEADER_LEN, &mut name).unwrap();
-        assert_eq!(name.as_str(), PROVISION_MDNS_SERVICE);
+        assert_eq!(name.as_str(), MICROTUN_MDNS_SERVICE);
         assert_eq!(read_u16(&query, next), Some(DNS_TYPE_PTR));
         assert_eq!(
             read_u16(&query, next + 2),
@@ -969,11 +973,12 @@ mod tests {
         let len = build_service_response(
             &mut packet,
             0,
-            PROVISION_MDNS_SERVICE,
+            MICROTUN_MDNS_SERVICE,
             instance,
             host,
             "0svmx1udh1",
             "test-board",
+            23,
             [10, 42, 0, 17],
         )
         .unwrap();
@@ -985,7 +990,7 @@ mod tests {
             Some("test-board")
         );
         assert_eq!(device.address, [10, 42, 0, 17]);
-        assert_eq!(device.port, PROVISION_PORT);
+        assert_eq!(device.port, 23);
     }
 
     #[test]
@@ -997,8 +1002,7 @@ mod tests {
 
     #[test]
     fn service_names_embed_the_canonical_device_id() {
-        let identity = DeviceIdentity::from_unique_bytes(&[0x12, 0xab, 0xcd]).unwrap();
-        let (hostname, instance, device_id) = service_names(identity).unwrap();
+        let (hostname, instance, device_id) = service_names("0svmx1udh1").unwrap();
 
         assert_eq!(device_id.as_str(), "0svmx1udh1");
         assert_eq!(hostname.as_str(), "microtun-0svmx1udh1.local");
@@ -1014,7 +1018,7 @@ mod tests {
         let len = build_discovery_query(&mut packet).unwrap();
         let query = matching_query(
             &packet[..len],
-            PROVISION_MDNS_SERVICE,
+            MICROTUN_MDNS_SERVICE,
             "microtun-0svmx1udh1._microtun._tcp.local",
             "microtun-0svmx1udh1.local",
         )

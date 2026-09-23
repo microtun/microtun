@@ -1,8 +1,8 @@
 # ICBBUY ESP32-C6-PLC-V uses ESP32-C6-WROOM-1U-N4 (4 MiB flash).
 #
 # Normal firmware boots from ota_0/ota_1. The inactive slot is used for
-# power-fail-safe shell OTA; the provisioning record stays at its historical
-# address so existing field provisioning data remains compatible.
+# power-fail-safe shell OTA; the configuration record stays at its historical
+# address so existing field configuration data remains compatible.
 #
 # Keep `microtun` as standard ESP-IDF data/undefined (subtype 0x06).
 # esp-bootloader-esp-idf 0.5.0 assumes every partition has a recognized

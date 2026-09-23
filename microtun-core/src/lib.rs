@@ -33,10 +33,10 @@
 //! capacities remain compile-time fixed; rate and firewall active limits are
 //! runtime settings below backend-specific compile-time ceilings.
 //!
-//! Human-facing device INI configuration is a separate concern in
+//! Human-facing device TOML configuration is a separate concern in
 //! [`device_config`]. Its [`device_config::DeviceConfig`] schema is shared by
-//! firmware and host applications, while provisioning transport and flash-record
-//! storage live in `microtun-provisioning`.
+//! firmware and host applications. The embedded examples keep their setup
+//! transport and flash-record helpers local under `examples/common`.
 //!
 //! ## Sans-IO contract
 //!

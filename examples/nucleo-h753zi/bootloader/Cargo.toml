@@ -1,10 +1,10 @@
 [package]
 name = "microtun-nucleo-h753zi-bootloader"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.91"
-publish = false
-license = "BUSL-1.1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
 
 [dependencies]
 embassy-boot-stm32 = { version = "0.8.0", default-features = false }
@@ -12,18 +12,3 @@ embassy-stm32 = { version = "0.6.0", features = ["stm32h753zi"] }
 embassy-sync = { version = "0.8.0", default-features = false }
 cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7.0"
-
-[profile.dev]
-debug = 2
-incremental = false
-codegen-units = 1
-opt-level = "s"
-lto = "fat"
-
-[profile.release]
-debug = 1
-incremental = false
-codegen-units = 1
-opt-level = "s"
-lto = "fat"
-

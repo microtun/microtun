@@ -1,13 +1,13 @@
 //! microtun Tracker.
 //!
 //! Answers the two resolver lookups from `[Microtun]` and `[Tunnel]` base
-//! sections followed by repeated `[Peer]` sections.
+//! sections followed by repeated `[[Peer]]` array tables.
 //! The Tracker's own peer identity and address come from `[Tunnel]`; its record
 //! deliberately has no advertised outer endpoint. The Tracker owns these
-//! config types and parses them with `microtun-ini`.
+//! config types and parses TOML with `toml_parser`.
 //!
 //! ```bash
-//! microtun-tracker /etc/microtun/tracker.conf
+//! microtun-tracker /etc/microtun/tracker.toml
 //! ```
 //!
 //! # Where this belongs in a deployment

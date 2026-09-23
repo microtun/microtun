@@ -438,7 +438,12 @@ impl TlvArea {
                     self.entry_fill = 0;
                     self.entry_collect = matches!(
                         self.entry_type,
-                        TLV_KEYHASH | TLV_SHA256 | TLV_ED25519 | TLV_SIG_PURE | TLV_UUID_CID
+                        TLV_KEYHASH
+                            | TLV_SHA256
+                            | TLV_ED25519
+                            | TLV_SIG_PURE
+                            | TLV_UUID_VID
+                            | TLV_UUID_CID
                     );
 
                     if self.entry_len > total - self.consumed {

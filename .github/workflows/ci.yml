@@ -33,6 +33,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check workspace versions
+        run: .github/scripts/check-release-tag.sh
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -60,7 +63,6 @@ jobs:
           cargo check --locked -p microtun-core --no-default-features
           cargo check --locked -p microtun-api --no-default-features
           cargo check --locked -p microtun-embassy --no-default-features
-          cargo check --locked -p microtun-jsonrpc --no-default-features --features sync
 
       - name: Build workspace
         run: cargo build --workspace --all-targets --locked
@@ -82,12 +84,15 @@ jobs:
       matrix:
         include:
           - name: nucleo-h753zi
-            directory: examples/nucleo-h753zi
+            directory: examples/nucleo-h753zi/app
+            package: microtun-nucleo-h753zi
             target: thumbv7em-none-eabi
 
           - name: esp32-c6-plc-v
-            directory: examples/esp32-c6-plc-v
-            target: riscv32imc-unknown-none-elf
+            directory: examples/esp32-c6-plc-v/app
+            package: microtun-esp32-c6-plc-v
+            # Must match [build] target in the example's .cargo/config.toml.
+            target: riscv32imac-unknown-none-elf
 
     steps:
       - name: Check out repository
@@ -108,8 +113,22 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
 
-      # Run from the example directory so Cargo loads its local .cargo/config.toml.
-      # Both examples contain non-secret placeholder configuration suitable for CI.
+      # Ordinary CI never contacts the production signer. The application build
+      # requires a verification key to exercise the firmware-update code path,
+      # so use a throwaway Ed25519 key that exists only for this CI job.
+      - name: Configure ephemeral firmware public key
+        run: |
+          public_key="$RUNNER_TEMP/microtun-ci-firmware-public-key.pem"
+          openssl genpkey -algorithm ED25519 | openssl pkey -pubout -out "$public_key"
+          openssl pkey -pubin -in "$public_key" -text_pub -noout | grep -q '^ED25519 Public-Key:'
+          key_cache="$(sha256sum "$public_key" | cut -d' ' -f1)"
+          echo "MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH=$public_key" >> "$GITHUB_ENV"
+          echo "MICROTUN_FIRMWARE_PUBLIC_KEY_CACHE_KEY=$key_cache" >> "$GITHUB_ENV"
+
+      # Run from the example's own directory so Cargo loads its local .cargo/config.toml, which
+      # is what supplies the target and the linker arguments. The examples share one workspace
+      # (examples/Cargo.toml) and therefore one lockfile, so -p selects the board to build.
+      # Both examples contain non-secret placeholder device configuration suitable for CI.
       - name: Build ${{ matrix.name }} firmware
         working-directory: ${{ matrix.directory }}
-        run: cargo build --locked
+        run: cargo build --locked -p ${{ matrix.package }}

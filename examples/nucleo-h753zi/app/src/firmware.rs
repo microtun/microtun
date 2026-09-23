@@ -6,15 +6,13 @@
 
 use defmt::warn;
 use embassy_boot::{AlignedBuffer, BlockingFirmwareState, State};
-use embassy_net::tcp::TcpSocket;
-use embassy_stm32::flash::{Blocking, Error as FlashError, Flash, WRITE_SIZE};
+use embassy_stm32::flash::{
+    Blocking, Error as FlashError, FLASH_BASE, Flash, MAX_ERASE_SIZE, WRITE_SIZE,
+};
+use embedded_io_async::{Read, Write};
 use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
-pub(crate) use microtun_examples_common::firmware::{
-    FirmwareStatus, receive_ymodem_buffer, telnet_write_data,
-};
-use microtun_examples_common::firmware::{
-    ImageTransferError, TransferError, receive_signed_image, transfer_error_text,
-};
+pub(crate) use microtun_examples_common::firmware::FirmwareStatus;
+use microtun_examples_common::firmware::{ImageTransferError, TransferError, receive_signed_image};
 use microtun_mcuboot::{
     ImageVersion, PayloadSink, Policy as McubootPolicy, StoredImageError, StreamingVerifier,
     VerifiedImage, verify_stored_image,
@@ -33,20 +31,75 @@ const FIRMWARE_PUBLIC_KEY: &[u8; 32] =
 include!(concat!(env!("OUT_DIR"), "/firmware-version.rs"));
 
 // Embassy Boot owns rollback state and swaps ACTIVE/DFU pages power-fail-safely.
-// H753 sectors are 128 KiB. The application is linked at 0x0802_0000:
-//   bank1 s0: bootloader (128 KiB)
-//   bank1 s1..s6: ACTIVE (768 KiB)
-//   bank1 s7: boot state (128 KiB)
-//   bank2 s0..s6: DFU (896 KiB; one sector larger than ACTIVE)
-//   bank2 s7: provisioning (128 KiB)
-pub(crate) const DFU_SLOT_OFFSET: u32 = 0x0010_0000;
-pub(crate) const FIRMWARE_SLOT_SIZE: u32 = 0x000c_0000; // 768 KiB ACTIVE payload
-const DFU_SLOT_SIZE: u32 = 0x000e_0000; // ACTIVE + one scratch sector
-const BOOT_STATE_OFFSET: u32 = 0x000e_0000;
-const BOOT_STATE_SIZE: u32 = 0x0002_0000;
-const FLASH_SECTOR_SIZE: u32 = 0x0002_0000;
-const STM32_APP_BASE: u32 = 0x0802_0000;
-const STM32_APP_END: u32 = STM32_APP_BASE + FIRMWARE_SLOT_SIZE;
+// The physical partition map lives exclusively in ../memory.x. Linker symbols
+// are absolute CPU addresses; Embassy STM32's flash driver uses offsets from
+// FLASH_BASE, so Partition::flash_offset() performs that conversion here.
+
+unsafe extern "C" {
+    static __microtun_state_start: u8;
+    static __microtun_state_end: u8;
+    static __microtun_active_start: u8;
+    static __microtun_active_end: u8;
+    static __microtun_dfu_start: u8;
+    static __microtun_dfu_end: u8;
+    static __microtun_configuration_start: u8;
+    static __microtun_configuration_end: u8;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Partition {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+}
+
+impl Partition {
+    #[inline]
+    pub(crate) fn len(self) -> u32 {
+        self.end - self.start
+    }
+
+    #[inline]
+    pub(crate) fn flash_offset(self) -> u32 {
+        self.start - FLASH_BASE as u32
+    }
+}
+
+#[inline]
+fn linker_addr(symbol: *const u8) -> u32 {
+    symbol as usize as u32
+}
+
+#[inline]
+fn state() -> Partition {
+    Partition {
+        start: linker_addr(core::ptr::addr_of!(__microtun_state_start)),
+        end: linker_addr(core::ptr::addr_of!(__microtun_state_end)),
+    }
+}
+
+#[inline]
+fn active() -> Partition {
+    Partition {
+        start: linker_addr(core::ptr::addr_of!(__microtun_active_start)),
+        end: linker_addr(core::ptr::addr_of!(__microtun_active_end)),
+    }
+}
+
+#[inline]
+fn dfu() -> Partition {
+    Partition {
+        start: linker_addr(core::ptr::addr_of!(__microtun_dfu_start)),
+        end: linker_addr(core::ptr::addr_of!(__microtun_dfu_end)),
+    }
+}
+
+#[inline]
+pub(crate) fn configuration() -> Partition {
+    Partition {
+        start: linker_addr(core::ptr::addr_of!(__microtun_configuration_start)),
+        end: linker_addr(core::ptr::addr_of!(__microtun_configuration_end)),
+    }
+}
 
 struct BootStatePartition<'a, 'd> {
     flash: &'a mut Flash<'d, Blocking>,
@@ -60,42 +113,47 @@ impl ReadNorFlash for BootStatePartition<'_, '_> {
     const READ_SIZE: usize = 1;
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        let state = state();
         if offset
             .checked_add(bytes.len() as u32)
-            .is_none_or(|end| end > BOOT_STATE_SIZE)
+            .is_none_or(|end| end > state.len())
         {
             return Err(FlashError::Size);
         }
-        self.flash.blocking_read(BOOT_STATE_OFFSET + offset, bytes)
+        self.flash
+            .blocking_read(state.flash_offset() + offset, bytes)
     }
 
     fn capacity(&self) -> usize {
-        BOOT_STATE_SIZE as usize
+        state().len() as usize
     }
 }
 
 impl NorFlash for BootStatePartition<'_, '_> {
     const WRITE_SIZE: usize = WRITE_SIZE;
-    const ERASE_SIZE: usize = FLASH_SECTOR_SIZE as usize;
+    const ERASE_SIZE: usize = MAX_ERASE_SIZE;
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        let state = state();
         if offset
             .checked_add(bytes.len() as u32)
-            .is_none_or(|end| end > BOOT_STATE_SIZE)
+            .is_none_or(|end| end > state.len())
         {
             return Err(FlashError::Size);
         }
         pet_watchdog();
-        self.flash.blocking_write(BOOT_STATE_OFFSET + offset, bytes)
+        self.flash
+            .blocking_write(state.flash_offset() + offset, bytes)
     }
 
     fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
-        if to > BOOT_STATE_SIZE || from > to {
+        let state = state();
+        if to > state.len() || from > to {
             return Err(FlashError::Size);
         }
         pet_watchdog();
         self.flash
-            .blocking_erase(BOOT_STATE_OFFSET + from, BOOT_STATE_OFFSET + to)
+            .blocking_erase(state.flash_offset() + from, state.flash_offset() + to)
     }
 }
 
@@ -226,8 +284,8 @@ impl<'a, 'd> Stm32FirmwareSink<'a, 'd> {
         let reset = u32::from_le_bytes(self.vector[4..8].try_into().unwrap());
         let stack_in_ram = (0x2000_0000..0x4000_0000).contains(&initial_sp);
         let reset_addr = reset & !1;
-        let reset_in_image =
-            reset & 1 == 1 && (STM32_APP_BASE..STM32_APP_END).contains(&reset_addr);
+        let active = active();
+        let reset_in_image = reset & 1 == 1 && (active.start..active.end).contains(&reset_addr);
         if stack_in_ram && reset_in_image {
             Ok(())
         } else {
@@ -240,19 +298,20 @@ impl<'a, 'd> Stm32FirmwareSink<'a, 'd> {
     /// A 128 KiB H7 sector erase takes on the order of a second and cannot
     /// yield, so the watchdog is petted around each one.
     fn ensure_erased(&mut self, end: u32) -> Result<(), Stm32SinkError> {
+        let dfu = dfu();
         while self.erased_until < end {
             let erase_end = self
                 .erased_until
-                .checked_add(FLASH_SECTOR_SIZE)
+                .checked_add(MAX_ERASE_SIZE as u32)
                 .ok_or(Stm32SinkError::OutOfBounds)?;
-            if erase_end > DFU_SLOT_SIZE {
+            if erase_end > dfu.len() {
                 return Err(Stm32SinkError::OutOfBounds);
             }
             pet_watchdog();
             self.flash
                 .blocking_erase(
-                    DFU_SLOT_OFFSET + self.erased_until,
-                    DFU_SLOT_OFFSET + erase_end,
+                    dfu.flash_offset() + self.erased_until,
+                    dfu.flash_offset() + erase_end,
                 )
                 .map_err(Stm32SinkError::Flash)?;
             self.erased_until = erase_end;
@@ -267,12 +326,12 @@ impl<'a, 'd> Stm32FirmwareSink<'a, 'd> {
             .written_offset
             .checked_add(bytes.len() as u32)
             .ok_or(Stm32SinkError::OutOfBounds)?;
-        if end > FIRMWARE_SLOT_SIZE {
+        if end > active().len() {
             return Err(Stm32SinkError::OutOfBounds);
         }
         self.ensure_erased(end)?;
         self.flash
-            .blocking_write(DFU_SLOT_OFFSET + self.written_offset, bytes)
+            .blocking_write(dfu().flash_offset() + self.written_offset, bytes)
             .map_err(Stm32SinkError::Flash)?;
         self.written_offset = end;
         Ok(())
@@ -306,7 +365,7 @@ impl PayloadSink for Stm32FirmwareSink<'_, '_> {
         let end = offset
             .checked_add(bytes.len() as u32)
             .ok_or(Stm32SinkError::OutOfBounds)?;
-        if end > FIRMWARE_SLOT_SIZE {
+        if end > active().len() {
             return Err(Stm32SinkError::OutOfBounds);
         }
         self.capture_vector(bytes)?;
@@ -353,17 +412,18 @@ impl ReadNorFlash for DfuPartition<'_, '_> {
     const READ_SIZE: usize = 1;
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        let dfu = dfu();
         if offset
             .checked_add(bytes.len() as u32)
-            .is_none_or(|end| end > DFU_SLOT_SIZE)
+            .is_none_or(|end| end > dfu.len())
         {
             return Err(FlashError::Size);
         }
-        self.flash.blocking_read(DFU_SLOT_OFFSET + offset, bytes)
+        self.flash.blocking_read(dfu.flash_offset() + offset, bytes)
     }
 
     fn capacity(&self) -> usize {
-        DFU_SLOT_SIZE as usize
+        dfu().len() as usize
     }
 }
 
@@ -424,7 +484,7 @@ pub(crate) fn firmware_update_error_text(error: &FirmwareUpdateError) -> &'stati
         FirmwareUpdateError::TrialPending => {
             "a trial image is still pending verification; reboot or confirm it first"
         }
-        FirmwareUpdateError::Transfer(error) => transfer_error_text(*error),
+        FirmwareUpdateError::Transfer(error) => error,
     }
 }
 
@@ -439,10 +499,13 @@ pub(crate) fn log_firmware_update_error(error: &FirmwareUpdateError) {
     }
 }
 
-pub(crate) async fn receive_firmware_update(
-    socket: &mut TcpSocket<'_>,
+pub(crate) async fn receive_firmware_update<T>(
+    io: &mut T,
     flash: &mut Flash<'_, Blocking>,
-) -> Result<(VerifiedImage, &'static str), FirmwareUpdateError> {
+) -> Result<(VerifiedImage, &'static str), FirmwareUpdateError>
+where
+    T: Read + Write + ?Sized,
+{
     let target_slot = "dfu";
 
     // Writing into DFU destroys the image Embassy Boot would revert to, so it
@@ -459,13 +522,13 @@ pub(crate) async fn receive_firmware_update(
         McubootPolicy::from_imgtool_names(
             FIRMWARE_VENDOR_ID,
             FIRMWARE_COMPONENT_ID,
-            FIRMWARE_SLOT_SIZE,
+            active().len(),
             FIRMWARE_MCUBOOT_VERSION,
         ),
     )
     .map_err(FirmwareUpdateError::Image)?;
 
-    receive_signed_image(socket, &mut verifier, &mut sink).await?;
+    receive_signed_image(io, &mut verifier, &mut sink).await?;
 
     let verified = verifier.finish().map_err(FirmwareUpdateError::Image)?;
     // Commit the trailing partial write word before reading anything back.

@@ -9,7 +9,7 @@ use embassy_stm32::flash::Flash;
 use embassy_sync::blocking_mutex::{Mutex, raw::NoopRawMutex};
 
 unsafe extern "C" {
-    static __microtun_firmware_slot_start: u8;
+    static __microtun_active_start: u8;
 }
 
 // H753 internal flash has a 32-byte write granularity. This also satisfies
@@ -29,7 +29,7 @@ fn main() -> ! {
 
     // Safety: this takes the address of an absolute linker symbol and does not
     // dereference it.
-    let active_app_start = core::ptr::addr_of!(__microtun_firmware_slot_start) as u32;
+    let active_app_start = core::ptr::addr_of!(__microtun_active_start) as usize as u32;
 
     // Safety: active_app_start is the linker-defined ACTIVE partition start from
     // the same memory.x used to link both this first stage and the application.

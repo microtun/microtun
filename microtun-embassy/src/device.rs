@@ -64,7 +64,7 @@ impl<const MAX_RX_PACKETS: usize, const MAX_TX_PACKETS: usize>
 /// channel buffers.
 ///
 /// The buffers remain sized to [`MTU`], while `embassy-net` sees the runtime
-/// value through [`Driver::capabilities`]. This lets provisioned devices lower
+/// value through [`Driver::capabilities`]. This lets configured devices lower
 /// their link MTU without requiring a different firmware build.
 pub struct TunnelDevice<'d> {
     inner: Device<'d, MTU>,

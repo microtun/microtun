@@ -900,15 +900,15 @@ mod tests {
     /// — and so a source-address attribution would get the laptop wrong.
     fn config_text() -> String {
         format!(
-            "{}[Peer]\nName = gateway\nPublicKey = {GATEWAY}\nEndpoint = 198.51.100.20:51820\nAddress = 10.0.0.1/32\n\n\
-             [Peer]\nName = laptop\nPublicKey = {LAPTOP}\nAddress = 10.0.0.0/24\nRelay = gateway\n",
+            "{}[[Peer]]\nName = \"gateway\"\nPublicKey = \"{GATEWAY}\"\nEndpoint = \"198.51.100.20:51820\"\nAddress = \"10.0.0.1/32\"\n\n\
+             [[Peer]]\nName = \"laptop\"\nPublicKey = \"{LAPTOP}\"\nAddress = \"10.0.0.0/24\"\nRelay = \"gateway\"\n",
             server_config("10.0.0.9/32")
         )
     }
 
     fn app_state() -> Arc<AppState> {
         let loaded =
-            config::parse(&config_text(), Path::new("test.conf")).expect("test config loads");
+            config::parse(&config_text(), Path::new("test.toml")).expect("test config loads");
         AppState::new(loaded.registry)
     }
 
@@ -1195,7 +1195,7 @@ mod tests {
 
         let replacement = config_text().replace("198.51.100.20:51820", "198.51.100.99:51820");
         let loaded =
-            config::parse(&replacement, Path::new("test.conf")).expect("replacement loads");
+            config::parse(&replacement, Path::new("test.toml")).expect("replacement loads");
         state.registry().replace(loaded.registry);
 
         assert!(
@@ -1230,7 +1230,7 @@ mod tests {
 
         let replacement = config_text().replace("198.51.100.20:51820", "198.51.100.99:51820");
         let loaded =
-            config::parse(&replacement, Path::new("test.conf")).expect("replacement loads");
+            config::parse(&replacement, Path::new("test.toml")).expect("replacement loads");
         state.registry().replace(loaded.registry);
 
         // Only a connection that explicitly watched the gateway receives this
@@ -1277,7 +1277,7 @@ mod tests {
 
         let replacement = replacement.replace("198.51.100.99:51820", "198.51.100.77:51820");
         let loaded =
-            config::parse(&replacement, Path::new("test.conf")).expect("second replacement loads");
+            config::parse(&replacement, Path::new("test.toml")).expect("second replacement loads");
         state.registry().replace(loaded.registry);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), connection.poll())
@@ -1366,9 +1366,9 @@ mod tests {
 
         let replacement = config_text()
             .replace("198.51.100.20:51820", "198.51.100.99:51820")
-            .replace("Address = 10.0.0.1/32", "Address = 10.6.0.1/32");
+            .replace("Address = \"10.0.0.1/32\"", "Address = \"10.6.0.1/32\"");
         let loaded =
-            config::parse(&replacement, Path::new("test.conf")).expect("replacement config loads");
+            config::parse(&replacement, Path::new("test.toml")).expect("replacement config loads");
         state.registry().replace(loaded.registry);
 
         let record = by_key(&state, LAPTOP_KEY, GATEWAY).await.expect("gateway");
@@ -1439,10 +1439,10 @@ mod tests {
 
         // Drop the laptop — the caller itself — from the registry.
         let without_laptop = format!(
-            "{}[Peer]\nName = gateway\nPublicKey = {GATEWAY}\nEndpoint = 198.51.100.20:51820\nAddress = 10.0.0.1/32\n",
+            "{}[[Peer]]\nName = \"gateway\"\nPublicKey = \"{GATEWAY}\"\nEndpoint = \"198.51.100.20:51820\"\nAddress = \"10.0.0.1/32\"\n",
             server_config("10.0.0.9/32")
         );
-        let loaded = config::parse(&without_laptop, Path::new("test.conf")).expect("config loads");
+        let loaded = config::parse(&without_laptop, Path::new("test.toml")).expect("config loads");
         registry.replace(loaded.registry);
 
         // The gateway still exists, so a miss here would be a lie about the

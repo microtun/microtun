@@ -14,7 +14,7 @@ microtun-core = { workspace = true, features = ["alloc"] }
 # incident.
 microtun-api = { workspace = true, features = ["tokio"] }
 microtun-ws = { workspace = true, features = ["tokio"] }
-microtun-ini = { workspace = true, features = ["std"] }
+toml_parser = { workspace = true }
 embedded-io = { workspace = true, features = ["std"] }
 embedded-io-async = { workspace = true }
 
@@ -40,9 +40,9 @@ tokio = { version = "1", features = [
 clap = { version = "4.6", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-serde = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
+serde = { workspace = true, features = ["std"] }
 # Used only to assert the exact bytes of a serialized record; the server itself
 # serializes through the session layer's responder.
 serde_json = "1"

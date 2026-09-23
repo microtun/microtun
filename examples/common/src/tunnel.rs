@@ -28,9 +28,11 @@ use crate::net::resolve_tracker_host;
 
 pub const TUNNEL_QUEUE_DEPTH: usize = 4;
 pub const OUTER_UDP_PACKETS: usize = 4;
-pub const INNER_STACK_SOCKETS: usize = 5;
-pub const LISTEN_PORT: u16 = 51820;
-
+// embassy-net's `dns` feature reserves one slot even though the inner stack has no DNS
+// servers configured. The other steady-state users are resolver TCP and Telnet TCP; the
+// fourth slot is needed transiently by `ping tunnel` while Telnet remains connected.
+pub const INNER_STACK_SOCKETS: usize = 4;
+const DEFAULT_LISTEN_PORT: u16 = 51820;
 const RESOLVER_TCP_BUFFER: usize = 1024;
 const PEERS_API_PORT: u16 = microtun_embassy::peers_api::PEERS_API_PORT;
 
@@ -118,7 +120,7 @@ where
         rng,
         channel_runner,
         status,
-        LISTEN_PORT,
+        config.tunnel.listen_port.unwrap_or(DEFAULT_LISTEN_PORT),
         config.tunnel.enable_forwarding,
         now,
     )
@@ -162,9 +164,6 @@ where
 }
 
 /// Run the peer resolver with a 256-bit seed drawn from the platform RNG.
-///
-/// The resolver expands this with a CSPRNG and uses fresh entropy for every
-/// WebSocket connection it opens.
 pub async fn run_peer_resolver(
     inner_stack: Stack<'static>,
     local_public_key: [u8; 32],

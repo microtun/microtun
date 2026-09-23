@@ -1,11 +1,10 @@
 [package]
 name = "microtun-examples-common"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.91"
-publish = false
-
-license = "BUSL-1.1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
 
 [features]
 default = []
@@ -34,11 +33,16 @@ embassy-net = { version = "0.9.1", default-features = false, features = [
 ] }
 embassy-time = { version = "0.5.1", default-features = false }
 embedded-io-async = { version = "0.7.0", default-features = false }
+embedded-hal = { version = "1.0.0", default-features = false }
+embedded-storage = { version = "0.3.1", default-features = false }
+crc = { version = "3.4", default-features = false }
+heapless = { version = "0.9.1", default-features = false }
+microtun-core = { path = "../../microtun-core" }
 microtun-embassy = { path = "../../microtun-embassy" }
 microtun-mcuboot = { path = "../../microtun-mcuboot", default-features = false }
-microtun-net-util = { path = "../../microtun-net-util", default-features = false, features = ["ping"] }
-microtun-ymodem = { path = "../../microtun-ymodem" }
+microtun-cli = { path = "../../microtun-cli" }
+microtun-net-util = { path = "../../microtun-net-util", default-features = false, features = ["embassy-net", "ping"] }
+microtun-ymodem = { git = "https://github.com/microtun/microtun-ymodem", rev = "v0.2.0" }
 rand_core = { version = "0.6", default-features = false }
 sntpc = { version = "0.11", default-features = false }
 sntpc-net-embassy = { version = "0.11", default-features = false, features = ["ipv6"] }
-microtun-telnet-cli = { git = "https://github.com/microtun/microtun-telnet-cli", rev = "v0.2.0" }

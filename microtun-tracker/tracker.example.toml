@@ -1,0 +1,43 @@
+# microtun Tracker - example configuration.
+
+[Microtun]
+ApiVersion = "microtun.dev/v1alpha1"
+Kind = "TrackerConfig"
+
+[Tunnel]
+# The Tracker's tunnel identity.
+PrivateKey = "+FjyECUtAzQ/UZvyw4ogXGp8uhPRri9pVOdudoRRJ0E="
+# The local IPv4 or IPv6 tunnel interface address and optional prefix. A bare
+# address becomes /32 (IPv4) or /128 (IPv6).
+Address = "10.0.0.1/24"
+# Inner IP MTU. Defaults to 1280 when omitted.
+# MTU = 1280
+# UDP port the tunnel protocol listens on across local addresses.
+ListenPort = 51820
+# Forward authenticated relay packets between configured peers.
+EnableForwarding = false
+
+# Repeat [[Peer]] for every additional peer. Name is a case-insensitive local alias.
+[[Peer]]
+Name = "my-relay"
+PublicKey = "07dnTjJ6nzHKA1IqzSzEmK967uuT1ZoFa55/b6ThO0I="
+# Outer endpoint (public IP:port). Omit for peers that roam or sit behind NAT.
+Endpoint = "198.51.100.20:51820"
+# Single tunnel prefix owned by this peer. Host bits on shorter prefixes are
+# cleared before the record is served.
+Address = "10.0.0.3/32"
+# Persistent keepalive seconds. Omit it or set 0 to disable.
+PersistentKeepalive = 25
+
+[[Peer]]
+Name = "site-network"
+PublicKey = "rz/4664fkjDuRBrdo/LpptaxafT/xUSKKDFyhOgVXSw="
+Address = "10.5.0.0/24"
+
+[[Peer]]
+Name = "laptop"
+PublicKey = "Pvub4L2atK2PJNTeVBkFAOW+pl+/Z25rjQFlDpWcqG4="
+Address = "10.0.0.7/32"
+# Reachable through one directly reachable peer, named by its Name property.
+# A public key is also accepted. Use @self to relay through the Tracker.
+Relay = "my-relay"

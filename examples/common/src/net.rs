@@ -4,22 +4,63 @@ use core::net::{IpAddr, SocketAddr};
 
 use defmt_or_log::{info, warn};
 use embassy_net::{
-    IpAddress, Ipv4Address, Stack,
+    IpAddress, Ipv4Address, Ipv4Cidr, Stack, StaticConfigV4,
     dns::DnsQueryType,
     udp::{PacketMetadata, UdpSocket},
 };
 use embassy_time::{Duration, Instant, Timer, with_timeout};
+use microtun_net_util::{FALLBACK_DEVICE_IPV4, FALLBACK_IPV4_PREFIX_LEN};
 use sntpc::{NtpContext, NtpResult, NtpTimestampGenerator, get_time};
 use sntpc_net_embassy::UdpSocketWrapper;
 
-pub const TCP_KEEP_ALIVE: Duration = Duration::from_secs(15);
-pub const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+use crate::{cli::TELNET_PORT, configuration::DeviceIdentity};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 const NTP_TIMEOUT: Duration = Duration::from_secs(5);
 const NTP_PACKET_BUFFER: usize = 128;
 const NTP_LOCAL_PORT: u16 = 49152;
+
+// Setup-mode addressing
+
+pub fn fallback_static_ipv4_config() -> StaticConfigV4 {
+    StaticConfigV4 {
+        address: Ipv4Cidr::new(
+            Ipv4Address::new(
+                FALLBACK_DEVICE_IPV4[0],
+                FALLBACK_DEVICE_IPV4[1],
+                FALLBACK_DEVICE_IPV4[2],
+                FALLBACK_DEVICE_IPV4[3],
+            ),
+            FALLBACK_IPV4_PREFIX_LEN,
+        ),
+        gateway: None,
+        dns_servers: Default::default(),
+    }
+}
+
+// Setup-mode services
+
+/// Run the tiny DHCP server used by setup mode.
+///
+/// Kept here so every board gets the same failure policy and log message. Board crates keep only
+/// the tiny executor task wrappers, so this common crate does not need to own an executor.
+pub async fn run_setup_dhcp(stack: Stack<'static>) {
+    if microtun_net_util::dhcp::run(stack).await.is_err() {
+        warn!("setup-mode DHCP server stopped unexpectedly");
+    }
+}
+
+/// Advertise one setup-mode device through mDNS/DNS-SD.
+pub async fn run_setup_mdns(stack: Stack<'static>, identity: DeviceIdentity, model: &'static str) {
+    let device_id = identity.device_id();
+    if microtun_net_util::mdns::run(stack, device_id.as_str(), model, TELNET_PORT)
+        .await
+        .is_err()
+    {
+        warn!("setup-mode mDNS responder stopped unexpectedly");
+    }
+}
 
 // DNS
 

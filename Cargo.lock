@@ -302,21 +302,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc"
-version = "3.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
-dependencies = [
- "crc-catalog",
-]
-
-[[package]]
-name = "crc-catalog"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
-
-[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -623,6 +608,9 @@ name = "embedded-io"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+dependencies = [
+ "defmt 1.1.1",
+]
 
 [[package]]
 name = "embedded-io-adapters"
@@ -641,6 +629,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2564b9f813c544241430e147d8bc454815ef9ac998878d30cc3055449f7fd4c0"
 dependencies = [
+ "defmt 1.1.1",
  "embedded-io 0.7.1",
 ]
 
@@ -766,7 +755,10 @@ version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f78e10609fe0e0b3f4157ffab1876319b5b0db102a2c60dc4626306dc46b44ad"
 dependencies = [
+ "fastrand",
  "futures-core",
+ "futures-io",
+ "parking",
  "pin-project-lite",
 ]
 
@@ -856,12 +848,6 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
-
-[[package]]
-name = "hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hmac"
@@ -1021,6 +1007,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "microtun-cli"
+version = "0.1.0"
+dependencies = [
+ "defmt 1.1.1",
+ "embassy-net",
+ "embedded-io 0.7.1",
+ "embedded-io-async",
+ "futures-lite",
+ "heapless",
+ "microtun-cli-macros",
+]
+
+[[package]]
+name = "microtun-cli-macros"
+version = "0.1.0"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "microtun-core"
 version = "0.1.0"
 dependencies = [
@@ -1036,14 +1045,13 @@ dependencies = [
  "hmac",
  "log",
  "maybe-async",
- "microtun-ini",
  "rand",
  "rand_chacha",
  "rand_core",
- "serde",
  "subtle",
  "thiserror",
  "tokio",
+ "toml_parser",
  "wary",
  "x25519-dalek",
  "zerocopy",
@@ -1068,15 +1076,6 @@ dependencies = [
  "microtun-core",
  "rand_chacha",
  "rand_core",
-]
-
-[[package]]
-name = "microtun-ini"
-version = "0.2.1"
-source = "git+https://github.com/microtun/microtun-ini?rev=v0.2.1#51c526c95ebb671f5e18b21a4c11f23ef77664b1"
-dependencies = [
- "serde",
- "thiserror",
 ]
 
 [[package]]
@@ -1115,24 +1114,8 @@ dependencies = [
  "embedded-io-async",
  "getifaddrs",
  "heapless",
- "microtun-provisioning",
  "socket2 0.6.5",
  "static_cell",
-]
-
-[[package]]
-name = "microtun-provisioning"
-version = "0.1.0"
-dependencies = [
- "base64",
- "crc",
- "defmt 1.1.1",
- "embassy-net",
- "heapless",
- "hex",
- "microtun-core",
- "static_cell",
- "thiserror",
 ]
 
 [[package]]
@@ -1158,7 +1141,6 @@ dependencies = [
  "embedded-io-async",
  "microtun-api",
  "microtun-core",
- "microtun-ini",
  "microtun-std",
  "microtun-ws",
  "rand",
@@ -1166,6 +1148,7 @@ dependencies = [
  "serde_json",
  "smoltcp",
  "tokio",
+ "toml_parser",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1183,13 +1166,6 @@ dependencies = [
  "sha1",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "microtun-ymodem"
-version = "0.1.0"
-dependencies = [
- "crc",
 ]
 
 [[package]]
@@ -1780,6 +1756,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_parser"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
+dependencies = [
+ "winnow",
+]
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2197,6 +2182,12 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "winreg"

@@ -1,10 +1,10 @@
 //! microtun daemon for Linux hosts.
 //!
 //! Platform-independent Tokio driving and Peers API resolution live in
-//! [`microtun_std`]. This binary uses the same provisioning INI schema as
-//! `microtun-core` device configuration, plus Linux TUN setup, logging, and process lifecycle.
+//! [`microtun_std`]. This binary uses the same device-configuration TOML schema as
+//! `microtun-core`, plus Linux TUN setup, logging, and process lifecycle.
 //!
-//! Run: `microtun /etc/microtun/microtun.conf` (defaults to `mtun0`; needs `CAP_NET_ADMIN`).
+//! Run: `microtun /etc/microtun/microtun.toml` (defaults to `mtun0`; needs `CAP_NET_ADMIN`).
 
 use std::{
     fs, io,
@@ -14,7 +14,7 @@ use std::{
 };
 
 use clap::Parser;
-use microtun_core::device_config::{DeviceConfig, decode_ini};
+use microtun_core::device_config::{DeviceConfig, decode_toml};
 use microtun_std::{
     PeersApiResolver, PeersApiTransport, TunnelDevice, TunnelRunner,
     core::{
@@ -118,7 +118,7 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        match decode_ini(&config_bytes) {
+        match decode_toml(&config_bytes) {
             Ok(config) => config,
             Err(error) => {
                 tracing::error!(

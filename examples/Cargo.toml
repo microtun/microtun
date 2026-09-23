@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "common",
+    "esp32-c6-plc-v/app",
+    "nucleo-h753zi/app",
+    "nucleo-h753zi/bootloader",
+]
+
+# The two firmware crates each need their own target, so a bare `cargo build` here cannot build
+# both. Build a board by name (`cargo build -p microtun-nucleo-h753zi`) from inside its directory,
+# so that its `.cargo/config.toml` supplies the target.
+default-members = ["common"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "BUSL-1.1"
+publish = false
+
+# Profiles must live at the workspace root: Cargo ignores `[profile]` in a member manifest. These
+# are the union of what the three crates set individually before, with the differences preserved
+# as per-package overrides below.
+[profile.dev]
+debug = 2
+incremental = false
+codegen-units = 1
+opt-level = "s"
+lto = "fat"
+
+[profile.release]
+debug = 2
+incremental = false
+codegen-units = 1
+opt-level = "s"
+lto = "fat"
+
+# The Wi-Fi and flash drivers have timing-sensitive paths that a size-tuned opt-level makes
+# unusable. This was already called out in the ESP32-C6 example's own dev profile.
+[profile.dev.package.esp-radio]
+opt-level = 3
+
+[profile.release.package.esp-radio]
+opt-level = 3
+
+[profile.dev.package.esp-storage]
+opt-level = 3
+
+[profile.release.package.esp-storage]
+opt-level = 3

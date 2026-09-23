@@ -6,7 +6,6 @@ runner = "probe-rs run --chip STM32H753ZITx"
 rustflags = [
     "-C", "link-arg=-Tlink.x",
     "-C", "link-arg=-Tdefmt.x",
-    "-C", "link-arg=-Tmicrotun.x",
 ]
 
 [env]

@@ -6,7 +6,7 @@
 //! partition, the ESP application descriptor, and the otadata bookkeeping the
 //! rollback-capable bootloader reads.
 
-use embassy_net::tcp::TcpSocket;
+use embedded_io_async::{Read, Write};
 use embedded_storage::{ReadStorage, Storage, nor_flash::NorFlash as _};
 use esp_bootloader_esp_idf::{
     ota::OtaImageState,
@@ -18,12 +18,8 @@ use esp_bootloader_esp_idf::{
 };
 use esp_storage::FlashStorage;
 use log::{info, warn};
-pub(crate) use microtun_examples_common::firmware::{
-    FirmwareStatus, receive_ymodem_buffer, telnet_write_data,
-};
-use microtun_examples_common::firmware::{
-    ImageTransferError, TransferError, receive_signed_image, transfer_error_text,
-};
+pub(crate) use microtun_examples_common::firmware::FirmwareStatus;
+use microtun_examples_common::firmware::{ImageTransferError, TransferError, receive_signed_image};
 use microtun_mcuboot::{
     ImageVersion, PayloadSink, Policy as McubootPolicy, StoredImageError, StreamingVerifier,
     verify_stored_image,
@@ -478,7 +474,7 @@ pub(crate) fn firmware_update_error_text(error: &FirmwareUpdateError) -> &'stati
         }
         FirmwareUpdateError::Flash(OtaSinkError::OutOfBounds) => "firmware does not fit OTA slot",
         FirmwareUpdateError::Flash(OtaSinkError::Flash(_)) => "flash write failed",
-        FirmwareUpdateError::Transfer(error) => transfer_error_text(*error),
+        FirmwareUpdateError::Transfer(error) => error,
     }
 }
 
@@ -493,10 +489,13 @@ pub(crate) fn log_firmware_update_error(error: &FirmwareUpdateError) {
     }
 }
 
-pub(crate) async fn receive_firmware_update(
-    socket: &mut TcpSocket<'_>,
+pub(crate) async fn receive_firmware_update<T>(
+    io: &mut T,
     flash: &mut FlashStorage<'static>,
-) -> Result<(EspAppMetadata, AppPartitionSubType), FirmwareUpdateError> {
+) -> Result<(EspAppMetadata, AppPartitionSubType), FirmwareUpdateError>
+where
+    T: Read + Write + ?Sized,
+{
     let (metadata, slot) = {
         let mut partition_buffer = [0u8; PARTITION_TABLE_MAX_LEN];
         let mut updater = OtaUpdater::new(flash, &mut partition_buffer)?;
@@ -514,7 +513,7 @@ pub(crate) async fn receive_firmware_update(
         )
         .map_err(FirmwareUpdateError::Image)?;
 
-        receive_signed_image(socket, &mut verifier, &mut sink).await?;
+        receive_signed_image(io, &mut verifier, &mut sink).await?;
         let verified = verifier.finish().map_err(FirmwareUpdateError::Image)?;
 
         // Streaming verification only proves the bytes on the wire were

@@ -7,8 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-microtun-provisioning = { path = "../microtun-provisioning", default-features = false, optional = true }
-heapless = { workspace = true, optional = true }
 embassy-net = { version = "0.9.1", default-features = false, features = [
     "icmp",
     "udp",
@@ -20,23 +18,20 @@ embassy-net = { version = "0.9.1", default-features = false, features = [
 ], optional = true }
 embassy-time = { version = "0.5.1", default-features = false, optional = true }
 embedded-io-async = { workspace = true, optional = true }
-static_cell = { version = "2", optional = true }
 getifaddrs = { version = "0.6.2", optional = true }
+heapless = { workspace = true }
 socket2 = { version = "0.6.5", optional = true }
+static_cell = { version = "2", optional = true }
 
 [features]
 default = ["std"]
 std = [
-    "dep:microtun-provisioning",
-    "dep:heapless",
     "dep:getifaddrs",
     "dep:socket2",
 ]
 embassy-net = [
-    "dep:microtun-provisioning",
-    "dep:heapless",
     "dep:embassy-net",
     "dep:embassy-time",
     "dep:static_cell",
 ]
-ping = ["dep:embassy-net", "dep:embassy-time", "dep:embedded-io-async", "dep:heapless"]
+ping = ["dep:embassy-net", "dep:embassy-time", "dep:embedded-io-async"]

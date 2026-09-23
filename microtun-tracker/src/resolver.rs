@@ -348,13 +348,13 @@ mod tests {
 
     fn config_text(peer_key: &str, endpoint: &str, address: &str) -> String {
         format!(
-            "{}[Peer]\nName = client\nPublicKey = {peer_key}\nEndpoint = {endpoint}\nAddress = {address}\n",
+            "{}[[Peer]]\nName = \"client\"\nPublicKey = \"{peer_key}\"\nEndpoint = \"{endpoint}\"\nAddress = \"{address}\"\n",
             server_config("10.0.0.1/32")
         )
     }
 
     fn loaded(text: &str) -> Loaded {
-        config::parse(text, Path::new("test.conf")).expect("test config loads")
+        config::parse(text, Path::new("test.toml")).expect("test config loads")
     }
 
     fn temp_path(label: &str) -> PathBuf {
@@ -363,7 +363,7 @@ mod tests {
             .expect("system clock is after the Unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "microtun-tracker-{label}-{}-{nonce}.conf",
+            "microtun-tracker-{label}-{}-{nonce}.toml",
             std::process::id()
         ))
     }
@@ -371,8 +371,8 @@ mod tests {
     #[test]
     fn answers_by_key_and_longest_prefix() {
         let text = format!(
-            "{}[Peer]\nName = wide\nPublicKey = {PEER_A}\nEndpoint = 198.51.100.1:51820\nAddress = 10.2.0.0/16\n\n\
-             [Peer]\nName = narrow\nPublicKey = {PEER_B}\nEndpoint = 198.51.100.2:51820\nAddress = 10.2.3.0/24\n",
+            "{}[[Peer]]\nName = \"wide\"\nPublicKey = \"{PEER_A}\"\nEndpoint = \"198.51.100.1:51820\"\nAddress = \"10.2.0.0/16\"\n\n\
+             [[Peer]]\nName = \"narrow\"\nPublicKey = \"{PEER_B}\"\nEndpoint = \"198.51.100.2:51820\"\nAddress = \"10.2.3.0/24\"\n",
             server_config("10.0.0.1/32")
         );
         let loaded = loaded(&text);
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn server_local_resolver_strips_self_relay() {
         let text = format!(
-            "{}[Peer]\nName = client\nPublicKey = {PEER_A}\nAddress = 10.0.0.2/32\nRelay = @self\n",
+            "{}[[Peer]]\nName = \"client\"\nPublicKey = \"{PEER_A}\"\nAddress = \"10.0.0.2/32\"\nRelay = \"@self\"\n",
             server_config("10.0.0.1/32")
         );
         let loaded = loaded(&text);
@@ -493,10 +493,11 @@ mod tests {
     #[test]
     fn tunnel_prefix_change_requires_restart_even_when_host_is_unchanged() {
         let first_text = config_text(PEER_A, "198.51.100.10:51820", "10.0.0.2/32")
-            .replace("Address = 10.0.0.1/32", "Address = 10.0.0.1/24");
+            .replace("Address = \"10.0.0.1/32\"", "Address = \"10.0.0.1/24\"");
         let first = loaded(&first_text);
         let fixed = FixedServer::from_loaded(&first).unwrap();
-        let changed = loaded(&first_text.replace("Address = 10.0.0.1/24", "Address = 10.0.0.1/16"));
+        let changed =
+            loaded(&first_text.replace("Address = \"10.0.0.1/24\"", "Address = \"10.0.0.1/16\""));
 
         assert_eq!(
             fixed.validate_reload(&changed).unwrap_err(),
@@ -552,7 +553,7 @@ mod tests {
         assert!(shared.config_snapshot().lookup_key(&[0xAA; 32]).is_some());
 
         let changed_server = format!(
-            "{}[Peer]\nName = client\nPublicKey = {PEER_B}\nEndpoint = 198.51.100.20:51820\nAddress = 10.0.0.3/32\n",
+            "{}[[Peer]]\nName = \"client\"\nPublicKey = \"{PEER_B}\"\nEndpoint = \"198.51.100.20:51820\"\nAddress = \"10.0.0.3/32\"\n",
             server_config("10.9.9.9/32")
         );
         fs::write(&path, changed_server).unwrap();

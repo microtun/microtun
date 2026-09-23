@@ -3,19 +3,22 @@
 use core::fmt::{self, Display};
 
 use embassy_net::Stack;
-use embassy_time::Instant as EmbassyInstant;
+use embassy_time::{Duration, Instant as EmbassyInstant};
 use embedded_io_async::Write as AsyncWrite;
+pub use microtun_cli::Table;
+use microtun_cli::{Error as CliError, ErrorKind, ValueEnum, write_fmt};
 use microtun_embassy::{
     TunnelStatus,
     core::{Instant, PeerConnectionState, PeerOrigin, key::encode_key},
 };
-pub use microtun_net_util::ping::{DEFAULT_PING_COUNT, MAX_PING_COUNT};
-use microtun_telnet_cli::{Error as CliError, IoError, ValueEnum, write_fmt};
-
-use crate::table::Table;
+pub use microtun_net_util::ping::{DEFAULT_PING_COUNT, MAX_PING_COUNT, ping};
 
 pub const TELNET_TCP_BUFFER: usize = 1024;
-pub const TELNET_PORT: u16 = 23;
+/// Use an alternate port for the management interface.
+pub const TELNET_PORT: u16 = 2323;
+pub const TELNET_PROMPT: &str = "microtun> ";
+pub const TELNET_KEEP_ALIVE: Duration = Duration::from_secs(15);
+pub const TELNET_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum PingIface {
@@ -34,32 +37,17 @@ impl PingIface {
     }
 }
 
-pub async fn ping<W>(
-    out: &mut W,
-    iface_name: &str,
-    iface: Stack<'static>,
-    target: core::net::IpAddr,
-    count: u8,
-) -> Result<(), CliError>
-where
-    W: AsyncWrite<Error = IoError> + ?Sized,
-{
-    microtun_net_util::ping::ping(out, iface_name, iface, target, count)
-        .await
-        .map_err(CliError::from)
-}
-
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum SysField {
     /// Show the current device mode.
     Mode,
-    /// Show whether a provisioning record is installed.
-    Provisioned,
+    /// Show whether a persisted device configuration is present.
+    Configuration,
     /// Show the board model.
     Board,
     /// Show the Git-derived firmware version string.
     Version,
-    /// Show the stable provisioning/device identifier.
+    /// Show the stable device identifier used for configuration and discovery.
     Id,
     /// Show the reason for the last reset.
     ResetReason,
@@ -81,19 +69,9 @@ pub enum TunnelAction {
     Key,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum IoAction {
-    /// Turn the output on.
-    On,
-    /// Turn the output off.
-    Off,
-    /// Invert the current output state.
-    Toggle,
-}
-
 pub async fn line<W>(out: &mut W, args: fmt::Arguments<'_>) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
 {
     write_fmt::<256, _>(out, args).await?;
     out.write_all(b"\r\n").await?;
@@ -102,7 +80,7 @@ where
 
 pub async fn println<W>(out: &mut W, text: &str) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
 {
     out.write_all(text.as_bytes()).await?;
     out.write_all(b"\r\n").await?;
@@ -113,7 +91,7 @@ const DEFAULT_TABLE: Table = Table::new(&[]);
 
 pub const SYS_TABLE: Table = Table::new(&[
     "mode",
-    "provisioned",
+    "configuration",
     "board",
     "id",
     "version",
@@ -126,7 +104,7 @@ pub const SYS_TABLE: Table = Table::new(&[
 
 pub async fn field<W, D>(out: &mut W, name: &str, value: &D) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
     D: Display + ?Sized,
 {
     DEFAULT_TABLE.field(out, name, value).await
@@ -139,7 +117,7 @@ pub async fn time_field<W>(
     time: Option<(u64, u32)>,
 ) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
 {
     match time {
         Some((seconds, nanos)) => {
@@ -151,20 +129,13 @@ where
     }
 }
 
-pub async fn time<W>(
-    out: &mut W,
-    field_name: Option<&str>,
-    time: Option<(u64, u32)>,
-) -> Result<(), CliError>
+pub async fn time<W>(out: &mut W, time: Option<(u64, u32)>) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
 {
-    match field_name {
-        Some(name) => time_field(out, DEFAULT_TABLE, name, time).await,
-        None => match time {
-            Some((seconds, nanos)) => line(out, format_args!("unix={seconds}.{nanos:09}")).await,
-            None => println(out, "unavailable").await.map_err(CliError::from),
-        },
+    match time {
+        Some((seconds, nanos)) => line(out, format_args!("unix={seconds}.{nanos:09}")).await,
+        None => println(out, "unavailable").await,
     }
 }
 
@@ -176,7 +147,7 @@ pub async fn net_field<W>(
     gateway: Option<&dyn Display>,
 ) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
 {
     match (address, gateway) {
         (Some(address), Some(gateway)) => {
@@ -189,27 +160,6 @@ where
     }
 }
 
-pub async fn net<W>(
-    out: &mut W,
-    field_name: Option<&str>,
-    address: Option<&dyn Display>,
-    gateway: Option<&dyn Display>,
-) -> Result<(), CliError>
-where
-    W: AsyncWrite<Error = IoError> + ?Sized,
-{
-    match field_name {
-        Some(name) => net_field(out, DEFAULT_TABLE, name, address, gateway).await,
-        None => match (address, gateway) {
-            (Some(address), Some(gateway)) => {
-                line(out, format_args!("{address} gateway={gateway}")).await
-            }
-            (Some(address), None) => line(out, format_args!("{address}")).await,
-            (None, _) => println(out, "unconfigured").await.map_err(CliError::from),
-        },
-    }
-}
-
 pub async fn write_net_base<W>(
     out: &mut W,
     table: Table,
@@ -217,7 +167,7 @@ pub async fn write_net_base<W>(
     mac: [u8; 6],
 ) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
 {
     table
         .field(out, "link", if stack.is_link_up() { "up" } else { "down" })
@@ -247,16 +197,14 @@ where
 
 pub async fn write_link_status<W>(out: &mut W, stack: Stack<'static>) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
 {
-    println(out, if stack.is_link_up() { "up" } else { "down" })
-        .await
-        .map_err(CliError::from)
+    println(out, if stack.is_link_up() { "up" } else { "down" }).await
 }
 
 pub async fn write_ip_status<W>(out: &mut W, stack: Stack<'static>) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
 {
     let config = stack.config_v4();
     let address = config
@@ -266,12 +214,18 @@ where
         .as_ref()
         .and_then(|config| config.gateway.as_ref())
         .map(|gateway| gateway as &dyn Display);
-    net(out, None, address, gateway).await
+    match (address, gateway) {
+        (Some(address), Some(gateway)) => {
+            line(out, format_args!("{address} gateway={gateway}")).await
+        }
+        (Some(address), None) => line(out, format_args!("{address}")).await,
+        (None, _) => println(out, "unconfigured").await,
+    }
 }
 
 pub async fn write_mac_status<W>(out: &mut W, mac: [u8; 6]) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
 {
     line(
         out,
@@ -306,7 +260,7 @@ pub async fn write_tunnel_status<W>(
     inner_stack: &Stack<'static>,
 ) -> Result<(), CliError>
 where
-    W: AsyncWrite<Error = IoError> + ?Sized,
+    W: AsyncWrite<Error = ErrorKind> + ?Sized,
 {
     let snapshot = status.snapshot();
     let public_key = encode_key(&snapshot.public_key);

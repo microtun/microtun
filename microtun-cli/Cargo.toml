@@ -1,0 +1,32 @@
+[package]
+name = "microtun-cli"
+description = "Clap-like no_std async Telnet CLI for embedded Rust, allocation-free by default"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+embedded-io = { version = "0.7.1", default-features = false }
+embedded-io-async = { version = "0.7.0", default-features = false }
+heapless = { version = "0.9.3", default-features = false }
+microtun-cli-macros = { path = "../microtun-cli-macros", optional = true }
+defmt = { version = "1", optional = true }
+embassy-net = { version = "0.9.1", default-features = false, features = ["tcp", "proto-ipv4", "medium-ip"], optional = true }
+
+[dev-dependencies]
+futures-lite = "2.6.1"
+
+[[example]]
+name = "embassy_net"
+path = "examples/embassy_net.rs"
+
+[features]
+default = ["derive", "help", "completion", "history"]
+alloc = []
+derive = ["dep:microtun-cli-macros"]
+help = []
+completion = []
+history = []
+defmt = ["dep:defmt", "embedded-io/defmt", "embedded-io-async/defmt"]
+embassy-net = ["dep:embassy-net"]

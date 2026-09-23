@@ -1,0 +1,338 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUST_TOOLCHAIN: "1.97.1"
+  MICROTUN_SIGNER_VERSION: "v0.6.0"
+  MICROTUN_SIGNER_URL: "https://signer.microtun.dev"
+  MICROTUN_SIGNER_KEY_ID: "microtun-firmware-prod"
+  MICROTUN_SIGNER_OIDC_AUDIENCE: "microtun-signer"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate tag and workspace versions
+        id: version
+        run: |
+          .github/scripts/check-release-tag.sh "${{ github.ref_name }}"
+          version="${GITHUB_REF_NAME#v}"
+          printf 'version=%s\ntag=%s\n' "$version" "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Build Linux binaries (${{ matrix.arch }})
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            cross_cc: ""
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            cross_cc: aarch64-linux-gnu-gcc
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install ARM64 cross linker
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gcc-aarch64-linux-gnu
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: ${{ matrix.target }}
+          rustflags: ""
+          cache: false
+
+      - name: Build release binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          CROSS_CC: ${{ matrix.cross_cc }}
+        run: |
+          if [[ -n "$CROSS_CC" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$CROSS_CC"
+          fi
+          cargo build --locked --release \
+            --target "$TARGET" \
+            -p microtun-linux \
+            -p microtun-tracker
+
+      - name: Stage Linux binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          install -m 0755 "target/${TARGET}/release/microtun" "dist/microtun-linux-${ARCH}"
+          install -m 0755 "target/${TARGET}/release/microtun-tracker" "dist/microtun-tracker-linux-${ARCH}"
+          test -s "dist/microtun-linux-${ARCH}"
+          test -s "dist/microtun-tracker-linux-${ARCH}"
+          file "dist/microtun-linux-${ARCH}" "dist/microtun-tracker-linux-${ARCH}"
+
+      - name: Upload Linux binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  signing-key:
+    name: Fetch firmware signing key
+    needs: validate
+    # Set MICROTUN_SIGNING_RUNNER to a self-hosted runner label when the signer
+    # is only reachable from a private network. Otherwise GitHub-hosted Ubuntu
+    # is sufficient for an HTTPS-reachable signer.
+    runs-on: ${{ vars.MICROTUN_SIGNING_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install microtun-signer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          signer_version="${MICROTUN_SIGNER_VERSION#v}"
+          arch="$(dpkg --print-architecture)"
+          case "$arch" in
+            amd64|arm64) ;;
+            *) echo "Unsupported microtun-signer Debian architecture: $arch" >&2; exit 1 ;;
+          esac
+          package="microtun-signer_${signer_version}_${arch}.deb"
+          mkdir -p "$RUNNER_TEMP/microtun-signer-package"
+          gh release download "$MICROTUN_SIGNER_VERSION" \
+            --repo microtun/microtun-signer \
+            --pattern "$package" \
+            --dir "$RUNNER_TEMP/microtun-signer-package"
+          sudo apt-get install -y "$RUNNER_TEMP/microtun-signer-package/$package"
+          microtun-signer --version
+
+      - name: Fetch immutable firmware verification key
+        run: |
+          mkdir -p dist
+          microtun-signer \
+            --url "$MICROTUN_SIGNER_URL" \
+            public-key \
+            --key-id "$MICROTUN_SIGNER_KEY_ID" \
+            > dist/firmware-signing-public.pem
+          test -s dist/firmware-signing-public.pem
+
+      - name: Upload firmware verification key
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmware-signing-public-key
+          path: dist/firmware-signing-public.pem
+          if-no-files-found: error
+          retention-days: 1
+
+  firmware:
+    name: Build and sign firmware (${{ matrix.name }})
+    needs: [validate, signing-key]
+    runs-on: ${{ vars.MICROTUN_SIGNING_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: nucleo-h753zi
+            script: examples/nucleo-h753zi/scripts/make-mcuboot-image.sh
+            asset: microtun-nucleo-h753zi-${{ needs.validate.outputs.version }}.mcuboot.bin
+          - name: esp32-c6-plc-v
+            script: examples/esp32-c6-plc-v/scripts/make-mcuboot-image.sh
+            asset: microtun-esp32-c6-plc-v-${{ needs.validate.outputs.version }}.mcuboot.bin
+
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download firmware verification key
+        uses: actions/download-artifact@v8
+        with:
+          name: firmware-signing-public-key
+          path: ${{ runner.temp }}/microtun-signing-key
+
+      - name: Install microtun-signer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          signer_version="${MICROTUN_SIGNER_VERSION#v}"
+          arch="$(dpkg --print-architecture)"
+          case "$arch" in
+            amd64|arm64) ;;
+            *) echo "Unsupported microtun-signer Debian architecture: $arch" >&2; exit 1 ;;
+          esac
+          package="microtun-signer_${signer_version}_${arch}.deb"
+          mkdir -p "$RUNNER_TEMP/microtun-signer-package"
+          gh release download "$MICROTUN_SIGNER_VERSION" \
+            --repo microtun/microtun-signer \
+            --pattern "$package" \
+            --dir "$RUNNER_TEMP/microtun-signer-package"
+          sudo apt-get install -y "$RUNNER_TEMP/microtun-signer-package/$package"
+          microtun-signer --version
+
+      - name: Acquire signer credential
+        id: signer-credential
+        uses: actions/github-script@v8
+        env:
+          OIDC_AUDIENCE: ${{ env.MICROTUN_SIGNER_OIDC_AUDIENCE }}
+        with:
+          result-encoding: string
+          script: |
+            const token = await core.getIDToken(process.env.OIDC_AUDIENCE);
+            core.setSecret(token);
+            return token;
+
+      - name: Install imgtool
+        run: |
+          python3 -m venv "$RUNNER_TEMP/imgtool"
+          "$RUNNER_TEMP/imgtool/bin/pip" install --disable-pip-version-check "imgtool==2.4.0"
+          echo "$RUNNER_TEMP/imgtool/bin" >> "$GITHUB_PATH"
+
+      - name: Build and sign firmware image with microtun-signer
+        env:
+          MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH: ${{ runner.temp }}/microtun-signing-key/firmware-signing-public.pem
+          MICROTUN_SIGNER_TOKEN: ${{ steps.signer-credential.outputs.result }}
+        run: |
+          test -s "$MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH"
+          command -v microtun-signer >/dev/null
+          mkdir -p dist
+          "${{ matrix.script }}" "dist/${{ matrix.asset }}"
+          test -s "dist/${{ matrix.asset }}"
+
+      - name: Upload firmware image
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-firmware-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub release
+    needs: [validate, linux, signing-key, firmware]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          cd dist
+
+          assets=(
+            microtun-linux-x86_64
+            microtun-tracker-linux-x86_64
+            microtun-linux-arm64
+            microtun-tracker-linux-arm64
+            "microtun-nucleo-h753zi-${VERSION}.mcuboot.bin"
+            "microtun-esp32-c6-plc-v-${VERSION}.mcuboot.bin"
+          )
+
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+          done
+
+          sha256sum "${assets[@]}" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          assets=(dist/*)
+          if ((${#assets[@]} == 0)); then
+            echo "no release assets found" >&2
+            exit 1
+          fi
+
+          if is_draft="$(gh release view "$TAG" --repo "$REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$is_draft" == "true" ]]; then
+              gh release upload "$TAG" "${assets[@]}" --clobber --repo "$REPOSITORY"
+              gh release edit "$TAG" --draft=false --repo "$REPOSITORY"
+            else
+              existing_assets="$(gh release view "$TAG" --repo "$REPOSITORY" --json assets --jq '.assets[].name')"
+              for asset in "${assets[@]}"; do
+                name="${asset##*/}"
+                if ! grep -Fxq "$name" <<<"$existing_assets"; then
+                  echo "::error::published release $TAG already exists but is missing asset $name"
+                  exit 1
+                fi
+              done
+              echo "release $TAG is already published with all expected assets"
+            fi
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --repo "$REPOSITORY" \
+              --verify-tag \
+              --generate-notes \
+              --title "$TAG"
+          fi

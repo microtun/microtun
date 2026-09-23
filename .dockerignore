@@ -1,0 +1,30 @@
+# VCS and editor state
+**/.git/
+**/.idea/
+**/.vscode/
+
+# Build output and caches
+**/target/
+**/build/
+**/dist/
+**/out/
+**/.cache/
+**/.direnv/
+**/.venv/
+**/venv/
+**/node_modules/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Signing material is supplied through BuildKit secrets, never build context.
+**/*.pem
+**/*.key
+
+# Generated firmware/images and local archives
+**/*.mcuboot.bin
+**/*.zip
+**/*.tar
+**/*.tar.gz
+**/*.tgz

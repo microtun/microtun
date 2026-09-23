@@ -17,5 +17,4 @@ cargo run --release
 The bootloader and sibling `../app/` project both consume the shared `../memory.x`, which defines the
 complete physical flash map once. The bootloader selects the `BOOTLOADER` region while the
 application selects `ACTIVE`; Embassy Boot partition offsets are derived from those regions.
-The application itself is linked at `0x0802_0000`; do not erase sector 0 when performing
-normal application updates.
+The application itself is linked at the linker-defined `ACTIVE` start (`0x0804_0000` with the current map); do not erase the BOOTLOADER sector when performing normal application updates.
