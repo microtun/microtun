@@ -41,10 +41,43 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate signer trust context
+        env:
+          EXPECTED_REPOSITORY: "microtun/microtun"
+          EXPECTED_REPOSITORY_ID: "1330258906"
+          ACTUAL_REPOSITORY_ID: ${{ github.repository_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          if [[ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
+            echo "::error::release signing is restricted to $EXPECTED_REPOSITORY (got $GITHUB_REPOSITORY)"
+            exit 1
+          fi
+          if [[ "$ACTUAL_REPOSITORY_ID" != "$EXPECTED_REPOSITORY_ID" ]]; then
+            echo "::error::repository id does not match the microtun-signer identity"
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" != "push" || "$REF_TYPE" != "tag" ]]; then
+            echo "::error::release signing requires a tag push"
+            exit 1
+          fi
+          if [[ "$REF_PROTECTED" != "true" ]]; then
+            echo "::error::release tag $GITHUB_REF_NAME is not protected; configure an active GitHub tag ruleset before releasing"
+            exit 1
+          fi
+          expected_workflow_ref="$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF"
+          if [[ "$WORKFLOW_REF" != "$expected_workflow_ref" ]]; then
+            echo "::error::workflow_ref does not match the path trusted by microtun-signer"
+            echo "::error::expected $expected_workflow_ref, got $WORKFLOW_REF"
+            exit 1
+          fi
+
       - name: Validate tag and workspace versions
         id: version
         run: |
-          .github/scripts/check-release-tag.sh "${{ github.ref_name }}"
+          scripts/check-release-tag.sh "${{ github.ref_name }}"
           version="${GITHUB_REF_NAME#v}"
           printf 'version=%s\ntag=%s\n' "$version" "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
 
@@ -175,6 +208,7 @@ jobs:
   firmware:
     name: Build and sign firmware (${{ matrix.name }})
     needs: [validate, signing-key]
+    environment: release
     runs-on: ${{ vars.MICROTUN_SIGNING_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 60
     permissions:
@@ -186,10 +220,8 @@ jobs:
       matrix:
         include:
           - name: nucleo-h753zi
-            script: examples/nucleo-h753zi/scripts/make-mcuboot-image.sh
             asset: microtun-nucleo-h753zi-${{ needs.validate.outputs.version }}.mcuboot.bin
           - name: esp32-c6-plc-v
-            script: examples/esp32-c6-plc-v/scripts/make-mcuboot-image.sh
             asset: microtun-esp32-c6-plc-v-${{ needs.validate.outputs.version }}.mcuboot.bin
 
     env:
@@ -252,7 +284,7 @@ jobs:
           test -s "$MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH"
           command -v microtun-signer >/dev/null
           mkdir -p dist
-          "${{ matrix.script }}" "dist/${{ matrix.asset }}"
+          scripts/make-mcuboot-image.sh "${{ matrix.name }}" "dist/${{ matrix.asset }}"
           test -s "dist/${{ matrix.asset }}"
 
       - name: Upload firmware image

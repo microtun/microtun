@@ -1,35 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reproducibly build the ESP32-C6 payload in Docker, then create an MCUboot
-# image using the public key retrieved from the network signer.
+# Reproducibly build a firmware payload in its target-specific Dockerfile, then
+# create an MCUboot image using the public key retrieved from the network signer.
 #
 # Required environment:
-#   MICROTUN_SIGNING_SERVICE_URL
-#   MICROTUN_SIGNING_KEY_ID
+#   MICROTUN_SIGNER_URL
+#   MICROTUN_SIGNER_KEY_ID
 # Optional environment:
 #   MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH (optional pre-fetched public key)
-#   MICROTUN_SIGNING_OIDC_AUDIENCE (default: microtun-firmware-signer)
-#   MICROTUN_SIGNING_SERVICE_TOKEN (fallback when GitHub OIDC is not used)
+#   MICROTUN_SIGNER_TOKEN (bearer token used by microtun-signer sign)
+#   MICROTUN_SIGNER (default: microtun-signer)
 #   IMGTOOL (default: imgtool)
 #   DOCKER (default: docker)
 #
 # Usage:
-#   ./make-mcuboot-image.sh [output.bin]
+#   scripts/make-mcuboot-image.sh <target> [output.bin]
+#
+# Supported targets:
+#   esp32-c6-plc-v
+#   nucleo-h753zi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXAMPLE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_ROOT="$(cd "$EXAMPLE_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CALLER_DIR="$PWD"
 DOCKER="${DOCKER:-docker}"
 IMGTOOL="${IMGTOOL:-imgtool}"
+MICROTUN_SIGNER="${MICROTUN_SIGNER:-microtun-signer}"
 
-if [[ $# -gt 1 ]]; then
-    echo "usage: $0 [output.bin]" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    echo "usage: $0 <target> [output.bin]" >&2
     exit 2
 fi
 
-for tool in "$DOCKER" python3 "$IMGTOOL"; do
+TARGET="$1"
+case "$TARGET" in
+    esp32-c6-plc-v)
+        CID="esp32-c6-plc-v"
+        SLOT_SIZE="0x1f0000"
+        BUILD_LABEL="ESP32-C6"
+        ;;
+    nucleo-h753zi)
+        CID="nucleo-h753zi"
+        SLOT_SIZE="0x0c0000"
+        BUILD_LABEL="NUCLEO-H753ZI"
+        ;;
+    *)
+        echo "unsupported firmware target: $TARGET" >&2
+        exit 2
+        ;;
+esac
+
+EXAMPLE_DIR="$REPO_ROOT/examples/$TARGET"
+DOCKERFILE="$EXAMPLE_DIR/app/Dockerfile.firmware"
+if [[ ! -f "$DOCKERFILE" ]]; then
+    echo "firmware Dockerfile not found for target $TARGET: $DOCKERFILE" >&2
+    exit 2
+fi
+
+for tool in "$DOCKER" sha256sum "$IMGTOOL" "$MICROTUN_SIGNER"; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "required tool not found: $tool" >&2
         exit 127
@@ -53,20 +82,20 @@ if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; th
     exit 2
 fi
 
-if [[ $# -eq 1 ]]; then
-    OUTPUT="$1"
+if [[ $# -eq 2 ]]; then
+    OUTPUT="$2"
     if [[ "$OUTPUT" != /* ]]; then
         OUTPUT="$CALLER_DIR/$OUTPUT"
     fi
 else
-    OUTPUT="$CALLER_DIR/microtun-esp32-c6-plc-v-$VERSION.mcuboot.bin"
+    OUTPUT="$CALLER_DIR/microtun-$TARGET-$VERSION.mcuboot.bin"
 fi
 mkdir -p "$(dirname "$OUTPUT")"
 
-: "${MICROTUN_SIGNING_SERVICE_URL:?MICROTUN_SIGNING_SERVICE_URL is required}"
-: "${MICROTUN_SIGNING_KEY_ID:?MICROTUN_SIGNING_KEY_ID is required}"
+: "${MICROTUN_SIGNER_URL:?MICROTUN_SIGNER_URL is required}"
+: "${MICROTUN_SIGNER_KEY_ID:?MICROTUN_SIGNER_KEY_ID is required}"
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/microtun-esp32-c6-plc-v-docker.XXXXXX")"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/microtun-$TARGET-docker.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 PUBLIC_KEY="${MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH:-}"
@@ -78,21 +107,22 @@ if [[ -n "$PUBLIC_KEY" ]]; then
     PUBLIC_KEY="$(realpath "$PUBLIC_KEY")"
 else
     PUBLIC_KEY="$WORK_DIR/firmware-signing-public.pem"
-    python3 "$REPO_ROOT/.github/scripts/firmware-signing-client.py" get-public-key \
-        --service-url "$MICROTUN_SIGNING_SERVICE_URL" \
-        --key-id "$MICROTUN_SIGNING_KEY_ID" \
-        --audience "${MICROTUN_SIGNING_OIDC_AUDIENCE:-microtun-firmware-signer}" \
-        --output "$PUBLIC_KEY"
+    "$MICROTUN_SIGNER" \
+        --url "$MICROTUN_SIGNER_URL" \
+        public-key \
+        --key-id "$MICROTUN_SIGNER_KEY_ID" \
+        > "$PUBLIC_KEY"
+    test -s "$PUBLIC_KEY"
 fi
 
 # BuildKit deliberately excludes secret contents from cache keys. Feed a hash
 # of the fetched public-key file through a non-secret build arg as a cache key
 # so a future key transition cannot reuse firmware built with a different key.
-PUBLIC_KEY_CACHE_KEY="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$PUBLIC_KEY")"
+read -r PUBLIC_KEY_CACHE_KEY _ < <(sha256sum "$PUBLIC_KEY")
 
-printf 'Building ESP32-C6 firmware payload in Docker...\n'
+printf 'Building %s firmware payload in Docker...\n' "$BUILD_LABEL"
 DOCKER_BUILDKIT=1 "$DOCKER" build \
-    --file "$SCRIPT_DIR/Dockerfile.mcuboot" \
+    --file "$DOCKERFILE" \
     --target artifact \
     --build-arg "FIRMWARE_PUBLIC_KEY_CACHE_KEY=$PUBLIC_KEY_CACHE_KEY" \
     --secret "id=firmware_public_key,src=$PUBLIC_KEY" \
@@ -101,15 +131,15 @@ DOCKER_BUILDKIT=1 "$DOCKER" build \
 
 test -s "$WORK_DIR/firmware.bin"
 
-python3 "$REPO_ROOT/.github/scripts/firmware-signing-client.py" sign-mcuboot \
+"$REPO_ROOT/scripts/sign-mcuboot.sh" \
     --input "$WORK_DIR/firmware.bin" \
     --output "$OUTPUT" \
     --public-key "$PUBLIC_KEY" \
     --version "$VERSION" \
-    --board esp32-c6-plc-v \
-    --cid esp32-c6-plc-v \
-    --slot-size 0x1f0000 \
-    --service-url "$MICROTUN_SIGNING_SERVICE_URL" \
-    --key-id "$MICROTUN_SIGNING_KEY_ID" \
-    --audience "${MICROTUN_SIGNING_OIDC_AUDIENCE:-microtun-firmware-signer}" \
+    --vid firmware.microtun.dev \
+    --cid "$CID" \
+    --slot-size "$SLOT_SIZE" \
+    --signer "$MICROTUN_SIGNER" \
+    --signer-url "$MICROTUN_SIGNER_URL" \
+    --key-id "$MICROTUN_SIGNER_KEY_ID" \
     --imgtool "$IMGTOOL"

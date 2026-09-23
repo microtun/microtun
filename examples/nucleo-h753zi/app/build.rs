@@ -27,7 +27,7 @@ fn emit_firmware_public_key() {
     cargo_emit::rerun_if_env_changed!("MICROTUN_FIRMWARE_PUBLIC_KEY_CACHE_KEY");
 
     let path = std::env::var("MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH").expect(
-        "MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH must point to an Ed25519 public-key PEM; release builds fetch it from the signing service",
+        "MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH must point to an Ed25519 public-key PEM; CI and release builds fetch it from the signing service",
     );
     let path = resolve_manifest_relative_path(path.trim());
     println!("cargo:rerun-if-changed={}", path.display());

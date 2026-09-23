@@ -16,6 +16,9 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  MICROTUN_SIGNER_VERSION: "v0.6.0"
+  MICROTUN_SIGNER_URL: "https://signer.microtun.dev"
+  MICROTUN_SIGNER_KEY_ID: "microtun-firmware-prod"
 
 defaults:
   run:
@@ -34,7 +37,7 @@ jobs:
           persist-credentials: false
 
       - name: Check workspace versions
-        run: .github/scripts/check-release-tag.sh
+        run: scripts/check-release-tag.sh
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -113,14 +116,32 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
 
-      # Ordinary CI never contacts the production signer. The application build
-      # requires a verification key to exercise the firmware-update code path,
-      # so use a throwaway Ed25519 key that exists only for this CI job.
-      - name: Configure ephemeral firmware public key
+      - name: Install microtun-signer
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          public_key="$RUNNER_TEMP/microtun-ci-firmware-public-key.pem"
-          openssl genpkey -algorithm ED25519 | openssl pkey -pubout -out "$public_key"
-          openssl pkey -pubin -in "$public_key" -text_pub -noout | grep -q '^ED25519 Public-Key:'
+          signer_version="${MICROTUN_SIGNER_VERSION#v}"
+          arch="$(dpkg --print-architecture)"
+          case "$arch" in
+            amd64|arm64) ;;
+            *) echo "Unsupported microtun-signer Debian architecture: $arch" >&2; exit 1 ;;
+          esac
+          package="microtun-signer_${signer_version}_${arch}.deb"
+          mkdir -p "$RUNNER_TEMP/microtun-signer-package"
+          gh release download "$MICROTUN_SIGNER_VERSION" \
+            --repo microtun/microtun-signer \
+            --pattern "$package" \
+            --dir "$RUNNER_TEMP/microtun-signer-package"
+          sudo apt-get install -y "$RUNNER_TEMP/microtun-signer-package/$package"
+          microtun-signer --version
+
+      - name: Configure firmware public key
+        run: |
+          public_key="$RUNNER_TEMP/microtun-firmware-public-key.pem"
+          microtun-signer public-key \
+            --key-id "$MICROTUN_SIGNER_KEY_ID" \
+            > "$public_key"
+          test -s "$public_key"
           key_cache="$(sha256sum "$public_key" | cut -d' ' -f1)"
           echo "MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH=$public_key" >> "$GITHUB_ENV"
           echo "MICROTUN_FIRMWARE_PUBLIC_KEY_CACHE_KEY=$key_cache" >> "$GITHUB_ENV"
