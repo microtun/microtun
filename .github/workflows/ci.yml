@@ -135,7 +135,7 @@ jobs:
           sudo apt-get install -y "$RUNNER_TEMP/microtun-signer-package/$package"
           microtun-signer --version
 
-      - name: Configure firmware public key
+      - name: Download firmware signing public key
         run: |
           public_key="$RUNNER_TEMP/microtun-firmware-public-key.pem"
           microtun-signer public-key \

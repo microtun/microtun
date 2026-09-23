@@ -188,7 +188,7 @@ jobs:
           sudo apt-get install -y "$RUNNER_TEMP/microtun-signer-package/$package"
           microtun-signer --version
 
-      - name: Fetch immutable firmware verification key
+      - name: Download firmware signing public key
         run: |
           mkdir -p dist
           microtun-signer \
@@ -198,7 +198,7 @@ jobs:
             > dist/firmware-signing-public.pem
           test -s dist/firmware-signing-public.pem
 
-      - name: Upload firmware verification key
+      - name: Upload firmware signing public key
         uses: actions/upload-artifact@v7
         with:
           name: firmware-signing-public-key
@@ -234,7 +234,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download firmware verification key
+      - name: Download firmware signing public key
         uses: actions/download-artifact@v8
         with:
           name: firmware-signing-public-key
