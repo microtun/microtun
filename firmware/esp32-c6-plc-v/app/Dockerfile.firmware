@@ -1,0 +1,51 @@
+FROM rust:1.97.1-trixie AS builder
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG ESPFLASH_VERSION=4.6.0
+ARG FIRMWARE_PUBLIC_KEY_CACHE_KEY
+ENV CARGO_TARGET_DIR=/target \
+    ESPFLASH_SKIP_UPDATE_CHECK=true
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libudev-dev \
+        pkg-config; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    rustup target add riscv32imac-unknown-none-elf; \
+    cargo install espflash --version "${ESPFLASH_VERSION}" --locked
+
+WORKDIR /project
+COPY . .
+
+# Build only the unsigned application payload. The application embeds the
+# verification key supplied by the release client. MCUboot framing and the
+# Ed25519 signature are added outside Docker using imgtool's external-signing flow.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/target \
+    --mount=type=secret,id=firmware_public_key,required=true \
+    set -eux; \
+    public_key=/run/secrets/firmware_public_key; \
+    test -n "$FIRMWARE_PUBLIC_KEY_CACHE_KEY"; \
+    app_dir=/project/firmware/esp32-c6-plc-v/app; \
+    elf=/target/riscv32imac-unknown-none-elf/release/microtun-esp32-c6-plc-v; \
+    test -f "$public_key"; \
+    mkdir -p /out; \
+    cd "$app_dir"; \
+    MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH="$public_key" MICROTUN_FIRMWARE_PUBLIC_KEY_CACHE_KEY="$FIRMWARE_PUBLIC_KEY_CACHE_KEY" cargo build --release; \
+    test -s "$elf"; \
+    cd /tmp; \
+    espflash save-image \
+        --chip esp32c6 \
+        --flash-size 4mb \
+        "$elf" \
+        /out/firmware.bin; \
+    test -s /out/firmware.bin
+
+FROM scratch AS artifact
+COPY --from=builder /out/firmware.bin /firmware.bin

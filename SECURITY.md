@@ -76,7 +76,7 @@ When investigating a suspected vulnerability:
 - stop testing if you obtain unintended access to real secrets or unrelated data, and report what occurred without exploring further;
 - avoid publishing exploit details until a fix or mitigation has been coordinated.
 
-The example firmware and configuration files are intended for development and demonstration. Publicly documented placeholder/example keys or intentionally exposed demo services are not vulnerabilities unless they lead to an unintended security impact outside the documented example behavior.
+Example configuration files, publicly documented placeholder keys, and intentionally exposed demo services are not vulnerabilities unless they lead to an unintended security impact outside their documented demonstration behavior.
 
 ## Response and disclosure process
 

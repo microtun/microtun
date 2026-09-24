@@ -1,6 +1,12 @@
+microtun (0.2.0) UNRELEASED; urgency=medium
+
+  * Move in microtun-telnet and cleanup workspace structure  
+
+ -- Damian Peckett <damian@pecke.tt>  Thu, 24 Sep 2026 14:42:40 +0200
+
 microtun (0.1.1) unstable; urgency=medium
 
-  * Package microtun and microtun-tracker together for Debian.
+  * Package microtun, microtun-tracker, and microtun-telnet together for Debian.
   * Install the Tracker systemd unit disabled and stopped by default.
 
- -- Damian Peckett <damian@pecke.tt>  Thu, 24 Sep 2026 11:40:00 +0200
+ -- Damian Peckett <damian@pecke.tt>  Thu, 24 Sep 2026 12:47:54 +0200

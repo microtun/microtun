@@ -17,10 +17,6 @@ embassy-net = { version = "0.9.1", default-features = false, features = ["tcp", 
 [dev-dependencies]
 futures-lite = "2.6.1"
 
-[[example]]
-name = "embassy_net"
-path = "examples/embassy_net.rs"
-
 [features]
 default = ["derive", "help", "completion", "history"]
 alloc = []

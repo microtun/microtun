@@ -37,10 +37,10 @@ workspace_version() {
 }
 
 root_version="$(workspace_version "$REPO_ROOT/Cargo.toml")"
-examples_version="$(workspace_version "$REPO_ROOT/examples/Cargo.toml")"
+firmware_version="$(workspace_version "$REPO_ROOT/firmware/Cargo.toml")"
 
-if [[ "$root_version" != "$examples_version" ]]; then
-    echo "error: workspace versions differ: root='$root_version', examples='$examples_version'" >&2
+if [[ "$root_version" != "$firmware_version" ]]; then
+    echo "error: workspace versions differ: root='$root_version', firmware='$firmware_version'" >&2
     exit 1
 fi
 

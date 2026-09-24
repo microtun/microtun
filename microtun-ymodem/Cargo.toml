@@ -1,0 +1,11 @@
+[package]
+name = "microtun-ymodem"
+description = "Small async no_std YMODEM-1K/CRC sender and receiver for embedded and host transports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crc = { version = "3.4", default-features = false }
+embedded-io-async = { workspace = true }

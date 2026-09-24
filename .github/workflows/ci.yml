@@ -113,8 +113,8 @@ jobs:
           dpkg-deb --info "$package"
           dpkg-deb --contents "$package"
 
-  examples:
-    name: Build example (${{ matrix.name }})
+  firmware:
+    name: Build firmware (${{ matrix.name }})
     needs: workspace
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -124,14 +124,14 @@ jobs:
       matrix:
         include:
           - name: nucleo-h753zi
-            directory: examples/nucleo-h753zi/app
+            directory: firmware/nucleo-h753zi/app
             package: microtun-nucleo-h753zi
             target: thumbv7em-none-eabi
 
           - name: esp32-c6-plc-v
-            directory: examples/esp32-c6-plc-v/app
+            directory: firmware/esp32-c6-plc-v/app
             package: microtun-esp32-c6-plc-v
-            # Must match [build] target in the example's .cargo/config.toml.
+            # Must match [build] target in the firmware target's .cargo/config.toml.
             target: riscv32imac-unknown-none-elf
 
     steps:
@@ -183,10 +183,10 @@ jobs:
           echo "MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH=$public_key" >> "$GITHUB_ENV"
           echo "MICROTUN_FIRMWARE_PUBLIC_KEY_CACHE_KEY=$key_cache" >> "$GITHUB_ENV"
 
-      # Run from the example's own directory so Cargo loads its local .cargo/config.toml, which
-      # is what supplies the target and the linker arguments. The examples share one workspace
-      # (examples/Cargo.toml) and therefore one lockfile, so -p selects the board to build.
-      # Both examples contain non-secret placeholder device configuration suitable for CI.
+      # Run from the firmware target's own directory so Cargo loads its local .cargo/config.toml,
+      # which supplies the target and linker arguments. All board firmware shares one workspace
+      # (firmware/Cargo.toml) and therefore one lockfile, so -p selects the board to build.
+      # Both targets contain non-secret placeholder device configuration suitable for CI.
       - name: Build ${{ matrix.name }} firmware
         working-directory: ${{ matrix.directory }}
         run: cargo build --locked -p ${{ matrix.package }}

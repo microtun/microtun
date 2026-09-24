@@ -16,6 +16,7 @@ Depends:
  ${misc:Depends},
  adduser,
  systemd
-Description: microtun Linux tunnel and tracker
+Description: microtun Linux tunnel, tracker, and Telnet client
  Linux host tools for microtun. This package contains the microtun tunnel
- daemon and the microtun-tracker service used to publish peer information.
+ daemon, the microtun-tracker service used to publish peer information, and
+ the microtun-telnet interactive client with YMODEM upload support.

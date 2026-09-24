@@ -1,0 +1,48 @@
+[package]
+name = "microtun-firmware-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+default = []
+defmt = [
+    "dep:defmt",
+    "defmt-or-log/defmt",
+    "embassy-net/defmt",
+    "embassy-time/defmt",
+    "microtun-embassy/defmt",
+    "microtun-mcuboot/defmt",
+]
+log = ["dep:log", "defmt-or-log/log", "microtun-embassy/log"]
+
+[dependencies]
+defmt-or-log = { version = "0.2.3", default-features = false }
+defmt = { version = "1.0.1", default-features = false, optional = true }
+log = { version = "0.4", default-features = false, optional = true }
+embassy-sync = { version = "0.8.0", default-features = false }
+embassy-net = { version = "0.9.1", default-features = false, features = [
+    "dns",
+    "icmp",
+    "tcp",
+    "udp",
+    "proto-ipv4",
+    "proto-ipv6",
+] }
+embassy-time = { version = "0.5.1", default-features = false }
+embedded-io-async = { version = "0.7.0", default-features = false }
+embedded-hal = { version = "1.0.0", default-features = false }
+embedded-storage = { version = "0.3.1", default-features = false }
+crc = { version = "3.4", default-features = false }
+heapless = { version = "0.9.1", default-features = false }
+microtun-core = { path = "../../microtun-core" }
+microtun-embassy = { path = "../../microtun-embassy" }
+microtun-mcuboot = { path = "../../microtun-mcuboot", default-features = false }
+microtun-cli = { path = "../../microtun-cli" }
+microtun-net-util = { path = "../../microtun-net-util", default-features = false, features = ["embassy-net", "ping"] }
+microtun-ymodem = { path = "../../microtun-ymodem" }
+rand_core = { version = "0.6", default-features = false }
+sntpc = { version = "0.11", default-features = false }
+sntpc-net-embassy = { version = "0.11", default-features = false, features = ["ipv6"] }

@@ -12,13 +12,15 @@ members = [
     "microtun-mcuboot",
     "microtun-cli",
     "microtun-cli-macros",
+    "microtun-ymodem",
+    "microtun-telnet",
 ]
-# The examples are a workspace of their own (see examples/Cargo.toml): firmware for two
-# different architectures, with their own profiles and their own lockfile.
-exclude = ["examples"]
+# Embedded firmware lives in a separate workspace (see firmware/Cargo.toml): each board
+# has its own target configuration, while sharing firmware support code and one lockfile.
+exclude = ["firmware"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "BUSL-1.1"
@@ -30,6 +32,7 @@ microtun-std = { path = "microtun-std" }
 microtun-ws = { path = "microtun-ws", default-features = false }
 toml_parser = { version = "1.1.3", default-features = false }
 microtun-net-util = { path = "microtun-net-util" }
+microtun-ymodem = { path = "microtun-ymodem" }
 
 heapless = { version = "0.9.1", default-features = false }
 hashbrown = { version = "0.15", default-features = false, features = [

@@ -1,10 +1,11 @@
 microtun for Debian
 ===================
 
-This package installs both Linux executables:
+This package installs the Linux executables:
 
   /usr/bin/microtun
   /usr/bin/microtun-tracker
+  /usr/bin/microtun-telnet
 
 The Tracker service is installed as microtun-tracker.service, but package
 installation deliberately does not enable or start it. The packaged

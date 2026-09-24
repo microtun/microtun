@@ -35,8 +35,8 @@
 //!
 //! Human-facing device TOML configuration is a separate concern in
 //! [`device_config`]. Its [`device_config::DeviceConfig`] schema is shared by
-//! firmware and host applications. The embedded examples keep their setup
-//! transport and flash-record helpers local under `examples/common`.
+//! firmware and host applications. The embedded firmware keeps its setup
+//! transport and flash-record helpers local under `firmware/common`.
 //!
 //! ## Sans-IO contract
 //!
