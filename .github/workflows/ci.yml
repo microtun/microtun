@@ -28,7 +28,7 @@ defaults:
 
 jobs:
   format:
-    name: Check formatting (both workspaces)
+    name: Check formatting
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
@@ -141,7 +141,7 @@ jobs:
           dpkg-deb --contents "$package"
 
   firmware-host:
-    name: Lint and test firmware workspace (host)
+    name: Lint, build, and test firmware workspace
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
