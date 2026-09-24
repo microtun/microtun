@@ -138,6 +138,7 @@ pub(crate) struct Shell {
 }
 
 impl Shell {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn setup(
         identity: DeviceIdentity,
         reset_reason: &'static str,
