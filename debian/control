@@ -1,0 +1,21 @@
+Source: microtun
+Section: net
+Priority: optional
+Maintainer: Local Package Builder <root@localhost>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: microtun
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ adduser,
+ systemd
+Description: microtun Linux tunnel and tracker
+ Linux host tools for microtun. This package contains the microtun tunnel
+ daemon and the microtun-tracker service used to publish peer information.

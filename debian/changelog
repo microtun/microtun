@@ -1,0 +1,6 @@
+microtun (0.1.1) unstable; urgency=medium
+
+  * Package microtun and microtun-tracker together for Debian.
+  * Install the Tracker systemd unit disabled and stopped by default.
+
+ -- Damian Peckett <damian@pecke.tt>  Thu, 24 Sep 2026 11:40:00 +0200

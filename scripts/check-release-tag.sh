@@ -44,9 +44,21 @@ if [[ "$root_version" != "$examples_version" ]]; then
     exit 1
 fi
 
-echo "workspace version: $root_version"
+debian_version="$(sed -nE '1s/^[^[:space:]]+[[:space:]]+\(([^)]+)\)[[:space:]]+.*/\1/p' "$REPO_ROOT/debian/changelog")"
+if [[ -z "$debian_version" ]]; then
+    echo "error: could not read package version from debian/changelog" >&2
+    exit 1
+fi
 
-# With no tag, this is the CI workspace-version consistency check.
+if [[ "$root_version" != "$debian_version" ]]; then
+    echo "error: workspace version '$root_version' differs from debian/changelog version '$debian_version'" >&2
+    exit 1
+fi
+
+echo "workspace version: $root_version"
+echo "debian package version: $debian_version"
+
+# With no tag, this is the CI workspace/package-version consistency check.
 tag="${1:-}"
 if [[ -z "$tag" ]]; then
     exit 0
@@ -63,6 +75,11 @@ fi
 version="${tag#v}"
 if [[ "$version" != "$root_version" ]]; then
     echo "error: release tag '$tag' does not match workspace version '$root_version' (expected 'v$root_version')" >&2
+    exit 1
+fi
+
+if [[ "$version" != "$debian_version" ]]; then
+    echo "error: release tag '$tag' does not match debian/changelog version '$debian_version' (expected 'v$debian_version')" >&2
     exit 1
 fi
 

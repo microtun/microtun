@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7
+
+ARG RUST_VERSION=1.97.1
+ARG DEBIAN_SUITE=trixie
+
+FROM rust:${RUST_VERSION}-${DEBIAN_SUITE} AS deb-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# cargo/rustc from Debian satisfy debian/control's Build-Depends. The Rust
+# toolchain from the official rust image is earlier on PATH and is the one that
+# actually builds the workspace.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        cargo \
+        debhelper \
+        dpkg-dev \
+        rustc
+
+WORKDIR /build/src
+COPY . .
+
+# dpkg-buildpackage writes the binary packages to /build. BuildKit caches Cargo
+# downloads between builds without putting them into the package artifact.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    dpkg-buildpackage -us -uc -b
+
+FROM scratch AS debs
+COPY --from=deb-builder /build/*.deb /

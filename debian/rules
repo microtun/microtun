@@ -1,0 +1,48 @@
+#!/usr/bin/make -f
+
+export CARGO_TERM_COLOR := never
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	# Cleaning must not require a working Cargo/rustup toolchain.
+	rm -rf target
+
+override_dh_auto_build:
+	cargo build --release --locked \
+		-p microtun-linux \
+		-p microtun-tracker
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --release --locked \
+		-p microtun-linux \
+		-p microtun-tracker
+endif
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/microtun \
+		debian/microtun/usr/bin/microtun
+	install -D -m 0755 target/release/microtun-tracker \
+		debian/microtun/usr/bin/microtun-tracker
+	install -D -m 0640 microtun-tracker/tracker.example.toml \
+		debian/microtun/etc/microtun/tracker.toml
+	install -D -m 0644 microtun-linux/device.example.toml \
+		debian/microtun/usr/share/doc/microtun/examples/device.toml
+	install -D -m 0644 deploy/microtun-tracker.service \
+		debian/microtun/usr/lib/systemd/system/microtun-tracker.service
+
+override_dh_fixperms:
+	dh_fixperms
+	# dh_fixperms resets conffiles to 0644. Keep the Tracker configuration
+	# private from unpack onwards; postinst hands it to the service group once
+	# that group exists.
+	chmod 0750 debian/microtun/etc/microtun
+	chmod 0640 debian/microtun/etc/microtun/tracker.toml
+
+override_dh_installsystemd:
+	# The packaged Tracker configuration is only an example. Install the unit,
+	# but leave it disabled and stopped until the administrator has configured
+	# the Tracker identity and peers.
+	dh_installsystemd --no-enable --no-start

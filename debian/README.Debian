@@ -1,0 +1,31 @@
+microtun for Debian
+===================
+
+This package installs both Linux executables:
+
+  /usr/bin/microtun
+  /usr/bin/microtun-tracker
+
+The Tracker service is installed as microtun-tracker.service, but package
+installation deliberately does not enable or start it. The packaged
+/etc/microtun/tracker.toml is an example and must be reviewed before first use.
+It contains a private tunnel key placeholder and should remain readable only by
+root and the dedicated microtun-tracker service group.
+
+After configuring the Tracker:
+
+  systemctl enable --now microtun-tracker.service
+  systemctl status microtun-tracker.service
+
+The package creates a dedicated microtun-tracker system user and group for the
+service. The service does not run as root.
+
+The microtun executable is intentionally not installed as a system-wide service:
+a Linux host may have multiple device configurations and interface names. A
+sample device configuration is installed at:
+
+  /usr/share/doc/microtun/examples/device.toml
+
+For example:
+
+  microtun -i mtun0 /path/to/device.toml

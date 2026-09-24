@@ -76,6 +76,43 @@ jobs:
       - name: Test documentation
         run: cargo test --workspace --doc --locked
 
+  debian-package:
+    name: Build Debian package (amd64)
+    needs: workspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Debian package
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.debian
+          platforms: linux/amd64
+          target: debs
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=debs-amd64
+          cache-to: type=gha,mode=max,scope=debs-amd64
+
+      - name: Verify Debian packages
+        run: |
+          set -euo pipefail
+          version="$(dpkg-parsechangelog -S Version)"
+          package="dist/microtun_${version}_amd64.deb"
+          find dist -type f -name '*.deb' -print
+          test -s "$package"
+          test -n "$(find dist -type f -name '*.deb' -print -quit)"
+          dpkg-deb --info "$package"
+          dpkg-deb --contents "$package"
+
   examples:
     name: Build example (${{ matrix.name }})
     needs: workspace
