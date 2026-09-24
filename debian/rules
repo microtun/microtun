@@ -34,7 +34,7 @@ override_dh_auto_install:
 		debian/microtun/etc/microtun/tracker.toml
 	install -D -m 0644 microtun-linux/device.example.toml \
 		debian/microtun/usr/share/doc/microtun/examples/device.toml
-	install -D -m 0644 deploy/microtun-tracker.service \
+	install -D -m 0644 debian/microtun-tracker.service \
 		debian/microtun/usr/lib/systemd/system/microtun-tracker.service
 
 override_dh_fixperms:

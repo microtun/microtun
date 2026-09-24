@@ -1,3 +1,6 @@
+# group_imports and imports_granularity are unstable rustfmt options: stable rustfmt ignores
+# them with a warning. Format with nightly (`cargo +nightly fmt --all`, here and in firmware/);
+# CI checks with the nightly pinned as RUSTFMT_TOOLCHAIN in .github/workflows/ci.yml.
 unstable_features = true
 group_imports = "StdExternalCrate"
 imports_granularity = "Crate"

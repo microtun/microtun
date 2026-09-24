@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "build-support",
     "common",
     "esp32-c6-plc-v/app",
     "nucleo-h753zi/app",
@@ -10,7 +11,7 @@ members = [
 # The two firmware crates each need their own target, so a bare `cargo build` here cannot build
 # both. Build a board by name (`cargo build -p microtun-nucleo-h753zi`) from inside its directory,
 # so that its `.cargo/config.toml` supplies the target.
-default-members = ["common"]
+default-members = ["build-support", "common"]
 
 [workspace.package]
 version = "0.2.0"

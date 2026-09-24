@@ -44,6 +44,25 @@ submission if the permission or compatibility is unclear. The maintainers may
 require the third-party material to be submitted separately by its owner or may
 decline it.
 
+## Building and testing
+
+The repository has two Cargo workspaces: the host crates at the root, and the embedded
+firmware in `firmware/`, which is excluded from the root workspace. CI checks both.
+
+- **Formatting** uses unstable rustfmt options, so it needs a nightly rustfmt. Run
+  `cargo +nightly fmt --all` at the root and again in `firmware/`. Stable rustfmt ignores the
+  import-grouping rules, so it will not produce the layout CI expects.
+- **Host crates:** `cargo clippy --workspace --all-targets` and `cargo test --workspace` at the
+  root.
+- **Firmware support code** builds for the host: in `firmware/`, run
+  `cargo test -p microtun-firmware-build -p microtun-firmware-common`.
+- **Board firmware** builds from the board's directory, whose `.cargo/config.toml` selects the
+  target, for example `cd firmware/nucleo-h753zi/app && cargo build`. No signing key or network
+  access is needed: without `MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH`, the build embeds a
+  development update key and prints a warning. Firmware built that way runs normally but rejects
+  every firmware update. See [`firmware/build-support/README.md`](firmware/build-support/README.md)
+  for using your own key to test updates.
+
 ## Pull requests
 
 Please keep changes focused, include tests where practical, and update relevant

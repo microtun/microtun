@@ -150,12 +150,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
-name = "cargo-emit"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1582e1c9e755dd6ad6b224dcffb135d199399a4568d454bd89fe515ca8425695"
-
-[[package]]
 name = "cc"
 version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1864,8 +1858,6 @@ dependencies = [
 name = "microtun-esp32-c6-plc-v"
 version = "0.2.0"
 dependencies = [
- "base64",
- "cargo-emit",
  "embassy-executor",
  "embassy-net",
  "embassy-net-driver-channel",
@@ -1884,11 +1876,19 @@ dependencies = [
  "log",
  "microtun-cli",
  "microtun-embassy",
+ "microtun-firmware-build",
  "microtun-firmware-common",
  "microtun-mcuboot",
  "microtun-net-util",
  "rand_core 0.6.4",
  "static_cell",
+]
+
+[[package]]
+name = "microtun-firmware-build"
+version = "0.2.0"
+dependencies = [
+ "base64",
 ]
 
 [[package]]
@@ -1943,8 +1943,6 @@ dependencies = [
 name = "microtun-nucleo-h753zi"
 version = "0.2.0"
 dependencies = [
- "base64",
- "cargo-emit",
  "chrono",
  "cortex-m",
  "cortex-m-rt",
@@ -1962,6 +1960,7 @@ dependencies = [
  "heapless 0.9.3",
  "microtun-cli",
  "microtun-embassy",
+ "microtun-firmware-build",
  "microtun-firmware-common",
  "microtun-mcuboot",
  "microtun-net-util",

@@ -1,0 +1,11 @@
+[package]
+name = "microtun-firmware-build"
+description = "Build-script support shared by the microtun board firmware crates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.22.1"

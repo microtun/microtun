@@ -16,15 +16,45 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  MICROTUN_SIGNER_VERSION: "v0.6.0"
-  MICROTUN_SIGNER_URL: "https://signer.microtun.dev"
-  MICROTUN_SIGNER_KEY_ID: "microtun-firmware-prod"
+  RUST_TOOLCHAIN: "1.97.1"
+  # rustfmt.toml uses unstable options (group_imports, imports_granularity) that stable
+  # rustfmt silently ignores, so formatting is checked with a pinned nightly rustfmt.
+  # Bump deliberately; a new nightly can change formatting.
+  RUSTFMT_TOOLCHAIN: "nightly-2026-09-01"
 
 defaults:
   run:
     shell: bash
 
 jobs:
+  format:
+    name: Check formatting (both workspaces)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install nightly rustfmt
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUSTFMT_TOOLCHAIN }}
+          components: rustfmt
+          rustflags: ""
+          cache: false
+
+      - name: Check formatting (host workspace)
+        run: cargo fmt --all -- --check
+
+      # The firmware workspace is excluded from the root workspace, so the root
+      # `cargo fmt --all` never reaches it.
+      - name: Check formatting (firmware workspace)
+        working-directory: firmware
+        run: cargo fmt --all -- --check
+
   workspace:
     name: Lint, build, and test workspace
     runs-on: ubuntu-24.04
@@ -42,8 +72,8 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: 1.97.1
-          components: rustfmt, clippy
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
           rustflags: ""
           cache: false
 
@@ -51,9 +81,6 @@ jobs:
         run: |
           rustc --version --verbose
           cargo --version --verbose
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
 
       - name: Lint with Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -113,6 +140,35 @@ jobs:
           dpkg-deb --info "$package"
           dpkg-deb --contents "$package"
 
+  firmware-host:
+    name: Lint and test firmware workspace (host)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+          rustflags: ""
+          cache: false
+
+      # Run from firmware/ itself: no board .cargo/config.toml applies there, so these
+      # crates build for the host and their unit tests can run.
+      - name: Lint firmware build support
+        working-directory: firmware
+        run: cargo clippy --locked -p microtun-firmware-build --all-targets -- -D warnings
+
+      - name: Test firmware build support and shared firmware code
+        working-directory: firmware
+        run: cargo test --locked -p microtun-firmware-build -p microtun-firmware-common
+
   firmware:
     name: Build firmware (${{ matrix.name }})
     needs: workspace
@@ -126,6 +182,11 @@ jobs:
           - name: nucleo-h753zi
             directory: firmware/nucleo-h753zi/app
             package: microtun-nucleo-h753zi
+            target: thumbv7em-none-eabi
+
+          - name: nucleo-h753zi-bootloader
+            directory: firmware/nucleo-h753zi/bootloader
+            package: microtun-nucleo-h753zi-bootloader
             target: thumbv7em-none-eabi
 
           - name: esp32-c6-plc-v
@@ -143,8 +204,9 @@ jobs:
       - name: Install Rust toolchain and target
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: 1.97.1
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           target: ${{ matrix.target }}
+          components: clippy
           rustflags: ""
           cache: false
 
@@ -153,40 +215,18 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
 
-      - name: Install microtun-signer
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          signer_version="${MICROTUN_SIGNER_VERSION#v}"
-          arch="$(dpkg --print-architecture)"
-          case "$arch" in
-            amd64|arm64) ;;
-            *) echo "Unsupported microtun-signer Debian architecture: $arch" >&2; exit 1 ;;
-          esac
-          package="microtun-signer_${signer_version}_${arch}.deb"
-          mkdir -p "$RUNNER_TEMP/microtun-signer-package"
-          gh release download "$MICROTUN_SIGNER_VERSION" \
-            --repo microtun/microtun-signer \
-            --pattern "$package" \
-            --dir "$RUNNER_TEMP/microtun-signer-package"
-          sudo apt-get install -y "$RUNNER_TEMP/microtun-signer-package/$package"
-          microtun-signer --version
-
-      - name: Download firmware signing public key
-        run: |
-          public_key="$RUNNER_TEMP/microtun-firmware-public-key.pem"
-          microtun-signer public-key \
-            --key-id "$MICROTUN_SIGNER_KEY_ID" \
-            > "$public_key"
-          test -s "$public_key"
-          key_cache="$(sha256sum "$public_key" | cut -d' ' -f1)"
-          echo "MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH=$public_key" >> "$GITHUB_ENV"
-          echo "MICROTUN_FIRMWARE_PUBLIC_KEY_CACHE_KEY=$key_cache" >> "$GITHUB_ENV"
-
       # Run from the firmware target's own directory so Cargo loads its local .cargo/config.toml,
       # which supplies the target and linker arguments. All board firmware shares one workspace
       # (firmware/Cargo.toml) and therefore one lockfile, so -p selects the board to build.
-      # Both targets contain non-secret placeholder device configuration suitable for CI.
-      - name: Build ${{ matrix.name }} firmware
+      #
+      # MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH is deliberately unset: the build embeds the
+      # development update key (see firmware/build-support/README.md), so pull requests,
+      # including ones from forks, need neither the signing service nor any credentials.
+      # Release builds require the real key and are produced by release.yml.
+      - name: Lint ${{ matrix.name }}
+        working-directory: ${{ matrix.directory }}
+        run: cargo clippy --locked -p ${{ matrix.package }} -- -D warnings
+
+      - name: Build ${{ matrix.name }}
         working-directory: ${{ matrix.directory }}
         run: cargo build --locked -p ${{ matrix.package }}

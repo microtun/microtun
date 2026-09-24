@@ -33,5 +33,4 @@ cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-sing
 cortex-m-rt = "0.7.0"
 
 [build-dependencies]
-base64 = "0.22.1"
-cargo-emit = "0.2.1"
+microtun-firmware-build = { path = "../../build-support" }

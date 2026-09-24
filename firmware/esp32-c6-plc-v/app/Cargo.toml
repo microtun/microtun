@@ -35,5 +35,4 @@ esp-rtos = { version = "0.3.0", features = ["esp32c6", "esp-radio", "esp-alloc",
 esp-storage = { version = "0.9.0", features = ["esp32c6"] }
 
 [build-dependencies]
-base64 = "0.22.1"
-cargo-emit = "0.2.1"
+microtun-firmware-build = { path = "../../build-support" }

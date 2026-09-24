@@ -1407,6 +1407,7 @@ version = "0.2.0"
 dependencies = [
  "crc",
  "embedded-io-async",
+ "futures-lite",
 ]
 
 [[package]]

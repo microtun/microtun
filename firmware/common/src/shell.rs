@@ -18,10 +18,12 @@ use crate::{
         field as cli_field, line as cli_line, ping as cli_ping, println as cli_println,
         time as cli_time, time_field as cli_time_field, write_tunnel_status,
     },
-    configuration::{CONFIG_YMODEM_READY, DeviceIdentity},
+    configuration::DeviceIdentity,
     firmware::FirmwareStatus,
     telnet::SessionAction,
 };
+
+const YMODEM_READY: &str = "MICROTUN-YMODEM-1K READY";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -323,7 +325,7 @@ where
         },
 
         CommonCommand::Config { action: None } => {
-            cli_println(out, CONFIG_YMODEM_READY).await?;
+            cli_println(out, YMODEM_READY).await?;
             cli_println(
                 out,
                 "send device configuration TOML with YMODEM-1K/CRC now; Ctrl-X cancels",
@@ -354,7 +356,7 @@ where
         CommonCommand::Fw {
             action: Some(FirmwareAction::Update),
         } => {
-            cli_println(out, "MICROTUN-YMODEM-1K READY").await?;
+            cli_println(out, YMODEM_READY).await?;
             cli_println(out, "send signed MCUboot image now; Ctrl-X cancels").await?;
             out.flush().await?;
             shell.request_action(SessionAction::FirmwareUpdate);

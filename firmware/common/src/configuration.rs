@@ -21,7 +21,6 @@ const FNV1A_64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 pub const RECORD_SIZE: usize = 4096;
 pub const MAX_TOML_LEN: usize = RECORD_SIZE - HEADER_LEN;
-pub const CONFIG_YMODEM_READY: &str = "MICROTUN-CONFIG-YMODEM-1K READY";
 pub const CONFIG_INSTALLED: &str = "configuration installed; rebooting";
 
 /// Stable board identity used for network naming and setup discovery.
