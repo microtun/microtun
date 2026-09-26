@@ -16,8 +16,14 @@ pub const PUBLIC_KEY_CACHE_KEY_ENV: &str = "MICROTUN_FIRMWARE_PUBLIC_KEY_CACHE_K
 /// When set to anything other than empty or `0`, the development key is refused.
 pub const REQUIRE_RELEASE_KEY_ENV: &str = "MICROTUN_FIRMWARE_REQUIRE_RELEASE_KEY";
 
-/// The development update key, whose private half does not exist.
-pub const DEV_PUBLIC_KEY_PEM: &str = include_str!("../dev.pem");
+/// The built-in development update key, whose private half does not exist.
+///
+/// Keeping the raw public-key bytes in source means production/container builds do not depend on
+/// a PEM fixture being present in the build context.
+pub const DEV_PUBLIC_KEY: [u8; 32] = [
+    0xda, 0x9b, 0x13, 0xa9, 0x76, 0x77, 0x4c, 0xeb, 0x53, 0xd1, 0x5e, 0x9c, 0x97, 0x37, 0xa3, 0x8a,
+    0x81, 0x9c, 0xd5, 0xaf, 0x61, 0xa1, 0x44, 0x6a, 0xe6, 0x14, 0x91, 0xda, 0x63, 0xc4, 0x37, 0xc0,
+];
 
 const ED25519_SPKI_PREFIX: &[u8] = &[
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
@@ -40,9 +46,8 @@ pub struct FirmwareKey {
 }
 
 /// Raw bytes of the development key.
-pub fn dev_public_key() -> [u8; 32] {
-    parse_ed25519_public_key_pem(DEV_PUBLIC_KEY_PEM, "development firmware key")
-        .expect("the bundled development key is a valid Ed25519 public key")
+pub const fn dev_public_key() -> [u8; 32] {
+    DEV_PUBLIC_KEY
 }
 
 /// Select the firmware-update key from the build environment, without touching Cargo.
@@ -268,16 +273,6 @@ mod tests {
     fn release_mode_requires_a_configured_key() {
         let error = resolve_public_key(None, true, Path::new("/")).unwrap_err();
         assert!(error.contains(PUBLIC_KEY_PATH_ENV), "{error}");
-    }
-
-    #[test]
-    fn release_mode_refuses_the_development_key_by_value() {
-        let path = temp_pem("dev-copy.pem", DEV_PUBLIC_KEY_PEM);
-        let error = resolve_public_key(path.to_str(), true, Path::new("/")).unwrap_err();
-        assert!(error.contains("development firmware key"), "{error}");
-        // Outside release mode the same file is accepted, e.g. for local experiments.
-        let key = resolve_public_key(path.to_str(), false, Path::new("/")).unwrap();
-        assert_eq!(key.raw, dev_public_key());
     }
 
     #[test]

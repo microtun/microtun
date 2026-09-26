@@ -9,11 +9,12 @@ verification key and the MCUboot anti-rollback version into `OUT_DIR`.
 The key is read from the Ed25519 public-key PEM named by `MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH`.
 CI release builds fetch it from the signing service.
 
-When the variable is unset, the build falls back to the development key in
-[`dev.pem`](dev.pem) and prints a Cargo warning. Its
-private half was destroyed when it was generated, so **firmware built with the development key
-boots normally but rejects every firmware update.** That makes a plain `cargo build` work for
-anyone, and makes an accidental development build harmless rather than a signing hole.
+When the variable is unset, the build falls back to a built-in development public key and prints
+a Cargo warning. The key is stored directly as its 32-byte Ed25519 public value, so builds do not
+depend on a PEM fixture being present. Its private half was destroyed when it was generated, so
+**firmware built with the development key boots normally but rejects every firmware update.** That
+makes a plain `cargo build` work for anyone, and makes an accidental development build harmless
+rather than a signing hole.
 
 To test over-the-air updates locally, create your own key pair and point the build at it:
 
