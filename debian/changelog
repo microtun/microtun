@@ -1,8 +1,14 @@
-microtun (0.2.0) UNRELEASED; urgency=medium
+microtun (0.3.0) UNRELEASED; urgency=medium
+
+  * Add generic firmware targets + esp32-c3 
+
+ -- Damian Peckett <damian@pecke.tt>  Sat, 26 Sep 2026 12:45:29 +0200
+
+microtun (0.2.0) unstable; urgency=medium
 
   * Move in microtun-telnet and cleanup workspace structure  
 
- -- Damian Peckett <damian@pecke.tt>  Thu, 24 Sep 2026 14:42:40 +0200
+ -- Damian Peckett <damian@pecke.tt>  Sat, 26 Sep 2026 12:45:01 +0200
 
 microtun (0.1.1) unstable; urgency=medium
 

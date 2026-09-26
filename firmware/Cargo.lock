@@ -1778,7 +1778,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "microtun-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embedded-io-async 0.7.0",
  "heapless 0.9.3",
@@ -1793,7 +1793,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "defmt 1.1.1",
  "embedded-io 0.7.1",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-cli-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "blake2",
@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-embassy"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "defmt 1.1.1",
  "defmt-or-log",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-esp32-c3"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embassy-executor",
  "embassy-net",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-esp32-c6"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embassy-executor",
  "embassy-net",
@@ -1920,14 +1920,14 @@ dependencies = [
 
 [[package]]
 name = "microtun-firmware-build"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
 ]
 
 [[package]]
 name = "microtun-firmware-common"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crc",
  "defmt 1.1.1",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-mcuboot"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "defmt 1.1.1",
  "ed25519-dalek",
@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-net-util"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embassy-net",
  "embassy-time",
@@ -1975,7 +1975,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-stm32h753zi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "cortex-m",
@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-stm32h753zi-bootloader"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-ws"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "embedded-io-async 0.7.0",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-ymodem"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crc",
  "embedded-io-async 0.7.0",

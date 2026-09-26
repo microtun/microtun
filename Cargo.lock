@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embedded-io-async",
  "heapless",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "defmt 1.1.1",
  "embassy-net",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-cli-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1249,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "blake2",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-embassy"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "defmt 1.1.1",
  "defmt-or-log",
@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-linux"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "microtun-core",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-mcuboot"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "defmt 1.1.1",
  "ed25519-dalek",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-net-util"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embassy-net",
  "embassy-time",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-std"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "log",
  "microtun-api",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-telnet"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-tracker"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "embedded-io 0.6.1",
@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-ws"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "embedded-io-adapters",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-ymodem"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crc",
  "embedded-io-async",
