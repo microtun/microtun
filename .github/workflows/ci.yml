@@ -179,19 +179,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: nucleo-h753zi
-            directory: firmware/nucleo-h753zi/app
-            package: microtun-nucleo-h753zi
+          - name: stm32h753zi
+            directory: firmware/stm32h753zi/app
+            package: microtun-stm32h753zi
             target: thumbv7em-none-eabi
 
-          - name: nucleo-h753zi-bootloader
-            directory: firmware/nucleo-h753zi/bootloader
-            package: microtun-nucleo-h753zi-bootloader
+          - name: stm32h753zi-bootloader
+            directory: firmware/stm32h753zi/bootloader
+            package: microtun-stm32h753zi-bootloader
             target: thumbv7em-none-eabi
 
-          - name: esp32-c6-plc-v
-            directory: firmware/esp32-c6-plc-v/app
-            package: microtun-esp32-c6-plc-v
+          - name: esp32-c3
+            directory: firmware/esp32-c3/app
+            package: microtun-esp32-c3
+            # Must match [build] target in the firmware target's .cargo/config.toml.
+            target: riscv32imc-unknown-none-elf
+
+          - name: esp32-c6
+            directory: firmware/esp32-c6/app
+            package: microtun-esp32-c6
             # Must match [build] target in the firmware target's .cargo/config.toml.
             target: riscv32imac-unknown-none-elf
 
@@ -216,8 +222,8 @@ jobs:
           cargo --version --verbose
 
       # Run from the firmware target's own directory so Cargo loads its local .cargo/config.toml,
-      # which supplies the target and linker arguments. All board firmware shares one workspace
-      # (firmware/Cargo.toml) and therefore one lockfile, so -p selects the board to build.
+      # which supplies the architecture target and linker arguments. All firmware targets share one
+      # workspace (firmware/Cargo.toml) and therefore one lockfile, so -p selects the target to build.
       #
       # MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH is deliberately unset: the build embeds the
       # development update key (see firmware/build-support/README.md), so pull requests,

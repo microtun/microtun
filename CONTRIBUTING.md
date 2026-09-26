@@ -56,8 +56,8 @@ firmware in `firmware/`, which is excluded from the root workspace. CI checks bo
   root.
 - **Firmware support code** builds for the host: in `firmware/`, run
   `cargo test -p microtun-firmware-build -p microtun-firmware-common`.
-- **Board firmware** builds from the board's directory, whose `.cargo/config.toml` selects the
-  target, for example `cd firmware/nucleo-h753zi/app && cargo build`. No signing key or network
+- **Firmware targets** build from the target directory, whose `.cargo/config.toml` selects the
+  architecture, for example `cd firmware/stm32h753zi/app && cargo build`. No signing key or network
   access is needed: without `MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH`, the build embeds a
   development update key and prints a warning. Firmware built that way runs normally but rejects
   every firmware update. See [`firmware/build-support/README.md`](firmware/build-support/README.md)

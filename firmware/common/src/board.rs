@@ -31,7 +31,7 @@ pub struct ResetButton {
 
     /// Wait for a stable release before resetting.
     ///
-    /// The ESP32-C6 user button is also the BOOT strap, so resetting while it is still held
+    /// The ESP32-C3/C6 user button is also the BOOT strap, so resetting while it is still held
     /// drops the chip into the ROM downloader instead of rebooting into setup mode. A
     /// board whose button is not a strap — the Nucleo's B1 — can reset immediately.
     pub reset_on_release: bool,

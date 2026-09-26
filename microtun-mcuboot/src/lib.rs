@@ -914,7 +914,7 @@ mod tests {
 
     #[test]
     fn derives_the_same_named_ids_as_imgtool() {
-        let identity = ImageIdentity::from_imgtool_names("firmware.microtun.dev", "nucleo-h753zi");
+        let identity = ImageIdentity::from_imgtool_names("firmware.microtun.dev", "stm32h753zi");
 
         assert_eq!(
             identity.vid,
@@ -926,15 +926,15 @@ mod tests {
         assert_eq!(
             identity.cid,
             [
-                0x9d, 0x8b, 0x09, 0x0b, 0x84, 0xfc, 0x58, 0x80, 0x97, 0x9c, 0x0d, 0x05, 0x7a, 0x61,
-                0x47, 0x0b,
+                0xbc, 0xcb, 0x67, 0x62, 0x21, 0x80, 0x5f, 0xad, 0xa5, 0xea, 0x68, 0x14, 0xb9, 0x9e,
+                0x4a, 0x72,
             ]
         );
     }
 
     #[test]
     fn named_policy_verifies_vid_and_cid_tlvs() {
-        let identity = ImageIdentity::from_imgtool_names("firmware.microtun.dev", "nucleo-h753zi");
+        let identity = ImageIdentity::from_imgtool_names("firmware.microtun.dev", "stm32h753zi");
         let version = ImageVersion {
             major: 1,
             minor: 2,
@@ -947,7 +947,7 @@ mod tests {
             public,
             Policy::from_imgtool_names(
                 "firmware.microtun.dev",
-                "nucleo-h753zi",
+                "stm32h753zi",
                 1024,
                 ImageVersion {
                     major: 0,
@@ -968,13 +968,13 @@ mod tests {
 
     #[test]
     fn named_policy_requires_vid_tlv() {
-        let identity = ImageIdentity::from_imgtool_names("firmware.microtun.dev", "nucleo-h753zi");
+        let identity = ImageIdentity::from_imgtool_names("firmware.microtun.dev", "stm32h753zi");
         let (public, image) = build_image(&[0xe9, 1, 2, 3], identity.cid);
         let mut verifier = StreamingVerifier::new(
             public,
             Policy::from_imgtool_names(
                 "firmware.microtun.dev",
-                "nucleo-h753zi",
+                "stm32h753zi",
                 1024,
                 ImageVersion {
                     major: 0,
@@ -992,8 +992,8 @@ mod tests {
 
     #[test]
     fn named_policy_rejects_wrong_vid_even_when_cid_matches() {
-        let identity = ImageIdentity::from_imgtool_names("firmware.microtun.dev", "nucleo-h753zi");
-        let wrong_vid = ImageIdentity::from_imgtool_names("other.example", "nucleo-h753zi").vid;
+        let identity = ImageIdentity::from_imgtool_names("firmware.microtun.dev", "stm32h753zi");
+        let wrong_vid = ImageIdentity::from_imgtool_names("other.example", "stm32h753zi").vid;
         let version = ImageVersion {
             major: 1,
             minor: 2,
@@ -1006,7 +1006,7 @@ mod tests {
             public,
             Policy::from_imgtool_names(
                 "firmware.microtun.dev",
-                "nucleo-h753zi",
+                "stm32h753zi",
                 1024,
                 ImageVersion {
                     major: 0,

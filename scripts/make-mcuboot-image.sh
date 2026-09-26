@@ -23,8 +23,8 @@ set -Eeuo pipefail
 #   scripts/make-mcuboot-image.sh <target> [output.bin]
 #
 # Supported targets:
-#   esp32-c6-plc-v
-#   nucleo-h753zi
+#   esp32-c6
+#   stm32h753zi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -137,15 +137,15 @@ fi
 
 TARGET="$1"
 case "$TARGET" in
-    esp32-c6-plc-v)
-        CID="esp32-c6-plc-v"
+    esp32-c6)
+        CID="esp32-c6"
         SLOT_SIZE="0x1f0000"
         BUILD_LABEL="ESP32-C6"
         ;;
-    nucleo-h753zi)
-        CID="nucleo-h753zi"
+    stm32h753zi)
+        CID="stm32h753zi"
         SLOT_SIZE="0x0c0000"
-        BUILD_LABEL="NUCLEO-H753ZI"
+        BUILD_LABEL="STM32H753ZI"
         ;;
     *)
         echo "unsupported firmware target: $TARGET" >&2

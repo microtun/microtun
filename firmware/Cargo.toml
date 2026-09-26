@@ -3,14 +3,16 @@ resolver = "3"
 members = [
     "build-support",
     "common",
-    "esp32-c6-plc-v/app",
-    "nucleo-h753zi/app",
-    "nucleo-h753zi/bootloader",
+    "esp32-c3/app",
+    "esp32-c6/app",
+    "stm32h753zi/app",
+    "stm32h753zi/bootloader",
 ]
 
-# The two firmware crates each need their own target, so a bare `cargo build` here cannot build
-# both. Build a board by name (`cargo build -p microtun-nucleo-h753zi`) from inside its directory,
-# so that its `.cargo/config.toml` supplies the target.
+# The application firmware crates need board-specific architecture targets, so a bare
+# `cargo build` here cannot build all targets. Build a target by name
+# (`cargo build -p microtun-stm32h753zi`) from inside its directory, so that its
+# `.cargo/config.toml` supplies the target.
 default-members = ["build-support", "common"]
 
 [workspace.package]
@@ -21,7 +23,7 @@ license = "BUSL-1.1"
 publish = false
 
 # Profiles must live at the workspace root: Cargo ignores `[profile]` in a member manifest. These
-# are the union of what the three crates set individually before, with the differences preserved
+# are the union of the target-specific settings, with differences preserved
 # as per-package overrides below.
 [profile.dev]
 debug = 2

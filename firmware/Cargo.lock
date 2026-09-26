@@ -1172,7 +1172,9 @@ dependencies = [
  "esp-hal",
  "esp-metadata-generated",
  "esp-sync",
+ "esp-wifi-sys-esp32c3",
  "esp-wifi-sys-esp32c6",
+ "esp32c3",
  "esp32c6",
  "log",
 ]
@@ -1219,6 +1221,7 @@ dependencies = [
  "esp-wifi-sys-esp32h2",
  "esp-wifi-sys-esp32s2",
  "esp-wifi-sys-esp32s3",
+ "esp32c3",
  "esp32c6",
  "heapless 0.9.3",
  "instability",
@@ -1260,6 +1263,7 @@ dependencies = [
  "cfg-if",
  "document-features",
  "esp-metadata-generated",
+ "esp32c3",
  "esp32c6",
 ]
 
@@ -1855,7 +1859,37 @@ dependencies = [
 ]
 
 [[package]]
-name = "microtun-esp32-c6-plc-v"
+name = "microtun-esp32-c3"
+version = "0.2.0"
+dependencies = [
+ "embassy-executor",
+ "embassy-net",
+ "embassy-net-driver-channel",
+ "embassy-sync 0.8.0",
+ "embassy-time",
+ "embedded-io-async 0.7.0",
+ "embedded-storage",
+ "esp-alloc",
+ "esp-bootloader-esp-idf",
+ "esp-hal",
+ "esp-println",
+ "esp-radio",
+ "esp-rtos",
+ "esp-storage",
+ "heapless 0.9.3",
+ "log",
+ "microtun-cli",
+ "microtun-embassy",
+ "microtun-firmware-build",
+ "microtun-firmware-common",
+ "microtun-mcuboot",
+ "microtun-net-util",
+ "rand_core 0.6.4",
+ "static_cell",
+]
+
+[[package]]
+name = "microtun-esp32-c6"
 version = "0.2.0"
 dependencies = [
  "embassy-executor",
@@ -1940,7 +1974,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "microtun-nucleo-h753zi"
+name = "microtun-stm32h753zi"
 version = "0.2.0"
 dependencies = [
  "chrono",
@@ -1969,7 +2003,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "microtun-nucleo-h753zi-bootloader"
+name = "microtun-stm32h753zi-bootloader"
 version = "0.2.0"
 dependencies = [
  "cortex-m",

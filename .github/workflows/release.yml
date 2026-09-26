@@ -207,10 +207,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: nucleo-h753zi
-            asset: microtun-nucleo-h753zi-${{ needs.validate.outputs.version }}.mcuboot.bin
-          - name: esp32-c6-plc-v
-            asset: microtun-esp32-c6-plc-v-${{ needs.validate.outputs.version }}.mcuboot.bin
+          - name: stm32h753zi
+            asset: microtun-stm32h753zi-${{ needs.validate.outputs.version }}.mcuboot.bin
+          - name: esp32-c6
+            asset: microtun-esp32-c6-${{ needs.validate.outputs.version }}.mcuboot.bin
 
     env:
       VERSION: ${{ needs.validate.outputs.version }}
@@ -313,8 +313,8 @@ jobs:
 
           assets=(
             "${debs[@]}"
-            "microtun-nucleo-h753zi-${VERSION}.mcuboot.bin"
-            "microtun-esp32-c6-plc-v-${VERSION}.mcuboot.bin"
+            "microtun-stm32h753zi-${VERSION}.mcuboot.bin"
+            "microtun-esp32-c6-${VERSION}.mcuboot.bin"
           )
 
           for asset in "${assets[@]}"; do
