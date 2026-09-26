@@ -196,6 +196,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cc"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f360145194ee8e21db5ee7f3fcd4fe52210864c75c985dae33218202c8bbe040"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -853,6 +863,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "find-msvc-tools"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
+
+[[package]]
 name = "flume"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1235,6 +1251,7 @@ dependencies = [
  "futures-lite",
  "heapless",
  "microtun-cli-macros",
+ "microtun-telnet-proto",
 ]
 
 [[package]]
@@ -1337,6 +1354,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "microtun-serial"
+version = "0.3.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "cc",
+ "clap",
+ "embedded-io-adapters",
+ "heapless",
+ "libc",
+ "microtun-telnet-proto",
+ "nix 0.30.1",
+ "pkg-config",
+ "tokio",
+]
+
+[[package]]
 name = "microtun-std"
 version = "0.3.0"
 dependencies = [
@@ -1359,10 +1392,22 @@ dependencies = [
  "embedded-io-adapters",
  "embedded-io-async",
  "futures-util",
+ "heapless",
+ "microtun-telnet-proto",
  "microtun-ymodem",
  "ratatui",
  "tokio",
  "tui-term",
+]
+
+[[package]]
+name = "microtun-telnet-proto"
+version = "0.3.0"
+dependencies = [
+ "defmt 1.1.1",
+ "embedded-io-async",
+ "futures-lite",
+ "heapless",
 ]
 
 [[package]]
@@ -1641,6 +1686,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1916,6 +1967,12 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "signal-hook"

@@ -1,6 +1,8 @@
 microtun (0.3.0) UNRELEASED; urgency=medium
 
-  * Add generic firmware targets + esp32-c3 
+  * Add generic firmware targets + esp32-c3
+  * Split serial CUSE bridging into the microtun-serial companion binary.
+  * Add TUI-selectable interactive serial mode and controls to microtun-telnet.
 
  -- Damian Peckett <damian@pecke.tt>  Sat, 26 Sep 2026 12:45:29 +0200
 

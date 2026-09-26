@@ -1,0 +1,27 @@
+[package]
+name = "microtun-serial"
+description = "Serial-to-Linux character-device bridge for microtun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { version = "~4.6", features = ["derive"] }
+embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
+heapless = { workspace = true }
+microtun-telnet-proto = { workspace = true }
+tokio = { version = "~1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bitflags = "2"
+libc = "0.2"
+nix = { version = "0.30.1", features = ["fs", "term"] }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[[bin]]
+name = "microtun-serial"
+path = "src/main.rs"

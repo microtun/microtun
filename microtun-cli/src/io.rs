@@ -4,7 +4,7 @@ use embedded_io::ErrorType;
 use embedded_io_async::Write;
 use heapless::String;
 
-use crate::{Error, ErrorKind, telnet::IAC};
+use crate::{Error, ErrorKind, telnet::write_data_unflushed};
 
 /// Telnet-aware writer adapter.
 ///
@@ -30,28 +30,9 @@ where
     W::Error: embedded_io::Error,
 {
     async fn write(&mut self, bytes: &[u8]) -> Result<usize, ErrorKind> {
-        let mut start = 0usize;
-        for (index, byte) in bytes.iter().copied().enumerate() {
-            if byte == IAC {
-                if start < index {
-                    self.writer
-                        .write_all(&bytes[start..index])
-                        .await
-                        .map_err(|e| embedded_io::Error::kind(&e))?;
-                }
-                self.writer
-                    .write_all(&[IAC, IAC])
-                    .await
-                    .map_err(|e| embedded_io::Error::kind(&e))?;
-                start = index + 1;
-            }
-        }
-        if start < bytes.len() {
-            self.writer
-                .write_all(&bytes[start..])
-                .await
-                .map_err(|e| embedded_io::Error::kind(&e))?;
-        }
+        write_data_unflushed(self.writer, bytes)
+            .await
+            .map_err(|e| embedded_io::Error::kind(&e))?;
         Ok(bytes.len())
     }
 

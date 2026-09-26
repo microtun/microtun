@@ -1,6 +1,6 @@
 [package]
 name = "microtun-telnet"
-description = "Interactive Telnet client with YMODEM file upload support"
+description = "Interactive Telnet client with TUI-selectable serial-console mode and YMODEM"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,9 @@ crossterm = { version = "=0.28.1", features = ["event-stream"] }
 embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
 embedded-io-async = { workspace = true, features = ["std"] }
 futures-util = "=0.3.31"
+heapless = { workspace = true }
 microtun-ymodem = { workspace = true }
+microtun-telnet-proto = { workspace = true }
 ratatui = "=0.29.0"
 tokio = { version = "~1.53", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
 tui-term = "=0.2.0"

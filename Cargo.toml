@@ -14,6 +14,8 @@ members = [
     "microtun-cli-macros",
     "microtun-ymodem",
     "microtun-telnet",
+    "microtun-serial",
+    "microtun-telnet-proto",
 ]
 # Embedded firmware lives in a separate workspace (see firmware/Cargo.toml): each board
 # has its own target configuration, while sharing firmware support code and one lockfile.
@@ -33,6 +35,7 @@ microtun-ws = { path = "microtun-ws", default-features = false }
 toml_parser = { version = "1.1.3", default-features = false }
 microtun-net-util = { path = "microtun-net-util" }
 microtun-ymodem = { path = "microtun-ymodem" }
+microtun-telnet-proto = { path = "microtun-telnet-proto" }
 
 heapless = { version = "0.9.1", default-features = false }
 hashbrown = { version = "0.15", default-features = false, features = [

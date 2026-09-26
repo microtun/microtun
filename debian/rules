@@ -13,14 +13,16 @@ override_dh_auto_build:
 	cargo build --release --locked \
 		-p microtun-linux \
 		-p microtun-tracker \
-		-p microtun-telnet
+		-p microtun-telnet \
+		-p microtun-serial
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	cargo test --release --locked \
 		-p microtun-linux \
 		-p microtun-tracker \
-		-p microtun-telnet
+		-p microtun-telnet \
+		-p microtun-serial
 endif
 
 override_dh_auto_install:
@@ -30,6 +32,8 @@ override_dh_auto_install:
 		debian/microtun/usr/bin/microtun-tracker
 	install -D -m 0755 target/release/microtun-telnet \
 		debian/microtun/usr/bin/microtun-telnet
+	install -D -m 0755 target/release/microtun-serial \
+		debian/microtun/usr/bin/microtun-serial
 	install -D -m 0640 microtun-tracker/tracker.example.toml \
 		debian/microtun/etc/microtun/tracker.toml
 	install -D -m 0644 microtun-linux/device.example.toml \

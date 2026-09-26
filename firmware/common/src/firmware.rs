@@ -3,8 +3,8 @@
 use embassy_net::Stack;
 use embassy_time::{Duration, Timer, with_timeout};
 use embedded_io_async::{ErrorKind, ErrorType, Read, Write};
-use microtun_cli::telnet::{BinaryMode, BinaryModeError};
 use microtun_mcuboot::{FeedError, PayloadSink, StreamingVerifier};
+use microtun_telnet_proto::{BinaryMode, BinaryModeError};
 use microtun_ymodem::{Config as YmodemConfig, Error as YmodemError};
 
 const BINARY_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(5);

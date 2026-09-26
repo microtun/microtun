@@ -18,6 +18,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         cargo \
         debhelper \
         dpkg-dev \
+        libfuse3-dev \
+        pkg-config \
         rustc
 
 WORKDIR /build/src

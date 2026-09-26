@@ -42,6 +42,7 @@ microtun-embassy = { path = "../../microtun-embassy" }
 microtun-mcuboot = { path = "../../microtun-mcuboot", default-features = false }
 microtun-cli = { path = "../../microtun-cli" }
 microtun-net-util = { path = "../../microtun-net-util", default-features = false, features = ["embassy-net", "ping"] }
+microtun-telnet-proto = { path = "../../microtun-telnet-proto" }
 microtun-ymodem = { path = "../../microtun-ymodem" }
 rand_core = { version = "0.6", default-features = false }
 sntpc = { version = "0.11", default-features = false }

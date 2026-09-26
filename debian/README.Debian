@@ -6,6 +6,7 @@ This package installs the Linux executables:
   /usr/bin/microtun
   /usr/bin/microtun-tracker
   /usr/bin/microtun-telnet
+  /usr/bin/microtun-serial
 
 The Tracker service is installed as microtun-tracker.service, but package
 installation deliberately does not enable or start it. The packaged
@@ -30,3 +31,34 @@ sample device configuration is installed at:
 For example:
 
   microtun -i mtun0 /path/to/device.toml
+
+Serial console
+--------------
+
+microtun-telnet switches into an interactive serial-console mode from inside the
+TUI. Connect to the serial endpoint and press Ctrl-A P to open communication
+parameters. Enable serial mode on the first row:
+
+  microtun-telnet serial-gateway.example --port 2217
+
+Entering serial mode does not change the remote UART configuration. The serial
+protocol queries the current settings and applies changes only when requested, so
+an already-correct serial console can start displaying logging data immediately.
+Use Ctrl-A F for BREAK; turn the first row in Ctrl-A P back off to return to
+normal Telnet mode. Matching Minicom shortcuts are also used for Ctrl-A S (send),
+Ctrl-A C (clear), Ctrl-A Q (quit), and Ctrl-A Z (help). Ctrl-A R retains Minicom's
+receive-file meaning, but receiving files is not implemented yet.
+
+Virtual serial device
+---------------------
+
+For programs that require a normal Linux serial character device, microtun-serial
+bridges a serial connection through CUSE. Load the kernel module before use:
+
+  modprobe cuse
+  microtun-serial serial-gateway.example --port 2217 --name microtun0
+
+The resulting /dev/microtun0 accepts normal termios and serial ioctls; baud,
+data bits, parity, stop bits, flow control, DTR/RTS, break, and flush requests
+are translated into serial commands. Device-node ownership and mode are governed by the
+host's normal device/udev policy.

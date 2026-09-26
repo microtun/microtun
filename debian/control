@@ -5,6 +5,8 @@ Maintainer: Local Package Builder <root@localhost>
 Build-Depends:
  debhelper-compat (= 13),
  cargo,
+ libfuse3-dev,
+ pkg-config,
  rustc
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
@@ -16,7 +18,8 @@ Depends:
  ${misc:Depends},
  adduser,
  systemd
-Description: microtun Linux tunnel, tracker, and Telnet client
+Description: microtun Linux tunnel, tracker, Telnet, and serial tools
  Linux host tools for microtun. This package contains the microtun tunnel
  daemon, the microtun-tracker service used to publish peer information, and
- the microtun-telnet interactive client with YMODEM upload support.
+ the microtun-telnet interactive client with YMODEM/serial console support,
+ and the microtun-serial serial-to-CUSE character-device bridge.
