@@ -5,22 +5,28 @@ ARG DEBIAN_SUITE=trixie
 
 FROM rust:${RUST_VERSION}-${DEBIAN_SUITE} AS deb-builder
 
+# Re-declare so the global value is visible inside this stage.
+ARG RUST_VERSION
+
 ENV DEBIAN_FRONTEND=noninteractive
 
-# cargo/rustc from Debian satisfy debian/control's Build-Depends. The Rust
-# toolchain from the official rust image is earlier on PATH and is the one that
-# actually builds the workspace.
+# The Rust toolchain comes from the official rust image. Debian's cargo/rustc
+# are deliberately not installed; dpkg-buildpackage -d below skips the
+# Build-Depends check that would otherwise require them.
+#
+# Use the image's toolchain rather than the one named by rust-toolchain.toml,
+# so the build never asks rustup to download components.
+ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
+
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
-        cargo \
         debhelper \
         dpkg-dev \
         libfuse3-dev \
-        pkg-config \
-        rustc
+        pkg-config
 
 WORKDIR /build/src
 COPY . .
@@ -29,7 +35,7 @@ COPY . .
 # downloads between builds without putting them into the package artifact.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    dpkg-buildpackage -us -uc -b
+    dpkg-buildpackage -us -uc -b -d
 
 FROM scratch AS debs
 COPY --from=deb-builder /build/*.deb /

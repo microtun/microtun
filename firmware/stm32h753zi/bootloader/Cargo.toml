@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 embassy-boot-stm32 = { version = "0.8.0", default-features = false }
-embassy-stm32 = { version = "0.6.0", features = ["stm32h753zi"] }
-embassy-sync = { version = "0.8.0", default-features = false }
-cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
-cortex-m-rt = "0.7.0"
+embassy-stm32 = { workspace = true, features = ["stm32h753zi"] }
+embassy-sync = { workspace = true }
+cortex-m = { workspace = true }
+cortex-m-rt = { workspace = true }

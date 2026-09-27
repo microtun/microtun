@@ -49,9 +49,13 @@ decline it.
 The repository has two Cargo workspaces: the host crates at the root, and the embedded
 firmware in `firmware/`, which is excluded from the root workspace. CI checks both.
 
+- **Toolchain:** `rust-toolchain.toml` (at the root and in `firmware/`) pins the Rust version CI
+  uses, so rustup selects and installs it automatically, including the firmware targets.
 - **Formatting** uses unstable rustfmt options, so it needs a nightly rustfmt. Run
-  `cargo +nightly fmt --all` at the root and again in `firmware/`. Stable rustfmt ignores the
-  import-grouping rules, so it will not produce the layout CI expects.
+  `cargo +nightly-2026-09-01 fmt --all` at the root and again in `firmware/`, using the nightly
+  pinned as `RUSTFMT_TOOLCHAIN` in `.github/workflows/ci.yml`. Stable rustfmt ignores the
+  import-grouping rules, and a different nightly may format differently, so either can produce a
+  layout CI rejects.
 - **Host crates:** `cargo clippy --workspace --all-targets` and `cargo test --workspace` at the
   root.
 - **Firmware support code** builds for the host: in `firmware/`, run

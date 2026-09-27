@@ -47,10 +47,7 @@ fn option_policy_is_directional() {
     for byte in [IAC, DO, OPT_ECHO] {
         telnet.feed(byte, &mut reply);
     }
-    assert_eq!(
-        reply.as_slice(),
-        &[IAC, microtun_telnet::WONT, OPT_ECHO]
-    );
+    assert_eq!(reply.as_slice(), &[IAC, microtun_telnet::WONT, OPT_ECHO]);
     assert!(!telnet.us_enabled(OPT_ECHO));
 
     reply.clear();
@@ -82,14 +79,7 @@ fn binary_helpers_negotiate_both_directions() {
     telnet.request_binary_mode(&mut wire);
     assert_eq!(
         wire.as_slice(),
-        &[
-            IAC,
-            microtun_telnet::WILL,
-            OPT_BINARY,
-            IAC,
-            DO,
-            OPT_BINARY
-        ]
+        &[IAC, microtun_telnet::WILL, OPT_BINARY, IAC, DO, OPT_BINARY]
     );
     assert!(!telnet.binary_mode_enabled());
     assert!(!telnet.binary_mode_refused());

@@ -3,9 +3,7 @@ use std::{collections::VecDeque, io, time::Duration};
 use embedded_io_adapters::tokio_1::FromTokio;
 use embedded_io_async::{ErrorType, Read, Write};
 use heapless::Vec as HeaplessVec;
-pub(crate) use microtun_telnet::client::{
-    SerialStatus, flow_label, parity_label, stop_label,
-};
+pub(crate) use microtun_telnet::client::{SerialStatus, flow_label, parity_label, stop_label};
 use microtun_telnet::{
     client::{
         ClientEncodeError, ClientEvent, ClientSession, SerialConsoleState as ProtoSerialState,

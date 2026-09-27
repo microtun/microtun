@@ -20,10 +20,10 @@ log = ["dep:log", "defmt-or-log/log", "microtun-embassy/log"]
 
 [dependencies]
 defmt-or-log = { version = "0.2.3", default-features = false }
-defmt = { version = "1.0.1", default-features = false, optional = true }
-log = { version = "0.4", default-features = false, optional = true }
-embassy-sync = { version = "0.8.0", default-features = false }
-embassy-net = { version = "0.9.1", default-features = false, features = [
+defmt = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+embassy-sync = { workspace = true }
+embassy-net = { workspace = true, features = [
     "dns",
     "icmp",
     "tcp",
@@ -31,19 +31,19 @@ embassy-net = { version = "0.9.1", default-features = false, features = [
     "proto-ipv4",
     "proto-ipv6",
 ] }
-embassy-time = { version = "0.5.1", default-features = false }
-embedded-io-async = { version = "0.7.0", default-features = false }
+embassy-time = { workspace = true }
+embedded-io-async = { workspace = true }
 embedded-hal = { version = "1.0.0", default-features = false }
-embedded-storage = { version = "0.3.1", default-features = false }
+embedded-storage = { workspace = true }
 crc = { version = "3.4", default-features = false }
-heapless = { version = "0.9.1", default-features = false }
-microtun-core = { path = "../../microtun-core" }
-microtun-embassy = { path = "../../microtun-embassy" }
-microtun-mcuboot = { path = "../../microtun-mcuboot", default-features = false }
-microtun-cli = { path = "../../microtun-cli" }
-microtun-net-util = { path = "../../microtun-net-util", default-features = false, features = ["embassy-net", "ping"] }
-microtun-telnet = { path = "../../microtun-telnet" }
-microtun-ymodem = { path = "../../microtun-ymodem" }
-rand_core = { version = "0.6", default-features = false }
+heapless = { workspace = true }
+microtun-core = { workspace = true }
+microtun-embassy = { workspace = true }
+microtun-mcuboot = { workspace = true }
+microtun-cli = { workspace = true }
+microtun-net-util = { workspace = true, features = ["embassy-net", "ping"] }
+microtun-telnet = { workspace = true }
+microtun-ymodem = { workspace = true }
+rand_core = { workspace = true }
 sntpc = { version = "0.11", default-features = false }
 sntpc-net-embassy = { version = "0.11", default-features = false, features = ["ipv6"] }

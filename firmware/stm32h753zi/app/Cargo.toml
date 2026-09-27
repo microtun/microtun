@@ -7,30 +7,30 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-microtun-embassy = { path = "../../../microtun-embassy", features = ["defmt"] }
-microtun-mcuboot = { path = "../../../microtun-mcuboot", features = ["defmt"] }
-microtun-net-util = { path = "../../../microtun-net-util", default-features = false, features = ["embassy-net"] }
-microtun-cli = { path = "../../../microtun-cli", features = ["defmt"] }
-microtun-firmware-common = { path = "../../common", features = ["defmt"] }
+microtun-embassy = { workspace = true, features = ["defmt"] }
+microtun-mcuboot = { workspace = true, features = ["defmt"] }
+microtun-net-util = { workspace = true, features = ["embassy-net"] }
+microtun-cli = { workspace = true, features = ["defmt"] }
+microtun-firmware-common = { workspace = true, features = ["defmt"] }
 
-embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
-embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "udp", "icmp", "dhcpv4", "dhcpv4-hostname", "dns", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "multicast"] }
-embassy-net-driver-channel = { version = "0.4", default-features = false }
+embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-net = { workspace = true, features = ["defmt", "tcp", "udp", "icmp", "dhcpv4", "dhcpv4-hostname", "dns", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "multicast"] }
+embassy-net-driver-channel = { workspace = true }
 embassy-boot = { version = "0.7.0", default-features = false }
-embedded-io-async = { version = "0.7.0", default-features = false }
-embedded-storage = "0.3.1"
-embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32h753zi", "time-driver-tim2", "chrono", "unstable-pac"] }
-embassy-sync = { version = "0.8.0", default-features = false, features = ["defmt"] }
-embassy-time = { version = "0.5.1", default-features = false, features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
-heapless = { version = "0.9.1", default-features = false }
+embedded-io-async = { workspace = true }
+embedded-storage = { workspace = true }
+embassy-stm32 = { workspace = true, features = ["defmt", "stm32h753zi", "time-driver-tim2", "chrono", "unstable-pac"] }
+embassy-sync = { workspace = true, features = ["defmt"] }
+embassy-time = { workspace = true, features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+heapless = { workspace = true }
 chrono = { version = "0.4", default-features = false }
-static_cell = "2"
-rand_core = { version = "0.6", default-features = false }
+static_cell = { workspace = true }
+rand_core = { workspace = true }
 
-defmt = "1.0.1"
+defmt = { workspace = true }
 defmt-rtt = "1.0.0"
-cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
-cortex-m-rt = "0.7.0"
+cortex-m = { workspace = true }
+cortex-m-rt = { workspace = true }
 
 [build-dependencies]
-microtun-firmware-build = { path = "../../build-support" }
+microtun-firmware-build = { workspace = true }

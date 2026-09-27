@@ -18,9 +18,61 @@ default-members = ["build-support", "common"]
 [workspace.package]
 version = "0.4.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.97.1"
 license = "BUSL-1.1"
 publish = false
+
+
+# Dependencies shared by the firmware crates, and every microtun crate they use,
+# declared once so the boards stay in lockstep. Members inherit with
+# `{ workspace = true }` and add their own features (chip selection, defmt/log)
+# on top. Dependencies used by a single crate stay in that crate's manifest.
+#
+# `default-features = false` is set here only for crates that have no default
+# features, or whose defaults every member already disabled, so inheriting it
+# changes no member's resolved feature set.
+[workspace.dependencies]
+# microtun crates. The host crates live in the root workspace; this one reaches
+# them through path dependencies.
+microtun-core = { path = "../microtun-core" }
+microtun-embassy = { path = "../microtun-embassy" }
+microtun-mcuboot = { path = "../microtun-mcuboot", default-features = false }
+microtun-cli = { path = "../microtun-cli" }
+microtun-net-util = { path = "../microtun-net-util", default-features = false }
+microtun-telnet = { path = "../microtun-telnet" }
+microtun-ymodem = { path = "../microtun-ymodem" }
+microtun-firmware-build = { path = "build-support" }
+microtun-firmware-common = { path = "common" }
+
+# Embassy and embedded ecosystem
+embassy-executor = "0.10.0"
+embassy-net = { version = "0.9.1", default-features = false }
+embassy-net-driver-channel = { version = "0.4", default-features = false }
+embassy-sync = { version = "0.8.0", default-features = false }
+embassy-time = { version = "0.5.1", default-features = false }
+embedded-io-async = { version = "0.7.0", default-features = false }
+embedded-storage = { version = "0.3.1", default-features = false }
+heapless = { version = "0.9.1", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+static_cell = "2"
+
+# Logging
+defmt = { version = "1.0.1", default-features = false }
+log = { version = "0.4", default-features = false }
+
+# ESP32 (esp32-c3, esp32-c6). Each board selects its chip feature.
+esp-alloc = "0.10.0"
+esp-bootloader-esp-idf = "0.5.0"
+esp-hal = "~1.1"
+esp-println = "0.17.0"
+esp-radio = "=1.0.0-beta.0"
+esp-rtos = "0.3.0"
+esp-storage = "0.9.0"
+
+# STM32 (stm32h753zi application and bootloader)
+embassy-stm32 = "0.6.0"
+cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.0"
 
 # Profiles must live at the workspace root: Cargo ignores `[profile]` in a member manifest. These
 # are the union of the target-specific settings, with differences preserved

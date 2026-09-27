@@ -1,0 +1,14 @@
+# Keep in sync with /rust-toolchain.toml. The targets are the board targets
+# selected by each firmware crate's .cargo/config.toml.
+#
+# Formatting is the exception: rustfmt.toml uses unstable options, so run
+# `cargo +nightly-2026-09-01 fmt --all` (RUSTFMT_TOOLCHAIN in ci.yml).
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["clippy"]
+targets = [
+    "riscv32imc-unknown-none-elf",  # esp32-c3
+    "riscv32imac-unknown-none-elf", # esp32-c6
+    "thumbv7em-none-eabihf",        # stm32h753zi
+]

@@ -1,0 +1,9 @@
+# Keep in sync with RUST_TOOLCHAIN in .github/workflows/*.yml, the rust:<version>
+# base images in the Dockerfiles, and firmware/rust-toolchain.toml.
+#
+# Formatting is the exception: rustfmt.toml uses unstable options, so run
+# `cargo +nightly-2026-09-01 fmt --all` (RUSTFMT_TOOLCHAIN in ci.yml).
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["clippy"]

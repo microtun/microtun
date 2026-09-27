@@ -4,6 +4,9 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG FIRMWARE_PUBLIC_KEY_CACHE_KEY
 
+# Use the image's toolchain and ignore firmware/rust-toolchain.toml, which would
+# otherwise make rustup download every board's target on each build.
+ENV RUSTUP_TOOLCHAIN=1.97.1
 ENV CARGO_TARGET_DIR=/target
 
 RUN set -eux; \
@@ -13,7 +16,7 @@ RUN set -eux; \
         ca-certificates; \
     rm -rf /var/lib/apt/lists/*
 
-RUN rustup target add thumbv7em-none-eabi
+RUN rustup target add thumbv7em-none-eabihf
 
 WORKDIR /project
 COPY . .
@@ -30,14 +33,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     public_key=/run/secrets/firmware_public_key; \
     test -n "$FIRMWARE_PUBLIC_KEY_CACHE_KEY"; \
     app_dir=/project/firmware/stm32h753zi/app; \
-    elf=/target/thumbv7em-none-eabi/release/microtun-stm32h753zi; \
+    elf=/target/thumbv7em-none-eabihf/release/microtun-stm32h753zi; \
     test -f "$public_key"; \
     mkdir -p /out; \
     cd "$app_dir"; \
     MICROTUN_FIRMWARE_REQUIRE_RELEASE_KEY=1 \
     MICROTUN_FIRMWARE_PUBLIC_KEY_PEM_PATH="$public_key" \
     MICROTUN_FIRMWARE_PUBLIC_KEY_CACHE_KEY="$FIRMWARE_PUBLIC_KEY_CACHE_KEY" \
-        cargo build --release; \
+        cargo build --release --locked; \
     test -s "$elf"; \
     arm-none-eabi-objcopy -O binary "$elf" /out/firmware.bin; \
     test -s /out/firmware.bin

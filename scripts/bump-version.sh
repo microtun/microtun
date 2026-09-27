@@ -9,7 +9,8 @@ Set the Microtun release version everywhere it is owned by the repository:
   - Cargo.toml [workspace.package].version
   - firmware/Cargo.toml [workspace.package].version
   - debian/changelog (release old stanza, then open new UNRELEASED stanza via dch)
-  - Cargo.lock and firmware/Cargo.lock (regenerated via cargo generate-lockfile)
+  - Cargo.lock and firmware/Cargo.lock (workspace package versions only, via
+    cargo update --workspace; third-party dependencies are left as locked)
 
 <version> must be canonical release SemVer X.Y.Z. A leading "v" is accepted
 and stripped.
@@ -255,16 +256,16 @@ trap restore_on_error EXIT
 set_workspace_version "$ROOT_MANIFEST" "$new_version"
 set_workspace_version "$FIRMWARE_MANIFEST" "$new_version"
 
-# Regenerate each workspace lockfile from scratch. Removing the existing lock
-# first is intentional: this makes the bump produce a fresh lockfile rather
-# than relying on Cargo to patch the old workspace package entries in place.
-rm -f "$REPO_ROOT/Cargo.lock" "$REPO_ROOT/firmware/Cargo.lock"
+# Refresh only the workspace's own packages in each lockfile, so they record the
+# new version. Every third-party dependency stays pinned exactly as locked:
+# dependency upgrades belong in their own reviewed change, not in a version
+# bump. The firmware workspace pulls the host crates in as path dependencies,
+# which Cargo re-reads from their manifests and updates here too.
+cargo update --workspace --manifest-path "$ROOT_MANIFEST"
+cargo update --workspace --manifest-path "$FIRMWARE_MANIFEST"
 
-cargo generate-lockfile --manifest-path "$ROOT_MANIFEST"
-cargo generate-lockfile --manifest-path "$FIRMWARE_MANIFEST"
-
-# Verify both freshly generated lockfiles are accepted without further
-# resolution, then run the repository's existing consistency check.
+# Verify both updated lockfiles are accepted without further resolution, then
+# run the repository's existing consistency check.
 for manifest in "$ROOT_MANIFEST" "$FIRMWARE_MANIFEST"; do
     cargo metadata \
         --manifest-path "$manifest" \
