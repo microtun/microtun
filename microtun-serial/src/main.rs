@@ -33,17 +33,30 @@ struct Cli {
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     timeout: u64,
 
-    /// Print serial confirmations, modem state, and line state changes.
+    /// Enable debug logging for serial confirmations, modem state, and line state changes.
     #[arg(short, long)]
     verbose: bool,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+    let cli = Cli::parse();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(if cli.verbose {
+                    "info,microtun_serial=debug"
+                } else {
+                    "info"
+                })
+            }),
+        )
+        .init();
+
+    match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {error}");
+            tracing::error!(%error);
             ExitCode::FAILURE
         }
     }
@@ -52,16 +65,16 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        eprintln!(
-            "connecting to {} on port {} (serial-device mode)",
-            cli.target, cli.port
+        tracing::info!(
+            target = %cli.target,
+            port = cli.port,
+            "connecting in serial-device mode"
         );
         return serial::run_device(
             &cli.target,
             cli.port,
             Duration::from_secs(cli.timeout),
             &cli.name,
-            cli.verbose,
         )
         .await;
     }

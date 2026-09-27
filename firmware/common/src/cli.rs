@@ -14,8 +14,7 @@ use microtun_embassy::{
 pub use microtun_net_util::ping::{DEFAULT_PING_COUNT, MAX_PING_COUNT, ping};
 
 pub const TELNET_TCP_BUFFER: usize = 1024;
-/// Use an alternate port for the management interface.
-pub const TELNET_PORT: u16 = 2323;
+pub const TELNET_PORT: u16 = 23;
 pub const TELNET_PROMPT: &str = "microtun> ";
 pub const TELNET_KEEP_ALIVE: Duration = Duration::from_secs(15);
 pub const TELNET_IDLE_TIMEOUT: Duration = Duration::from_secs(45);

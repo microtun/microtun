@@ -99,7 +99,7 @@ impl<D: Device> Dispatcher<D> {
 
         if result.is_err() {
             // The reply was dropped during unwinding, which answered EIO.
-            eprintln!("cuse: device handler panicked; request failed with EIO");
+            tracing::error!("CUSE device handler panicked; request failed with EIO");
         }
         self.drain_interrupts();
     }
@@ -116,7 +116,7 @@ impl<D: Device> Dispatcher<D> {
                 self.device.borrow_mut().interrupt(id);
             }));
             if result.is_err() {
-                eprintln!("cuse: Device::interrupt panicked");
+                tracing::error!("CUSE Device::interrupt panicked");
             }
         }
     }
@@ -169,7 +169,7 @@ unsafe extern "C" fn init_done<D: Device>(data: *mut c_void) {
     // SAFETY: the shim passes our dispatcher pointer.
     let d = unsafe { dispatcher::<D>(data) };
     if catch_unwind(AssertUnwindSafe(|| d.device.borrow_mut().ready())).is_err() {
-        eprintln!("cuse: Device::ready panicked");
+        tracing::error!("CUSE Device::ready panicked");
     }
 }
 

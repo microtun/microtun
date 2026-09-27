@@ -102,7 +102,7 @@ impl SerialSession {
                     self.pending.push_back(SessionEvent::Serial(event));
                 }
                 Some(ClientEvent::MalformedSerial(error)) => {
-                    eprintln!("warning: malformed serial message: {error:?}");
+                    tracing::warn!(?error, "malformed serial message");
                 }
                 Some(ClientEvent::Telnet(TelnetEvent::OptionEnabled { side, option })) => {
                     flush_data_event(&mut self.pending, &mut data);
@@ -185,27 +185,34 @@ fn protocol_error(error: ClientEncodeError) -> io::Error {
 fn log_serial_event(event: &SerialEvent) {
     match event {
         SerialEvent::Signature(text) => {
-            eprintln!(
-                "serial: server signature {:?}",
-                String::from_utf8_lossy(text)
+            tracing::debug!(signature = ?String::from_utf8_lossy(text), "serial server signature");
+        }
+        SerialEvent::BaudRate(value) => tracing::debug!(baud_rate = *value, "serial baud rate"),
+        SerialEvent::DataSize(value) => tracing::debug!(data_bits = *value, "serial data size"),
+        SerialEvent::Parity(value) => tracing::debug!(parity = *value, "serial parity"),
+        SerialEvent::StopSize(value) => tracing::debug!(stop_size = *value, "serial stop size"),
+        SerialEvent::Control(value) => tracing::debug!(control = *value, "serial control"),
+        SerialEvent::LineState(value) => {
+            tracing::debug!(line_state = %format_args!("0x{value:02x}"), "serial line state");
+        }
+        SerialEvent::ModemState(value) => {
+            tracing::debug!(modem_state = %format_args!("0x{value:02x}"), "serial modem state");
+        }
+        SerialEvent::FlowControlSuspend => tracing::debug!("serial flow suspended"),
+        SerialEvent::FlowControlResume => tracing::debug!("serial flow resumed"),
+        SerialEvent::LineStateMask(value) => {
+            tracing::debug!(
+                line_state_mask = %format_args!("0x{value:02x}"),
+                "serial line-state mask"
             );
         }
-        SerialEvent::BaudRate(value) => eprintln!("serial: baud rate {value}"),
-        SerialEvent::DataSize(value) => eprintln!("serial: data bits {value}"),
-        SerialEvent::Parity(value) => eprintln!("serial: parity value {value}"),
-        SerialEvent::StopSize(value) => eprintln!("serial: stop-size value {value}"),
-        SerialEvent::Control(value) => eprintln!("serial: control value {value}"),
-        SerialEvent::LineState(value) => eprintln!("serial: line state 0x{value:02x}"),
-        SerialEvent::ModemState(value) => eprintln!("serial: modem state 0x{value:02x}"),
-        SerialEvent::FlowControlSuspend => eprintln!("serial: flow suspended"),
-        SerialEvent::FlowControlResume => eprintln!("serial: flow resumed"),
-        SerialEvent::LineStateMask(value) => {
-            eprintln!("serial: line-state mask 0x{value:02x}");
-        }
         SerialEvent::ModemStateMask(value) => {
-            eprintln!("serial: modem-state mask 0x{value:02x}");
+            tracing::debug!(
+                modem_state_mask = %format_args!("0x{value:02x}"),
+                "serial modem-state mask"
+            );
         }
-        SerialEvent::PurgeData(value) => eprintln!("serial: purge value {value}"),
+        SerialEvent::PurgeData(value) => tracing::debug!(purge = *value, "serial purge"),
     }
 }
 
@@ -1647,7 +1654,6 @@ pub(crate) async fn run_device(
     port: u16,
     timeout: Duration,
     device_name: &str,
-    verbose: bool,
 ) -> Result<(), String> {
     let (mut session, mut pre_session) = negotiate_serial(target, port, timeout).await?;
 
@@ -1726,9 +1732,11 @@ pub(crate) async fn run_device(
 
     let device = cuse::Device::start(device_name, state)
         .map_err(|error| format!("create /dev/{device_name}: {error}"))?;
-    eprintln!("serial connected to {target}:{port}");
-    eprintln!("virtual serial device: /dev/{device_name}");
-    eprintln!("serial settings are controlled through normal termios/ioctl calls on that device");
+    tracing::info!(%target, port, "serial connected");
+    tracing::info!(device = %format_args!("/dev/{device_name}"), "virtual serial device ready");
+    tracing::info!(
+        "serial settings are controlled through normal termios/ioctl calls on the device"
+    );
 
     let event_reader = device.event_reader();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<Result<DeviceEvent, String>>(1);
@@ -1765,9 +1773,7 @@ pub(crate) async fn run_device(
                 }
                 SessionEvent::Serial(ref serial_event) => {
                     device.remote_update(serial_event);
-                    if verbose {
-                        log_serial_event(serial_event);
-                    }
+                    log_serial_event(serial_event);
                 }
                 SessionEvent::OptionDisabled {
                     side: Side::Us,
@@ -1775,9 +1781,7 @@ pub(crate) async fn run_device(
                 } => return Err("server disabled serial COM-PORT-OPTION".to_owned()),
                 SessionEvent::OptionEnabled { side, option }
                 | SessionEvent::OptionDisabled { side, option } => {
-                    if verbose {
-                        eprintln!("Telnet option changed: {side:?} option {option}");
-                    }
+                    tracing::debug!(?side, option, "Telnet option changed");
                 }
             }
         }
@@ -1794,21 +1798,15 @@ pub(crate) async fn run_device(
                         SessionEvent::Data(bytes) => device.push_rx(&bytes)?,
                         SessionEvent::Serial(SerialEvent::FlowControlSuspend) => {
                             remote_tx_suspended = true;
-                            if verbose {
-                                eprintln!("serial: remote suspended client transmission");
-                            }
+                            tracing::debug!("remote suspended client serial transmission");
                         }
                         SessionEvent::Serial(SerialEvent::FlowControlResume) => {
                             remote_tx_suspended = false;
-                            if verbose {
-                                eprintln!("serial: remote resumed client transmission");
-                            }
+                            tracing::debug!("remote resumed client serial transmission");
                         }
                         SessionEvent::Serial(ref serial_event) => {
                             device.remote_update(serial_event);
-                            if verbose {
-                                log_serial_event(serial_event);
-                            }
+                            log_serial_event(serial_event);
                         }
                         SessionEvent::OptionDisabled {
                             side: Side::Us,
@@ -1816,9 +1814,7 @@ pub(crate) async fn run_device(
                         } => return Err("server disabled serial COM-PORT-OPTION".to_owned()),
                         SessionEvent::OptionEnabled { side, option }
                         | SessionEvent::OptionDisabled { side, option } => {
-                            if verbose {
-                                eprintln!("Telnet option changed: {side:?} option {option}");
-                            }
+                            tracing::debug!(?side, option, "Telnet option changed");
                         }
                     }
                 }
