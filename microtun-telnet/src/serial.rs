@@ -8,6 +8,9 @@ use heapless::Vec;
 
 use crate::{IAC, OPT_COM_PORT, SB, SE};
 
+/// Conventional TCP port used for Telnet COM-PORT-OPTION (RFC 2217).
+pub const DEFAULT_PORT: u16 = 2217;
+
 pub const SIGNATURE: u8 = 0;
 pub const SET_BAUDRATE: u8 = 1;
 pub const SET_DATASIZE: u8 = 2;

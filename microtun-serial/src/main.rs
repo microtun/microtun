@@ -7,8 +7,6 @@ mod cuse;
 #[cfg(target_os = "linux")]
 mod serial;
 
-const DEFAULT_SERIAL_PORT: u16 = 2217;
-
 #[derive(Parser)]
 #[command(
     name = "microtun-serial",
@@ -26,7 +24,7 @@ struct Cli {
     name: String,
 
     /// Serial TCP port. Defaults to 2217.
-    #[arg(short, long, default_value_t = DEFAULT_SERIAL_PORT)]
+    #[arg(short, long, default_value_t = microtun_telnet::serial::DEFAULT_PORT)]
     port: u16,
 
     /// Connect and serial negotiation timeout in seconds.

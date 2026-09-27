@@ -6,6 +6,7 @@ use heapless::Vec;
 pub mod binary;
 pub mod client;
 pub mod serial;
+pub mod server;
 
 pub use binary::{BinaryMode, BinaryModeError, write_data, write_data_unflushed};
 
