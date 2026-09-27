@@ -113,17 +113,15 @@ fn doc_string(attrs: &[Attribute]) -> String {
         if !attr.path().is_ident("doc") {
             continue;
         }
-        if let syn::Meta::NameValue(meta) = &attr.meta {
-            if let Expr::Lit(expr) = &meta.value {
-                if let Lit::Str(value) = &expr.lit {
+        if let syn::Meta::NameValue(meta) = &attr.meta
+            && let Expr::Lit(expr) = &meta.value
+                && let Lit::Str(value) = &expr.lit {
                     let text = value.value();
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
                         lines.push(trimmed.to_owned());
                     }
                 }
-            }
-        }
     }
     lines.join(" ")
 }

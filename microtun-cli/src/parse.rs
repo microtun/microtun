@@ -268,21 +268,18 @@ impl<'c, 'a> ArgCursor<'c, 'a> {
                 continue;
             };
 
-            if let Some(long) = long {
-                if Self::long_matches(token, long) {
+            if let Some(long) = long
+                && Self::long_matches(token, long) {
                     self.consume(index);
                     return true;
                 }
-            }
 
-            if let Some(short) = short {
-                if let Some(body) = short_cluster(token) {
-                    if self.locate_short(body, short).is_some() && !self.short_used(index, short) {
+            if let Some(short) = short
+                && let Some(body) = short_cluster(token)
+                    && self.locate_short(body, short).is_some() && !self.short_used(index, short) {
                         self.record_short_use(index, short);
                         return true;
                     }
-                }
-            }
         }
         false
     }
@@ -328,23 +325,21 @@ impl<'c, 'a> ArgCursor<'c, 'a> {
                 continue;
             };
 
-            if let Some(long) = long {
-                if Self::long_matches(token, long) {
+            if let Some(long) = long
+                && Self::long_matches(token, long) {
                     self.consume(index);
                     count = count.saturating_add(1);
                     continue;
                 }
-            }
 
-            if let Some(short) = short {
-                if let Some(body) = short_cluster(token) {
+            if let Some(short) = short
+                && let Some(body) = short_cluster(token) {
                     let hits = self.count_short(body, short);
                     if hits > 0 && !self.short_used(index, short) {
                         self.record_short_use(index, short);
                         count = count.saturating_add(hits.min(u8::MAX as usize) as u8);
                     }
                 }
-            }
         }
         count
     }
@@ -415,8 +410,8 @@ impl<'c, 'a> ArgCursor<'c, 'a> {
             }
             let token = self.line.arg(index)?;
 
-            if let Some(long) = long {
-                if let Some(rest) = token.strip_prefix("--") {
+            if let Some(long) = long
+                && let Some(rest) = token.strip_prefix("--") {
                     if rest == long {
                         self.consume(index);
                         return self
@@ -428,7 +423,6 @@ impl<'c, 'a> ArgCursor<'c, 'a> {
                         return Ok(Some(value));
                     }
                 }
-            }
 
             if let Some(short) = short {
                 if self.short_used(index, short) {

@@ -405,11 +405,10 @@ impl TlvArea {
                     if total < 4 {
                         return Err(Error::InvalidTlvAreaSize);
                     }
-                    if let Some(expected) = self.expected_total {
-                        if total != expected {
+                    if let Some(expected) = self.expected_total
+                        && total != expected {
                             return Err(Error::InvalidTlvAreaSize);
                         }
-                    }
                     self.total = Some(total);
                 }
                 continue;
@@ -641,8 +640,8 @@ impl StreamingVerifier {
                 continue;
             }
 
-            if let Some(protected) = self.protected.as_mut() {
-                if !protected.is_complete() {
+            if let Some(protected) = self.protected.as_mut()
+                && !protected.is_complete() {
                     let remaining = usize::from(header.protected_tlv_size) - protected.consumed;
                     let take = remaining.min(input.len());
                     self.hasher.update(&input[..take]);
@@ -659,7 +658,6 @@ impl StreamingVerifier {
                     input = &input[take..];
                     continue;
                 }
-            }
 
             let consumed = self
                 .regular

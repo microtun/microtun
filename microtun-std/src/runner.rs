@@ -195,16 +195,15 @@ impl<D: TunnelDevice> Sink for TunnelSink<'_, D> {
     }
 
     fn event(&mut self, event: Event) {
-        if let Event::PeerEvicted { public_key } = event {
-            if !self.flush_forgets()
+        if let Event::PeerEvicted { public_key } = event
+            && (!self.flush_forgets()
                 || self
                     .resolver_commands
                     .try_send(ResolverCommand::Forget(public_key))
-                    .is_err()
+                    .is_err())
             {
                 self.pending_forgets.push_back(public_key);
             }
-        }
         self.observer.event(event);
     }
 }

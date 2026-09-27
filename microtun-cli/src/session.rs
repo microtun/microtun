@@ -326,15 +326,14 @@ where
 
         let leading = trimmed.split_ascii_whitespace().next().unwrap_or("");
         let trailing = trimmed.split_ascii_whitespace().last().unwrap_or("");
-        if matches!(leading, "--version" | "-V") || matches!(trailing, "--version" | "-V") {
-            if let Some(version) = root.version {
+        if (matches!(leading, "--version" | "-V") || matches!(trailing, "--version" | "-V"))
+            && let Some(version) = root.version {
                 let mut out = Console::new(&mut self.io);
                 write_str(&mut out, root.name).await?;
                 write_str(&mut out, " ").await?;
                 write_line(&mut out, version).await?;
                 return Ok(true);
             }
-        }
 
         #[cfg(feature = "help")]
         {

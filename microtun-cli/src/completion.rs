@@ -214,16 +214,14 @@ fn attached_option_value_candidates<const N: usize>(
             return;
         }
 
-        if let Some(rest) = current.strip_prefix("--") {
-            if let Some((name, value)) = rest.split_once('=') {
-                if arg_long_matches(arg, name) {
+        if let Some(rest) = current.strip_prefix("--")
+            && let Some((name, value)) = rest.split_once('=')
+                && arg_long_matches(arg, name) {
                     let offset = current.len().saturating_sub(value.len());
                     add_value_candidates(arg, value, token_at + offset, out);
                     found = true;
                     return;
                 }
-            }
-        }
 
         if current.starts_with('-') && !current.starts_with("--") {
             let mut chars = current[1..].chars();

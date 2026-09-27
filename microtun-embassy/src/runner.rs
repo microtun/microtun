@@ -154,8 +154,8 @@ impl Sink for TunnelSink<'_, '_, '_, '_> {
     }
 
     fn event(&mut self, event: Event) {
-        if let Event::PeerEvicted { public_key } = event {
-            if (!self.flush_forgets()
+        if let Event::PeerEvicted { public_key } = event
+            && (!self.flush_forgets()
                 || self
                     .resolver_commands
                     .try_send(ResolverCommand::Forget(public_key))
@@ -164,7 +164,6 @@ impl Sink for TunnelSink<'_, '_, '_, '_> {
             {
                 warn!("pending forget queue full; dropping peer eviction");
             }
-        }
     }
 }
 

@@ -99,7 +99,7 @@ pub fn parse(plaintext: &[u8]) -> Option<Envelope<'_>> {
 fn inner_plausible(inner: &[u8]) -> bool {
     match messages::classify(inner) {
         Some(Message::Initiation | Message::Response | Message::CookieReply) => true,
-        Some(Message::Data) => inner.len() % 16 == 0,
+        Some(Message::Data) => inner.len().is_multiple_of(16),
         Some(Message::RelayData) | None => false,
     }
 }

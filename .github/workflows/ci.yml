@@ -47,13 +47,13 @@ jobs:
           cache: false
 
       - name: Check formatting (host workspace)
-        run: cargo fmt --all -- --check
+        run: cargo +${RUSTFMT_TOOLCHAIN} fmt --all -- --check
 
       # The firmware workspace is excluded from the root workspace, so the root
       # `cargo fmt --all` never reaches it.
       - name: Check formatting (firmware workspace)
         working-directory: firmware
-        run: cargo fmt --all -- --check
+        run: cargo +${RUSTFMT_TOOLCHAIN} fmt --all -- --check
 
   workspace:
     name: Lint, build, and test workspace

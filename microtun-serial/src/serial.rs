@@ -663,13 +663,12 @@ mod cuse {
         fn poll(&self, requested: PollEvents, notifier: Option<PollNotifier>, reply: PollReply) {
             let mut state = self.lock();
             let events = readiness(&state);
-            if let Some(notifier) = notifier {
-                if !state.stopping
+            if let Some(notifier) = notifier
+                && !state.stopping
                     && (requested.is_empty() || events.intersection(requested).is_empty())
                 {
                     state.polls.push(notifier);
                 }
-            }
             reply.ready(events);
         }
 
