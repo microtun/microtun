@@ -209,6 +209,8 @@ jobs:
         include:
           - name: stm32h753zi
             asset: microtun-stm32h753zi-${{ needs.validate.outputs.version }}.mcuboot.bin
+          - name: esp32-c3
+            asset: microtun-esp32-c3-${{ needs.validate.outputs.version }}.mcuboot.bin
           - name: esp32-c6
             asset: microtun-esp32-c6-${{ needs.validate.outputs.version }}.mcuboot.bin
 
@@ -314,6 +316,7 @@ jobs:
           assets=(
             "${debs[@]}"
             "microtun-stm32h753zi-${VERSION}.mcuboot.bin"
+            "microtun-esp32-c3-${VERSION}.mcuboot.bin"
             "microtun-esp32-c6-${VERSION}.mcuboot.bin"
           )
 

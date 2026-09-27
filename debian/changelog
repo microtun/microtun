@@ -1,8 +1,14 @@
-microtun (0.4.0) UNRELEASED; urgency=medium
+microtun (0.4.1) UNRELEASED; urgency=medium
+
+  * Improve build process + add support for new firmware targets
+
+ -- Damian Peckett <damian@pecke.tt>  Sun, 27 Sep 2026 16:45:19 +0200
+
+microtun (0.4.0) unstable; urgency=medium
 
   * Add microtun-serial command 
 
- -- Damian Peckett <damian@pecke.tt>  Sun, 27 Sep 2026 15:41:07 +0200
+ -- Damian Peckett <damian@pecke.tt>  Sun, 27 Sep 2026 16:45:18 +0200
 
 microtun (0.3.0) unstable; urgency=medium
 

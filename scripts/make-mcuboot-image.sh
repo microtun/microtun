@@ -23,6 +23,7 @@ set -Eeuo pipefail
 #   scripts/make-mcuboot-image.sh <target> [output.bin]
 #
 # Supported targets:
+#   esp32-c3
 #   esp32-c6
 #   stm32h753zi
 
@@ -137,6 +138,11 @@ fi
 
 TARGET="$1"
 case "$TARGET" in
+    esp32-c3)
+        CID="esp32-c3"
+        SLOT_SIZE="0x1f0000"
+        BUILD_LABEL="ESP32-C3"
+        ;;
     esp32-c6)
         CID="esp32-c6"
         SLOT_SIZE="0x1f0000"
