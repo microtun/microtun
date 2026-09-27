@@ -1,7 +1,7 @@
 use core::convert::Infallible;
 
 use futures_lite::future::block_on;
-use microtun_telnet_proto::{
+use microtun_telnet::{
     BinaryMode, BinaryModeError, DO, DONT, IAC, OPT_BINARY, WILL, WONT, write_data_unflushed,
 };
 

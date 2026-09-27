@@ -1,21 +1,19 @@
 # microtun-telnet
 
-Interactive Telnet client with a terminal UI and YMODEM upload support.
+A `no_std` Telnet protocol core shared by Microtun's embedded shell and desktop client.
 
-TELNET BINARY negotiation, receive-side framing, and IAC escaping are provided by `microtun-telnet-proto`, the same protocol core used by the embedded firmware transfer path.
+It provides:
 
-Serial-console support is selected from inside the TUI rather than on the command line. Connect to the desired endpoint normally:
+- RFC 854 framing and IAC/subnegotiation decoding.
+- RFC 1143 Q-method option negotiation with independent local/remote capability policy.
+- Shared RFC 856 BINARY negotiation/state helpers and IAC-safe application-data framing.
+- A runtime-agnostic RFC 856 BINARY byte-stream adapter for protocols such as YMODEM.
+- Atomic subnegotiation framing with IAC escaping.
+- Serial COM-PORT-OPTION (option 44) command constants, typed decode/encode support, server acknowledgement command offsets, line/modem state masks, purge controls, and all SET-CONTROL values.
+- A runtime-free `client::ClientSession` that owns terminal/serial option policy, serial activation/refusal, serial-state tracking, initial discovery queries, and client command encoding.
 
-```text
-microtun-telnet device.example.net --port 2217
-```
+The embedded transfer path, desktop `microtun-console` client, and host `microtun-serial` bridge use the same framing and negotiation core. The two host clients additionally share `client::ClientSession`, leaving TCP/Tokio I/O, timeout policy, and UI/device orchestration outside this crate.
 
-The command prefix follows Minicom where the operations line up: `Ctrl-A Z` opens help, `Ctrl-A S` sends a file, `Ctrl-A C` clears the screen, `Ctrl-A Q` quits, `Ctrl-A P` opens communication parameters, and `Ctrl-A F` sends BREAK.
+The crate deliberately does not own a UART, socket, timeout policy, or file-transfer state machine. Lower-level endpoints can still supply a custom `Policy` directly to `Telnet`; serial clients can use `ClientSession` for the standard Microtun client policy and state tracking. This keeps the protocol state machine usable by a terminal client, an embedded shell, or a serial access server without pulling in `std` or a particular async runtime.
 
-Press `Ctrl-A P` to open the communication-parameters popup. The first row switches the live connection between normal Telnet mode and serial mode. Use the arrow keys to navigate the popup; Enter or Space chooses/toggles the selected item and Escape closes it.
-
-Enabling serial mode negotiates Telnet binary/suppress-go-ahead and the serial COM-PORT-OPTION on the existing connection. It does **not** set the remote baud rate, data bits, parity, stop bits, flow control, DTR, or RTS. The client only queries the current serial state after serial mode becomes active, so if the remote UART is already configured correctly its logging/output bytes are displayed immediately, including while serial negotiation is still in progress.
-
-Baud rate, data bits, parity, stop bits, flow control, DTR, and RTS are changed only when explicitly requested in the communication-parameters popup. BREAK can be sent either with `Ctrl-A F` from the terminal or `F` while that popup is open. Turning the first row back off restores the Telnet option state from before serial mode was enabled.
-
-For applications that need a normal Linux `/dev` serial character device and termios/ioctl behavior, use the companion `microtun-serial` binary instead.
+For serial mode, `ClientSession::enter_serial_mode` requests the required TELNET options and reports activation/refusal through `ClientEvent`. `queue_initial_serial_query` and the `set_*` helpers encode the common client operations. Access-server implementations can continue to use the lower-level `serial::decode`/`decode_from` and `serial::encode` APIs directly.

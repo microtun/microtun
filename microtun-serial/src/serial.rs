@@ -2,7 +2,7 @@ use std::{collections::VecDeque, io, time::Duration};
 
 use embedded_io_adapters::tokio_1::FromTokio;
 use heapless::Vec as HeaplessVec;
-use microtun_telnet_proto::{
+use microtun_telnet::{
     OPT_COM_PORT, Side, TelnetEvent,
     client::{ClientEncodeError, ClientEvent, ClientSession, SerialEvent},
     serial, write_data_unflushed,

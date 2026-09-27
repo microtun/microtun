@@ -17,7 +17,7 @@ const DEFAULT_TELNET_PORT: u16 = 23;
 
 #[derive(Parser)]
 #[command(
-    name = "microtun-telnet",
+    name = "microtun-console",
     version,
     about = "Interactive Telnet and serial-console client with YMODEM",
     arg_required_else_help = true
@@ -49,7 +49,7 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Err("microtun-telnet requires an interactive terminal".to_owned());
+        return Err("microtun-console requires an interactive terminal".to_owned());
     }
 
     let timeout = Duration::from_secs(cli.timeout);

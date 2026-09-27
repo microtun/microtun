@@ -5,7 +5,7 @@ This package installs the Linux executables:
 
   /usr/bin/microtun
   /usr/bin/microtun-tracker
-  /usr/bin/microtun-telnet
+  /usr/bin/microtun-console
   /usr/bin/microtun-serial
 
 The Tracker service is installed as microtun-tracker.service, but package
@@ -35,11 +35,11 @@ For example:
 Serial console
 --------------
 
-microtun-telnet switches into an interactive serial-console mode from inside the
+microtun-console switches into an interactive serial-console mode from inside the
 TUI. Connect to the serial endpoint and press Ctrl-A P to open communication
 parameters. Enable serial mode on the first row:
 
-  microtun-telnet serial-gateway.example --port 2217
+  microtun-console serial-gateway.example --port 2217
 
 Entering serial mode does not change the remote UART configuration. The serial
 protocol queries the current settings and applies changes only when requested, so

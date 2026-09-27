@@ -228,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn lists_parent_and_directories_before_files() {
         let root = std::env::temp_dir().join(format!(
-            "microtun-telnet-picker-test-{}",
+            "microtun-console-picker-test-{}",
             std::process::id()
         ));
         let child = root.join("child");

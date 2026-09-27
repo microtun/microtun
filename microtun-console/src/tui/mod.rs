@@ -8,7 +8,7 @@ use crossterm::{
 };
 use embedded_io_async::Write;
 use futures_util::StreamExt;
-use microtun_telnet_proto::serial;
+use microtun_telnet::serial;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,

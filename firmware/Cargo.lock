@@ -1800,7 +1800,7 @@ dependencies = [
  "embedded-io-async 0.7.0",
  "heapless 0.9.3",
  "microtun-cli-macros",
- "microtun-telnet-proto",
+ "microtun-telnet",
 ]
 
 [[package]]
@@ -1946,7 +1946,7 @@ dependencies = [
  "microtun-embassy",
  "microtun-mcuboot",
  "microtun-net-util",
- "microtun-telnet-proto",
+ "microtun-telnet",
  "microtun-ymodem",
  "rand_core 0.6.4",
  "sntpc",
@@ -2016,7 +2016,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "microtun-telnet-proto"
+name = "microtun-telnet"
 version = "0.4.1"
 dependencies = [
  "defmt 1.1.1",

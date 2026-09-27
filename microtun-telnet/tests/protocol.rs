@@ -1,5 +1,5 @@
 use heapless::Vec;
-use microtun_telnet_proto::{
+use microtun_telnet::{
     DO, IAC, OPT_BINARY, OPT_ECHO, Policy, SB, SE, Side, Telnet, TelnetEvent, WILL,
 };
 
@@ -49,7 +49,7 @@ fn option_policy_is_directional() {
     }
     assert_eq!(
         reply.as_slice(),
-        &[IAC, microtun_telnet_proto::WONT, OPT_ECHO]
+        &[IAC, microtun_telnet::WONT, OPT_ECHO]
     );
     assert!(!telnet.us_enabled(OPT_ECHO));
 
@@ -84,7 +84,7 @@ fn binary_helpers_negotiate_both_directions() {
         wire.as_slice(),
         &[
             IAC,
-            microtun_telnet_proto::WILL,
+            microtun_telnet::WILL,
             OPT_BINARY,
             IAC,
             DO,
@@ -106,10 +106,10 @@ fn binary_helpers_negotiate_both_directions() {
         wire.as_slice(),
         &[
             IAC,
-            microtun_telnet_proto::WONT,
+            microtun_telnet::WONT,
             OPT_BINARY,
             IAC,
-            microtun_telnet_proto::DONT,
+            microtun_telnet::DONT,
             OPT_BINARY,
         ]
     );
@@ -123,7 +123,7 @@ fn q_method_reports_rejected_enable_request() {
     telnet.request_us(OPT_BINARY, &mut wire);
     wire.clear();
     let mut event = None;
-    for byte in [IAC, microtun_telnet_proto::DONT, OPT_BINARY] {
+    for byte in [IAC, microtun_telnet::DONT, OPT_BINARY] {
         event = telnet.feed(byte, &mut wire).or(event);
     }
     assert_eq!(

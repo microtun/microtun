@@ -1,11 +1,11 @@
 use embedded_io_async::Write;
 use heapless::{String, Vec};
-pub use microtun_telnet_proto::{
+pub use microtun_telnet::{
     AYT, BRK, BinaryMode, BinaryModeError, DO, DONT, EC, EL, IAC, IP, NOP, OPT_BINARY, OPT_ECHO,
     OPT_NAWS, OPT_SUPPRESS_GO_AHEAD, OPT_TERMINAL_TYPE, SB, SE, WILL, WONT, write_data,
     write_data_unflushed,
 };
-use microtun_telnet_proto::{Policy, Side, Telnet as Protocol, TelnetEvent as ProtocolEvent};
+use microtun_telnet::{Policy, Side, Telnet as Protocol, TelnetEvent as ProtocolEvent};
 
 /// Format into bounded stack storage and write the result as TELNET application data.
 pub async fn write_fmt<const FMT: usize, T>(
@@ -56,7 +56,7 @@ impl Policy for ServerPolicy {
 
 /// Microtun shell Telnet endpoint.
 ///
-/// RFC 854 framing and RFC 1143 negotiation live in `microtun-telnet-proto`; this wrapper only
+/// RFC 854 framing and RFC 1143 negotiation live in `microtun-telnet`; this wrapper only
 /// supplies the shell's server-side option policy and interprets NAWS/TERMINAL-TYPE payloads.
 pub struct Telnet<const SB_CAP: usize = 64, const TERM_CAP: usize = 32> {
     protocol: Protocol<ServerPolicy, SB_CAP, 12>,
@@ -131,7 +131,7 @@ impl<const SB_CAP: usize, const TERM_CAP: usize> Telnet<SB_CAP, TERM_CAP> {
         if !self.ttype_send_pending {
             return;
         }
-        if microtun_telnet_proto::push_subnegotiation(out, OPT_TERMINAL_TYPE, &[TTYPE_SEND]) {
+        if microtun_telnet::push_subnegotiation(out, OPT_TERMINAL_TYPE, &[TTYPE_SEND]) {
             self.ttype_send_pending = false;
         }
     }

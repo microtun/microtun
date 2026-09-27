@@ -1,5 +1,5 @@
 use heapless::Vec;
-use microtun_telnet_proto::{IAC, OPT_COM_PORT, SB, SE, serial};
+use microtun_telnet::{IAC, OPT_COM_PORT, SB, SE, serial};
 use serial::{Message, Origin};
 
 #[test]

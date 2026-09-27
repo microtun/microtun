@@ -1,5 +1,5 @@
 use heapless::Vec;
-use microtun_telnet_proto::{
+use microtun_telnet::{
     DO, DONT, IAC, OPT_BINARY, OPT_COM_PORT, OPT_SUPPRESS_GO_AHEAD, SB, SE,
     client::{ClientEvent, ClientSession, SerialEvent, SerialStatus},
     serial,
@@ -15,19 +15,19 @@ fn serial_mode_negotiation_is_owned_by_client_session() {
         wire.as_slice(),
         &[
             IAC,
-            microtun_telnet_proto::WILL,
+            microtun_telnet::WILL,
             OPT_BINARY,
             IAC,
             DO,
             OPT_BINARY,
             IAC,
-            microtun_telnet_proto::WILL,
+            microtun_telnet::WILL,
             OPT_SUPPRESS_GO_AHEAD,
             IAC,
             DO,
             OPT_SUPPRESS_GO_AHEAD,
             IAC,
-            microtun_telnet_proto::WILL,
+            microtun_telnet::WILL,
             OPT_COM_PORT,
         ]
     );

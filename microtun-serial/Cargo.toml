@@ -10,7 +10,7 @@ license.workspace = true
 clap = { version = "~4.6", features = ["derive"] }
 embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
 heapless = { workspace = true }
-microtun-telnet-proto = { workspace = true }
+microtun-telnet = { workspace = true }
 tokio = { version = "~1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
