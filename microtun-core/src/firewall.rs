@@ -537,9 +537,10 @@ impl<const MAX_FLOWS: usize, const MAX_PEERS: usize> Firewall<MAX_FLOWS, MAX_PEE
     pub(crate) fn remove_peer(&mut self, peer: PeerIdx) {
         self.entries.retain(|entry| entry.peer != peer);
         if let Some(position) = Self::peer_position(peer)
-            && let Some(count) = self.peer_counts.get_mut(position) {
-                *count = 0;
-            }
+            && let Some(count) = self.peer_counts.get_mut(position)
+        {
+            *count = 0;
+        }
     }
 }
 

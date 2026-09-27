@@ -1765,13 +1765,14 @@ impl<
                 return Ok(());
             }
             if let Some(last) = peer.last_initiation_consumption
-                && now.saturating_since(last) <= HANDSHAKE_INITIATION_MIN_INTERVAL {
-                    warn!(
-                        "handshake initiation rejected: per-peer flood peer={}",
-                        pidx
-                    );
-                    return Ok(());
-                }
+                && now.saturating_since(last) <= HANDSHAKE_INITIATION_MIN_INTERVAL
+            {
+                warn!(
+                    "handshake initiation rejected: per-peer flood peer={}",
+                    pidx
+                );
+                return Ok(());
+            }
             peer.greatest_ts = consumed.timestamp;
             peer.last_initiation_consumption = Some(now);
         }
@@ -2049,9 +2050,10 @@ impl<
         self.timers.arm(now + REJECT_AFTER_TIME);
 
         if let Some(old) = old_previous
-            && let Err(error) = self.free_slot(old) {
-                error!("failed to free superseded session slot: {:?}", error);
-            }
+            && let Err(error) = self.free_slot(old)
+        {
+            error!("failed to free superseded session slot: {:?}", error);
+        }
 
         // The initiator must speak first to confirm the session (§5.4.5):
         // flush anything parked for this peer, else send a keepalive.
@@ -2106,12 +2108,13 @@ impl<
             return;
         };
         if let Ok(c) = cookie::consume_cookie_reply(&peer_pub, &last_mac1, data)
-            && let Some(peer) = self.peers.get_mut(pidx as usize).and_then(Option::as_mut) {
-                debug!("stored cookie for peer={}", pidx);
-                peer.cookie = Some((c, now));
-                // The ≤5 s retransmission (§6.4) will carry mac2; no
-                // immediate resend, exactly like the reference behavior.
-            }
+            && let Some(peer) = self.peers.get_mut(pidx as usize).and_then(Option::as_mut)
+        {
+            debug!("stored cookie for peer={}", pidx);
+            peer.cookie = Some((c, now));
+            // The ≤5 s retransmission (§6.4) will carry mac2; no
+            // immediate resend, exactly like the reference behavior.
+        }
     }
 
     async fn rx_data<E: Sink>(
@@ -2227,9 +2230,10 @@ impl<
         }
 
         if let Some(old) = freed
-            && let Err(error) = self.free_slot(old) {
-                error!("failed to free superseded responder session: {:?}", error);
-            }
+            && let Err(error) = self.free_slot(old)
+        {
+            error!("failed to free superseded responder session: {:?}", error);
+        }
 
         // Receive-path rekey (§6.2), initiator role only.
         if role == Role::Initiator
@@ -2972,9 +2976,9 @@ impl<
                 .get(pidx as usize)
                 .and_then(Option::as_ref)
                 .is_none()
-            {
-                return Err(Error::InternalInvariant);
-            }
+        {
+            return Err(Error::InternalInvariant);
+        }
         if let Some(index) = local_index {
             self.session_indices.remove(index, sidx)?;
         }

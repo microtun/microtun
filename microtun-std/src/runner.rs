@@ -201,9 +201,9 @@ impl<D: TunnelDevice> Sink for TunnelSink<'_, D> {
                     .resolver_commands
                     .try_send(ResolverCommand::Forget(public_key))
                     .is_err())
-            {
-                self.pending_forgets.push_back(public_key);
-            }
+        {
+            self.pending_forgets.push_back(public_key);
+        }
         self.observer.event(event);
     }
 }

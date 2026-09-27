@@ -406,9 +406,10 @@ impl TlvArea {
                         return Err(Error::InvalidTlvAreaSize);
                     }
                     if let Some(expected) = self.expected_total
-                        && total != expected {
-                            return Err(Error::InvalidTlvAreaSize);
-                        }
+                        && total != expected
+                    {
+                        return Err(Error::InvalidTlvAreaSize);
+                    }
                     self.total = Some(total);
                 }
                 continue;
@@ -641,23 +642,24 @@ impl StreamingVerifier {
             }
 
             if let Some(protected) = self.protected.as_mut()
-                && !protected.is_complete() {
-                    let remaining = usize::from(header.protected_tlv_size) - protected.consumed;
-                    let take = remaining.min(input.len());
-                    self.hasher.update(&input[..take]);
-                    // Keep the protected block so the canonical digest can be
-                    // rebuilt later against what is actually in flash.
-                    self.protected_bytes[self.protected_fill..self.protected_fill + take]
-                        .copy_from_slice(&input[..take]);
-                    self.protected_fill += take;
-                    let consumed = protected
-                        .feed(&input[..take], &mut self.found)
-                        .map_err(FeedError::Image)?;
-                    debug_assert_eq!(consumed, take);
-                    self.container_position = self.container_position.saturating_add(take as u32);
-                    input = &input[take..];
-                    continue;
-                }
+                && !protected.is_complete()
+            {
+                let remaining = usize::from(header.protected_tlv_size) - protected.consumed;
+                let take = remaining.min(input.len());
+                self.hasher.update(&input[..take]);
+                // Keep the protected block so the canonical digest can be
+                // rebuilt later against what is actually in flash.
+                self.protected_bytes[self.protected_fill..self.protected_fill + take]
+                    .copy_from_slice(&input[..take]);
+                self.protected_fill += take;
+                let consumed = protected
+                    .feed(&input[..take], &mut self.found)
+                    .map_err(FeedError::Image)?;
+                debug_assert_eq!(consumed, take);
+                self.container_position = self.container_position.saturating_add(take as u32);
+                input = &input[take..];
+                continue;
+            }
 
             let consumed = self
                 .regular

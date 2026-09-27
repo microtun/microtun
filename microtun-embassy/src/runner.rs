@@ -160,10 +160,10 @@ impl Sink for TunnelSink<'_, '_, '_, '_> {
                     .resolver_commands
                     .try_send(ResolverCommand::Forget(public_key))
                     .is_err())
-                && self.pending_forgets.push_back(public_key).is_err()
-            {
-                warn!("pending forget queue full; dropping peer eviction");
-            }
+            && self.pending_forgets.push_back(public_key).is_err()
+        {
+            warn!("pending forget queue full; dropping peer eviction");
+        }
     }
 }
 

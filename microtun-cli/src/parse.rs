@@ -269,17 +269,20 @@ impl<'c, 'a> ArgCursor<'c, 'a> {
             };
 
             if let Some(long) = long
-                && Self::long_matches(token, long) {
-                    self.consume(index);
-                    return true;
-                }
+                && Self::long_matches(token, long)
+            {
+                self.consume(index);
+                return true;
+            }
 
             if let Some(short) = short
                 && let Some(body) = short_cluster(token)
-                    && self.locate_short(body, short).is_some() && !self.short_used(index, short) {
-                        self.record_short_use(index, short);
-                        return true;
-                    }
+                && self.locate_short(body, short).is_some()
+                && !self.short_used(index, short)
+            {
+                self.record_short_use(index, short);
+                return true;
+            }
         }
         false
     }
@@ -326,20 +329,22 @@ impl<'c, 'a> ArgCursor<'c, 'a> {
             };
 
             if let Some(long) = long
-                && Self::long_matches(token, long) {
-                    self.consume(index);
-                    count = count.saturating_add(1);
-                    continue;
-                }
+                && Self::long_matches(token, long)
+            {
+                self.consume(index);
+                count = count.saturating_add(1);
+                continue;
+            }
 
             if let Some(short) = short
-                && let Some(body) = short_cluster(token) {
-                    let hits = self.count_short(body, short);
-                    if hits > 0 && !self.short_used(index, short) {
-                        self.record_short_use(index, short);
-                        count = count.saturating_add(hits.min(u8::MAX as usize) as u8);
-                    }
+                && let Some(body) = short_cluster(token)
+            {
+                let hits = self.count_short(body, short);
+                if hits > 0 && !self.short_used(index, short) {
+                    self.record_short_use(index, short);
+                    count = count.saturating_add(hits.min(u8::MAX as usize) as u8);
                 }
+            }
         }
         count
     }
@@ -411,18 +416,19 @@ impl<'c, 'a> ArgCursor<'c, 'a> {
             let token = self.line.arg(index)?;
 
             if let Some(long) = long
-                && let Some(rest) = token.strip_prefix("--") {
-                    if rest == long {
-                        self.consume(index);
-                        return self
-                            .take_detached_value(index, argument, allow_hyphen)
-                            .map(Some);
-                    }
-                    if let Some(value) = rest.strip_prefix(long).and_then(|r| r.strip_prefix('=')) {
-                        self.consume(index);
-                        return Ok(Some(value));
-                    }
+                && let Some(rest) = token.strip_prefix("--")
+            {
+                if rest == long {
+                    self.consume(index);
+                    return self
+                        .take_detached_value(index, argument, allow_hyphen)
+                        .map(Some);
                 }
+                if let Some(value) = rest.strip_prefix(long).and_then(|r| r.strip_prefix('=')) {
+                    self.consume(index);
+                    return Ok(Some(value));
+                }
+            }
 
             if let Some(short) = short {
                 if self.short_used(index, short) {

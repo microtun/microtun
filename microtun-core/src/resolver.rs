@@ -1171,9 +1171,10 @@ impl<
 
     fn check_resolved_answer(&self, query: ResolveQuery, info: &ResolvedPeer) -> Result<(), Error> {
         if let ResolveQuery::ByPublicKey(expected) = query
-            && info.public_key != expected {
-                return Err(Error::InvalidResolverAnswer);
-            }
+            && info.public_key != expected
+        {
+            return Err(Error::InvalidResolverAnswer);
+        }
         // Our own static key. `Core::new` refuses this for pinned peers; a
         // dynamic answer must not be able to install what configuration
         // cannot. Accepting it would let us handshake with ourselves and
@@ -1304,21 +1305,22 @@ impl<
         // may use only capacity above the protected reserve. A cryptographically
         // authenticated unknown initiator can consume a reserved free slot.
         if (authenticated || free > self.core_config.lazy_peer_reserve)
-            && let Some(i) = free_index {
-                let peer = PeerEntry::new(
-                    info.public_key,
-                    PeerKind::Dynamic,
-                    *crate::crypto::dh(&self.s_priv, &info.public_key)?,
-                    info.endpoint,
-                    info.relay,
-                    info.inbound_policy,
-                    info.persistent_keepalive,
-                    info.address,
-                    now,
-                );
-                self.install_peer(i as PeerIdx, peer)?;
-                return Ok((i as PeerIdx, true, true));
-            }
+            && let Some(i) = free_index
+        {
+            let peer = PeerEntry::new(
+                info.public_key,
+                PeerKind::Dynamic,
+                *crate::crypto::dh(&self.s_priv, &info.public_key)?,
+                info.endpoint,
+                info.relay,
+                info.inbound_policy,
+                info.persistent_keepalive,
+                info.address,
+                now,
+            );
+            self.install_peer(i as PeerIdx, peer)?;
+            return Ok((i as PeerIdx, true, true));
+        }
 
         // A held-peer update is existing-only. A stale invalidation must never
         // turn into a fresh admission after the original peer was removed.

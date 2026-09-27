@@ -435,11 +435,12 @@ impl<D: Device> RunningCuse<D> {
         // blocking read with the non-restarting SIGPIPE handler acquired by
         // Cuse::start(). This signal is directed only at the loop thread.
         if let Some(thread) = self.thread.as_ref()
-            && !thread.is_finished() {
-                unsafe {
-                    let _ = libc::pthread_kill(thread.as_pthread_t(), libc::SIGPIPE);
-                }
+            && !thread.is_finished()
+        {
+            unsafe {
+                let _ = libc::pthread_kill(thread.as_pthread_t(), libc::SIGPIPE);
             }
+        }
     }
 
     fn finish(&mut self) -> io::Result<()> {
