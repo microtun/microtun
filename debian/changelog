@@ -1,10 +1,16 @@
-microtun (0.3.0) UNRELEASED; urgency=medium
+microtun (0.4.0) UNRELEASED; urgency=medium
+
+  * Add microtun-serial command 
+
+ -- Damian Peckett <damian@pecke.tt>  Sun, 27 Sep 2026 15:41:07 +0200
+
+microtun (0.3.0) unstable; urgency=medium
 
   * Add generic firmware targets + esp32-c3
   * Split serial CUSE bridging into the microtun-serial companion binary.
   * Add TUI-selectable interactive serial mode and controls to microtun-telnet.
 
- -- Damian Peckett <damian@pecke.tt>  Sat, 26 Sep 2026 12:45:29 +0200
+ -- Damian Peckett <damian@pecke.tt>  Sun, 27 Sep 2026 15:40:45 +0200
 
 microtun (0.2.0) unstable; urgency=medium
 

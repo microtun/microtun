@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-esp32-c3"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "embassy-executor",
  "embassy-net",
@@ -1891,7 +1891,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-esp32-c6"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "embassy-executor",
  "embassy-net",
@@ -1921,14 +1921,14 @@ dependencies = [
 
 [[package]]
 name = "microtun-firmware-build"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
 ]
 
 [[package]]
 name = "microtun-firmware-common"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crc",
  "defmt 1.1.1",
@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-stm32h753zi"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "cortex-m",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "microtun-stm32h753zi-bootloader"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
