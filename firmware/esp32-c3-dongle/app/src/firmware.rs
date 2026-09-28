@@ -28,7 +28,7 @@ use microtun_mcuboot::{
 use crate::pet_watchdog;
 
 const FIRMWARE_VENDOR_ID: &str = "firmware.microtun.dev";
-const FIRMWARE_COMPONENT_ID: &str = "esp32-c3";
+const FIRMWARE_COMPONENT_ID: &str = "esp32-c3-dongle";
 const FIRMWARE_PUBLIC_KEY: &[u8; 32] =
     include_bytes!(concat!(env!("OUT_DIR"), "/firmware-public-key.bin"));
 

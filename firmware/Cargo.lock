@@ -1398,6 +1398,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp32-c3-dongle"
+version = "0.5.0"
+dependencies = [
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-net-driver-channel",
+ "embassy-sync 0.8.0",
+ "embassy-time",
+ "embedded-io-async 0.7.0",
+ "embedded-storage",
+ "esp-alloc",
+ "esp-bootloader-esp-idf",
+ "esp-hal",
+ "esp-println",
+ "esp-radio",
+ "esp-rtos",
+ "esp-storage",
+ "heapless 0.9.3",
+ "log",
+ "microtun-cli",
+ "microtun-embassy",
+ "microtun-firmware-build",
+ "microtun-firmware-common",
+ "microtun-mcuboot",
+ "microtun-net-util",
+ "microtun-telnet",
+ "rand_core 0.6.4",
+ "static_cell",
+]
+
+[[package]]
 name = "esp32c2"
 version = "0.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1857,36 +1889,6 @@ dependencies = [
  "microtun-core",
  "rand_chacha",
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "microtun-esp32-c3"
-version = "0.5.0"
-dependencies = [
- "embassy-executor",
- "embassy-net",
- "embassy-net-driver-channel",
- "embassy-sync 0.8.0",
- "embassy-time",
- "embedded-io-async 0.7.0",
- "embedded-storage",
- "esp-alloc",
- "esp-bootloader-esp-idf",
- "esp-hal",
- "esp-println",
- "esp-radio",
- "esp-rtos",
- "esp-storage",
- "heapless 0.9.3",
- "log",
- "microtun-cli",
- "microtun-embassy",
- "microtun-firmware-build",
- "microtun-firmware-common",
- "microtun-mcuboot",
- "microtun-net-util",
- "rand_core 0.6.4",
- "static_cell",
 ]
 
 [[package]]

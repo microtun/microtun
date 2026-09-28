@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "build-support",
     "common",
-    "esp32-c3/app",
+    "esp32-c3-dongle/app",
     "esp32-c6/app",
     "stm32h753zi/app",
     "stm32h753zi/bootloader",

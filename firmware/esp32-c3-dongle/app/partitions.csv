@@ -1,5 +1,5 @@
 # Board profile: ESP32-C3-MINI-1-N4 (4 MiB flash).
-# The RS232 transceiver is intentionally unused by this example.
+# The on-board SP3232 RS232 transceiver is used by the RFC 2217 service.
 #
 # Normal firmware boots from ota_0/ota_1. The inactive slot is used for
 # power-fail-safe shell OTA; the configuration record stays at its historical

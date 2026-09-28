@@ -30,8 +30,8 @@ use crate::{
     storage::Storage,
 };
 
-const TELNET_BANNER: &str = "microtun ESP32-C3\r\ntype 'help' for commands";
-const SETUP_TELNET_BANNER: &str = "microtun ESP32-C3 setup mode\r\ntype 'help' for commands";
+const TELNET_BANNER: &str = "microtun ESP32-C3 dongle\r\ntype 'help' for commands";
+const SETUP_TELNET_BANNER: &str = "microtun ESP32-C3 dongle setup mode\r\ntype 'help' for commands";
 
 #[embassy_executor::task]
 pub(crate) async fn telnet_task(
@@ -112,7 +112,7 @@ enum NetField {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "microtun", about = "microtun ESP32-C3 shell")]
+#[command(name = "microtun", about = "microtun ESP32-C3 dongle shell")]
 enum Command {
     /// `sys`, `ping`, `tunnel`, `config`, `fw`, `identify`, `reboot`, `quit`.
     #[command(flatten)]

@@ -14,14 +14,17 @@ use microtun_embassy::TunnelRunner;
 use microtun_firmware_common::{
     configuration::DeviceIdentity,
     net::{self as common_net, fallback_static_ipv4_config},
-    tunnel::{self as common_tunnel, OUTER_UDP_PACKETS},
 };
 use microtun_net_util::{
     FALLBACK_DEVICE_IPV4, FALLBACK_IPV4_PREFIX_LEN, MICROTUN_MDNS_SERVICE, device_ap_ssid,
 };
 use static_cell::StaticCell;
 
-use crate::{HardwareRng, InnerDevice, OuterDevice, board::DEVICE_MODEL};
+use crate::{
+    HardwareRng, InnerDevice, OuterDevice,
+    board::DEVICE_MODEL,
+    tunnel::{self as common_tunnel, OUTER_UDP_PACKETS},
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct WifiLinkSnapshot {

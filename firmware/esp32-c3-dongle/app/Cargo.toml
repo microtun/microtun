@@ -1,5 +1,6 @@
 [package]
-name = "microtun-esp32-c3"
+name = "esp32-c3-dongle"
+description = "ESP32-C3 microtun firmware with management Telnet and an RFC 2217 RS232 server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,8 +13,10 @@ microtun-net-util = { workspace = true, features = ["embassy-net"] }
 microtun-mcuboot = { workspace = true }
 microtun-cli = { workspace = true }
 microtun-firmware-common = { workspace = true, features = ["log"] }
+microtun-telnet = { workspace = true }
 
 embassy-executor = { workspace = true, features = ["log"] }
+embassy-futures = { version = "0.1.2", default-features = false }
 embassy-net = { workspace = true, features = ["log", "tcp", "udp", "icmp", "dhcpv4", "dhcpv4-hostname", "dns", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "multicast"] }
 embassy-net-driver-channel = { workspace = true }
 embassy-sync = { workspace = true }
@@ -23,7 +26,6 @@ embedded-storage = { workspace = true }
 heapless = { workspace = true }
 rand_core = { workspace = true }
 static_cell = { workspace = true }
-
 log = { workspace = true }
 
 esp-alloc = { workspace = true }

@@ -36,8 +36,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     set -eux; \
     public_key=/run/secrets/firmware_public_key; \
     test -n "$FIRMWARE_PUBLIC_KEY_CACHE_KEY"; \
-    app_dir=/project/firmware/esp32-c3/app; \
-    elf=/target/riscv32imc-unknown-none-elf/release/microtun-esp32-c3; \
+    app_dir=/project/firmware/esp32-c3-dongle/app; \
+    elf=/target/riscv32imc-unknown-none-elf/release/esp32-c3-dongle; \
     test -f "$public_key"; \
     mkdir -p /out; \
     cd "$app_dir"; \

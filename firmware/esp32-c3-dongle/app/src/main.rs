@@ -6,8 +6,10 @@ extern crate alloc;
 mod board;
 mod firmware;
 mod network;
+mod rfc2217;
 mod shell;
 mod storage;
+mod tunnel;
 
 use core::cell::RefCell;
 
@@ -36,7 +38,6 @@ use microtun_embassy::{TunnelDevice, TunnelState};
 use microtun_firmware_common::{
     configuration::{DeviceIdentity, RECORD_SIZE},
     firmware::trial_image_is_healthy,
-    tunnel::{self as common_tunnel, INNER_STACK_SOCKETS, TUNNEL_QUEUE_DEPTH},
 };
 use microtun_net_util::{device_ap_ssid, device_hostname};
 use network::{
@@ -47,6 +48,7 @@ use rand_core::RngCore as _;
 use shell::{Shell, WallClock, setup_mode, sync_time_from_ntp, telnet_task};
 use static_cell::StaticCell;
 use storage::{BoardStorage, CONFIGURATION_BUFFER, Storage};
+use tunnel::{self as common_tunnel, INNER_STACK_SOCKETS, TUNNEL_QUEUE_DEPTH};
 
 type OuterDevice = Interface;
 type InnerDevice = TunnelDevice<'static>;
@@ -287,7 +289,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(inner_net_task(inner_runner).unwrap());
 
     let local_public_key = tunnel.public_key();
-    info!("microtun tunnel ready; telnet is only on the inner interface");
+    info!("microtun tunnel ready; management Telnet and RFC2217 are only on the inner interface");
     spawner.spawn(tunnel_task(tunnel, outer_stack).unwrap());
     spawner.spawn(
         peers_resolver_task(
@@ -340,6 +342,11 @@ async fn main(spawner: Spawner) -> ! {
         )
         .unwrap(),
     );
+
+    // Expose the board's physical RS232 port as a single-client RFC 2217
+    // Telnet COM-PORT-OPTION service on the secure tunnel interface.
+    let (rs232_uart, rs232_rts, rs232_cts) = board::rs232!(peripherals);
+    spawner.spawn(rfc2217::rfc2217_task(inner_stack, rs232_uart, rs232_rts, rs232_cts).unwrap());
 
     core::future::pending().await
 }
