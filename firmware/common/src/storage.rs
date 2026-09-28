@@ -11,7 +11,10 @@ use embedded_io_async::{Read, Write};
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use heapless::String;
 
-use crate::configuration::{DeviceConfig, RECORD_SIZE, decode_record};
+use crate::{
+    configuration::{DeviceConfig, RECORD_SIZE, decode_record},
+    firmware::BinaryTelnet,
+};
 
 /// Detail lines shown to the operator after a firmware image has been accepted.
 pub type FirmwareSummary = String<192>;
@@ -22,9 +25,14 @@ pub type FirmwareSummary = String<192>;
 /// `embedded-io-async` avoids coupling the OTA verifier and board bootloader code to Embassy Net.
 pub trait FirmwareInstaller {
     /// Receive, verify, and arm a board-specific firmware image.
-    async fn install_firmware<T>(&mut self, io: &mut T) -> Result<FirmwareSummary, &'static str>
+    async fn install_firmware<T, C>(
+        &mut self,
+        io: &mut T,
+        telnet: &mut C,
+    ) -> Result<FirmwareSummary, &'static str>
     where
-        T: Read + Write + ?Sized;
+        T: Read + Write + ?Sized,
+        C: BinaryTelnet + ?Sized;
 }
 
 /// Serialized access to one board's flash-backed storage.
@@ -103,11 +111,16 @@ impl<B: NorFlash> Storage<B> {
 
 impl<B: FirmwareInstaller> Storage<B> {
     /// Receive, verify, and arm a firmware image while holding exclusive flash access.
-    pub async fn install_firmware<T>(&self, io: &mut T) -> Result<FirmwareSummary, &'static str>
+    pub async fn install_firmware<T, C>(
+        &self,
+        io: &mut T,
+        telnet: &mut C,
+    ) -> Result<FirmwareSummary, &'static str>
     where
         T: Read + Write + ?Sized,
+        C: BinaryTelnet + ?Sized,
     {
         let mut backend = self.backend.lock().await;
-        backend.install_firmware(io).await
+        backend.install_firmware(io, telnet).await
     }
 }

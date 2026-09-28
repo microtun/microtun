@@ -19,7 +19,9 @@ use esp_bootloader_esp_idf::{
 use esp_storage::FlashStorage;
 use log::{info, warn};
 pub(crate) use microtun_firmware_common::firmware::FirmwareStatus;
-use microtun_firmware_common::firmware::{ImageTransferError, TransferError, receive_signed_image};
+use microtun_firmware_common::firmware::{
+    BinaryTelnet, ImageTransferError, TransferError, receive_signed_image,
+};
 use microtun_mcuboot::{
     ImageVersion, PayloadSink, Policy as McubootPolicy, StoredImageError, StreamingVerifier,
     verify_stored_image,
@@ -489,12 +491,14 @@ pub(crate) fn log_firmware_update_error(error: &FirmwareUpdateError) {
     }
 }
 
-pub(crate) async fn receive_firmware_update<T>(
+pub(crate) async fn receive_firmware_update<T, C>(
     io: &mut T,
+    telnet: &mut C,
     flash: &mut FlashStorage<'static>,
 ) -> Result<(EspAppMetadata, AppPartitionSubType), FirmwareUpdateError>
 where
     T: Read + Write + ?Sized,
+    C: BinaryTelnet + ?Sized,
 {
     let (metadata, slot) = {
         let mut partition_buffer = [0u8; PARTITION_TABLE_MAX_LEN];
@@ -513,7 +517,7 @@ where
         )
         .map_err(FirmwareUpdateError::Image)?;
 
-        receive_signed_image(io, &mut verifier, &mut sink).await?;
+        receive_signed_image(io, telnet, &mut verifier, &mut sink).await?;
         let verified = verifier.finish().map_err(FirmwareUpdateError::Image)?;
 
         // Streaming verification only proves the bytes on the wire were

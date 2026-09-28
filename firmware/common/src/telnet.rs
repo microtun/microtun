@@ -13,7 +13,7 @@ use embassy_time::{Duration, with_timeout};
 use embedded_storage::nor_flash::NorFlash;
 use microtun_cli::{
     Config as CliConfig, Dispatch, Error as CliError, ParserFamily, Session,
-    telnet::write_fmt as telnet_write_fmt,
+    telnet::{Telnet as CliTelnet, write_fmt as telnet_write_fmt},
 };
 
 use crate::{
@@ -83,10 +83,11 @@ async fn report(socket: &mut TcpSocket<'_>, reason: fmt::Arguments<'_>) -> bool 
 
 async fn receive_configuration<B: NorFlash>(
     socket: &mut TcpSocket<'_>,
+    telnet: &mut CliTelnet<64, 32>,
     storage: &Storage<B>,
     scratch: &mut [u8; RECORD_SIZE],
 ) -> Result<(), &'static str> {
-    let len = receive_ymodem_buffer(socket, record_payload_buffer(scratch)).await?;
+    let len = receive_ymodem_buffer(socket, telnet, record_payload_buffer(scratch)).await?;
     encode_record_in_place(scratch, len).map_err(|_| "invalid configuration")?;
     storage.store_config(scratch).await
 }
@@ -151,14 +152,16 @@ where
         }
         info!("telnet client connected");
 
+        let mut telnet = CliTelnet::<64, 32>::new();
         loop {
             *shell.pending_action() = None;
-            let result = Session::<_, 160, 4, 256>::new(
+            let mut session = Session::<_, 160, 4, 256>::with_telnet(
                 &mut socket,
                 CliConfig::new(TELNET_PROMPT).banner(banner),
-            )
-            .serve::<P, _>(shell)
-            .await;
+                telnet,
+            );
+            let result = session.serve::<P, _>(shell).await;
+            telnet = session.into_telnet();
             let Some(action) = shell.pending_action().take() else {
                 match result {
                     Ok(()) | Err(CliError::Disconnected) => break,
@@ -173,7 +176,14 @@ where
                 SessionAction::Reboot => reboot(&mut socket, shell).await,
 
                 SessionAction::ConfigInstall => {
-                    match receive_configuration(&mut socket, storage, configuration_scratch).await {
+                    match receive_configuration(
+                        &mut socket,
+                        &mut telnet,
+                        storage,
+                        configuration_scratch,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             info!("device configuration installed; rebooting");
                             reboot_with(
@@ -215,7 +225,7 @@ where
                 },
 
                 SessionAction::FirmwareUpdate => {
-                    match storage.install_firmware(&mut socket).await {
+                    match storage.install_firmware(&mut socket, &mut telnet).await {
                         Ok(summary) => {
                             info!("firmware update verified and activated; rebooting");
                             reboot_with(

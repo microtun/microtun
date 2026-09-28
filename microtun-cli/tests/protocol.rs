@@ -58,6 +58,18 @@ fn initial_negotiation_requests_echo() {
     );
 }
 
+#[test]
+fn initial_negotiation_is_sent_only_once_per_telnet_connection() {
+    let mut telnet = Telnet::<64, 32>::new();
+    let mut first = Vec::<u8, 32>::new();
+    telnet.initial_negotiation(&mut first);
+    assert!(!first.is_empty());
+
+    let mut second = Vec::<u8, 32>::new();
+    telnet.initial_negotiation(&mut second);
+    assert!(second.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Regression tests for telnet fixes
 // ---------------------------------------------------------------------------

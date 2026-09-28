@@ -39,7 +39,7 @@ snapshot and subscription. Reconnect recovery replays `peer.watch` for the
 peer keys the client still holds.
 
 The wire shapes in this document are normative for `microtun-api`,
-`microtun-tracker`, `microtun-std`, and `microtun-embassy`.
+`microtun tracker`, `microtun-std`, and `microtun-embassy`.
 
 ## 1. Design goals
 

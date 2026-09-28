@@ -2,6 +2,20 @@
 
 microtun is a VPN for microcontrollers. It implements a secure, Noise_IK-based tunnel protocol in Rust, using Curve25519 and ChaCha20-Poly1305, and runs on no_std targets with no heap allocator requirement. It is wire-compatible with existing, widely deployed [Linux VPN technologies](https://man7.org/linux/man-pages/man8/wg.8.html).
 
+## Host tools
+
+Host-side commands are provided by one `microtun` binary from the `microtun` crate:
+
+```text
+microtun tunnel /path/to/device.toml
+microtun tracker /path/to/tracker.toml
+microtun console device.example.net
+microtun console --serial device.example.net
+microtun console --serial --baudrate 115200 --data-bits 8 device.example.net
+microtun serial device.example.net --name ttyMT0
+microtun serial device.example.net --baudrate 115200 --data-bits 8 --name ttyMT0
+```
+
 ## Contributing
 
 Contributions are welcome. Before a contribution can be merged, the contributor

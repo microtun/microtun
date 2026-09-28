@@ -1,12 +1,16 @@
 microtun for Debian
 ===================
 
-This package installs the Linux executables:
+This package installs one Linux executable:
 
   /usr/bin/microtun
-  /usr/bin/microtun-tracker
-  /usr/bin/microtun-console
-  /usr/bin/microtun-serial
+
+Host functionality is selected with subcommands:
+
+  microtun tunnel [-i mt0] /path/to/device.toml
+  microtun tracker /etc/microtun/tracker.toml
+  microtun console serial-gateway.example --port 2217
+  microtun serial serial-gateway.example --port 2217 --name ttyMT0
 
 The Tracker service is installed as microtun-tracker.service, but package
 installation deliberately does not enable or start it. The packaged
@@ -22,24 +26,24 @@ After configuring the Tracker:
 The package creates a dedicated microtun-tracker system user and group for the
 service. The service does not run as root.
 
-The microtun executable is intentionally not installed as a system-wide service:
-a Linux host may have multiple device configurations and interface names. A
-sample device configuration is installed at:
+The `microtun tunnel` command is intentionally not installed as a system-wide
+service: a Linux host may have multiple device configurations and interface
+names. A sample device configuration is installed at:
 
   /usr/share/doc/microtun/examples/device.toml
 
 For example:
 
-  microtun -i mtun0 /path/to/device.toml
+  microtun tunnel -i mt0 /path/to/device.toml
 
 Serial console
 --------------
 
-microtun-console switches into an interactive serial-console mode from inside the
-TUI. Connect to the serial endpoint and press Ctrl-A P to open communication
+`microtun console` switches into an interactive serial-console mode from inside
+the TUI. Connect to the serial endpoint and press Ctrl-A P to open communication
 parameters. Enable serial mode on the first row:
 
-  microtun-console serial-gateway.example --port 2217
+  microtun console serial-gateway.example --port 2217
 
 Entering serial mode does not change the remote UART configuration. The serial
 protocol queries the current settings and applies changes only when requested, so
@@ -52,13 +56,13 @@ receive-file meaning, but receiving files is not implemented yet.
 Virtual serial device
 ---------------------
 
-For programs that require a normal Linux serial character device, microtun-serial
+For programs that require a normal Linux serial character device, `microtun serial`
 bridges a serial connection through CUSE. Load the kernel module before use:
 
   modprobe cuse
-  microtun-serial serial-gateway.example --port 2217 --name microtun0
+  microtun serial serial-gateway.example --port 2217 --name ttyMT0
 
-The resulting /dev/microtun0 accepts normal termios and serial ioctls; baud,
+The resulting /dev/ttyMT0 accepts normal termios and serial ioctls; baud,
 data bits, parity, stop bits, flow control, DTR/RTS, break, and flush requests
-are translated into serial commands. Device-node ownership and mode are governed by the
-host's normal device/udev policy.
+are translated into serial commands. Device-node ownership and mode are governed
+by the host's normal device/udev policy.

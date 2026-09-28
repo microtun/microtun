@@ -1,9 +1,9 @@
 use embedded_io_async::Write;
 use heapless::{String, Vec};
 pub use microtun_telnet::{
-    AYT, BRK, BinaryMode, BinaryModeError, DO, DONT, EC, EL, IAC, IP, NOP, OPT_BINARY, OPT_ECHO,
-    OPT_NAWS, OPT_SUPPRESS_GO_AHEAD, OPT_TERMINAL_TYPE, SB, SE, WILL, WONT, write_data,
-    write_data_unflushed,
+    AYT, BRK, BinaryMode, BinaryModeError, BinaryTelnet, DO, DONT, EC, EL, IAC, IP, NOP,
+    OPT_BINARY, OPT_ECHO, OPT_NAWS, OPT_SUPPRESS_GO_AHEAD, OPT_TERMINAL_TYPE, SB, SE, WILL, WONT,
+    write_data, write_data_unflushed,
 };
 use microtun_telnet::{Policy, Side, Telnet as Protocol, TelnetEvent as ProtocolEvent};
 
@@ -63,6 +63,8 @@ pub struct Telnet<const SB_CAP: usize = 64, const TERM_CAP: usize = 32> {
     terminal_type: String<TERM_CAP>,
     window_size: Option<(u16, u16)>,
     ttype_send_pending: bool,
+    initial_negotiation_started: bool,
+    binary_handoff_cr_pending: bool,
 }
 
 impl<const SB_CAP: usize, const TERM_CAP: usize> Default for Telnet<SB_CAP, TERM_CAP> {
@@ -84,7 +86,17 @@ impl<const SB_CAP: usize, const TERM_CAP: usize> Telnet<SB_CAP, TERM_CAP> {
             terminal_type: String::new(),
             window_size: None,
             ttype_send_pending: false,
+            initial_negotiation_started: false,
+            binary_handoff_cr_pending: false,
         }
+    }
+
+    /// Record that the shell handed the connection to a binary protocol immediately after an
+    /// NVT carriage return. A conforming NVT sender follows CR with LF or NUL; the shell has
+    /// already consumed the CR, so the binary handoff must consume that continuation rather than
+    /// expose it to the application protocol.
+    pub(crate) fn expect_binary_handoff_cr_continuation(&mut self) {
+        self.binary_handoff_cr_pending = true;
     }
 
     pub fn us_enabled(&self, option: u8) -> bool {
@@ -115,11 +127,25 @@ impl<const SB_CAP: usize, const TERM_CAP: usize> Telnet<SB_CAP, TERM_CAP> {
         self.protocol.request_binary_mode(out);
     }
 
+    pub fn disable_binary_mode<const N: usize>(&mut self, out: &mut Vec<u8, N>) {
+        self.protocol.disable_binary_mode(out);
+    }
+
     pub fn binary_mode_enabled(&self) -> bool {
         self.protocol.binary_mode_enabled()
     }
 
+    pub fn binary_mode_refused(&self) -> bool {
+        self.protocol.binary_mode_refused()
+    }
+
     pub fn initial_negotiation<const N: usize>(&mut self, out: &mut Vec<u8, N>) {
+        if self.initial_negotiation_started
+            || N.saturating_sub(out.len()) < Self::INITIAL_NEGOTIATION
+        {
+            return;
+        }
+        self.initial_negotiation_started = true;
         self.protocol.request_us(OPT_ECHO, out);
         self.protocol.request_us(OPT_SUPPRESS_GO_AHEAD, out);
         self.protocol.request_him(OPT_SUPPRESS_GO_AHEAD, out);
@@ -184,6 +210,39 @@ impl<const SB_CAP: usize, const TERM_CAP: usize> Telnet<SB_CAP, TERM_CAP> {
                 | ProtocolEvent::OptionRefused { .. },
             )
             | None => None,
+        }
+    }
+}
+
+impl<const SB_CAP: usize, const TERM_CAP: usize> BinaryTelnet for Telnet<SB_CAP, TERM_CAP> {
+    fn binary_mode_enabled(&self) -> bool {
+        self.protocol.binary_mode_enabled()
+    }
+
+    fn binary_mode_refused(&self) -> bool {
+        self.protocol.binary_mode_refused()
+    }
+
+    fn request_binary_mode(&mut self, out: &mut Vec<u8, 6>) {
+        self.protocol.request_binary_mode(out);
+    }
+
+    fn disable_binary_mode(&mut self, out: &mut Vec<u8, 6>) {
+        self.protocol.disable_binary_mode(out);
+    }
+
+    fn feed_binary(&mut self, byte: u8, reply: &mut Vec<u8, 16>) -> Option<u8> {
+        match self.feed(byte, reply) {
+            Some(TelnetEvent::Data(byte)) => {
+                if self.binary_handoff_cr_pending {
+                    self.binary_handoff_cr_pending = false;
+                    if matches!(byte, b'\n' | 0) {
+                        return None;
+                    }
+                }
+                Some(byte)
+            }
+            _ => None,
         }
     }
 }

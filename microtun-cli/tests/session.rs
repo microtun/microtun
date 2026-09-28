@@ -6,7 +6,7 @@ use embedded_io_async::Write;
 use futures_lite::future::block_on;
 use microtun_cli::{
     Config, Console, Dispatch, Error, ErrorKind, Parser, Session,
-    telnet::{DO, DONT, IAC, OPT_ECHO},
+    telnet::{BinaryMode, DO, DONT, IAC, OPT_BINARY, OPT_ECHO, WILL},
     write_fmt,
 };
 
@@ -187,9 +187,36 @@ fn disconnected_from_handler_ends_the_session_without_an_error_or_new_prompt() {
     assert_eq!(result, Err(Error::Disconnected));
 
     let io = session.into_inner();
+    // The handler ends the shell on CR; bytes after that point must remain unread so the same
+    // transport can be handed to another protocol without losing read-ahead data.
+    assert_eq!(io.read_at, b"exit\r".len());
     let output = String::from_utf8_lossy(&io.output);
     assert!(output.contains("bye"));
     assert!(!output.contains("error: disconnected"));
     assert_eq!(output.matches("> ").count(), 1);
     assert_eq!(app.greetings, 0);
+}
+
+#[test]
+fn binary_handoff_consumes_the_nvt_cr_continuation() {
+    let mut script = b"exit\r\n".to_vec();
+    script.extend_from_slice(&[IAC, DO, OPT_BINARY, IAC, WILL, OPT_BINARY, b'x']);
+    let io = Loopback::new(&script);
+    let mut app = App { greetings: 0 };
+    let mut session = Session::<_, 128, 4, 64>::new(
+        io,
+        Config::new("> ").negotiate_telnet(false).help_hint(false),
+    );
+
+    let result = block_on(session.serve::<CommandParser, _>(&mut app));
+    assert_eq!(result, Err(Error::Disconnected));
+    let (mut io, mut telnet) = session.into_parts();
+
+    block_on(async {
+        let mut binary = BinaryMode::with_telnet(&mut io, &mut telnet);
+        binary.negotiate().await.unwrap();
+        // The LF completing the command's NVT CR LF belongs to the shell line ending, not to the
+        // binary application. The first binary application byte must therefore be `x`.
+        assert_eq!(binary.read_byte().await.unwrap(), b'x');
+    });
 }

@@ -20,6 +20,6 @@ Depends:
  systemd
 Description: microtun Linux tunnel, tracker, Telnet, and serial tools
  Linux host tools for microtun. This package contains the microtun tunnel
- daemon, the microtun-tracker service used to publish peer information, and
- the microtun-console interactive client with YMODEM/serial console support,
- and the microtun-serial serial-to-CUSE character-device bridge.
+ daemon, the Tracker service used to publish peer information, the interactive
+ console with YMODEM/serial console support, and the serial-to-CUSE character-device
+ bridge. These host tools are exposed as subcommands of the microtun executable.

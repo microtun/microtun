@@ -5,16 +5,13 @@ members = [
     "microtun-core",
     "microtun-embassy",
     "microtun-std",
-    "microtun-linux",
-    "microtun-tracker",
+    "microtun",
     "microtun-ws",
     "microtun-net-util",
     "microtun-mcuboot",
     "microtun-cli",
     "microtun-cli-macros",
     "microtun-ymodem",
-    "microtun-console",
-    "microtun-serial",
     "microtun-telnet",
 ]
 # Embedded firmware lives in a separate workspace (see firmware/Cargo.toml): each board
@@ -22,7 +19,7 @@ members = [
 exclude = ["firmware"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.97.1"
 license = "BUSL-1.1"

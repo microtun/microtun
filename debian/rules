@@ -10,33 +10,19 @@ override_dh_auto_clean:
 	rm -rf target
 
 override_dh_auto_build:
-	cargo build --release --locked \
-		-p microtun-linux \
-		-p microtun-tracker \
-		-p microtun-console \
-		-p microtun-serial
+	cargo build --release --locked -p microtun
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
-	cargo test --release --locked \
-		-p microtun-linux \
-		-p microtun-tracker \
-		-p microtun-console \
-		-p microtun-serial
+	cargo test --release --locked -p microtun
 endif
 
 override_dh_auto_install:
 	install -D -m 0755 target/release/microtun \
 		debian/microtun/usr/bin/microtun
-	install -D -m 0755 target/release/microtun-tracker \
-		debian/microtun/usr/bin/microtun-tracker
-	install -D -m 0755 target/release/microtun-console \
-		debian/microtun/usr/bin/microtun-console
-	install -D -m 0755 target/release/microtun-serial \
-		debian/microtun/usr/bin/microtun-serial
-	install -D -m 0640 microtun-tracker/tracker.example.toml \
+	install -D -m 0640 microtun/tracker.example.toml \
 		debian/microtun/etc/microtun/tracker.toml
-	install -D -m 0644 microtun-linux/device.example.toml \
+	install -D -m 0644 microtun/device.example.toml \
 		debian/microtun/usr/share/doc/microtun/examples/device.toml
 	install -D -m 0644 debian/microtun-tracker.service \
 		debian/microtun/usr/lib/systemd/system/microtun-tracker.service

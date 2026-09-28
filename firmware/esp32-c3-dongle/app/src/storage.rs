@@ -12,6 +12,7 @@ use esp_storage::FlashStorage;
 use log::info;
 use microtun_firmware_common::{
     configuration::RECORD_SIZE,
+    firmware::BinaryTelnet,
     storage::{FirmwareInstaller, FirmwareSummary, Storage as CommonStorage},
 };
 use static_cell::StaticCell;
@@ -97,17 +98,21 @@ impl NorFlash for BoardStorage {
 }
 
 impl FirmwareInstaller for BoardStorage {
-    async fn install_firmware<T>(&mut self, io: &mut T) -> Result<FirmwareSummary, &'static str>
+    async fn install_firmware<T, C>(
+        &mut self,
+        io: &mut T,
+        telnet: &mut C,
+    ) -> Result<FirmwareSummary, &'static str>
     where
         T: Read + Write + ?Sized,
+        C: BinaryTelnet + ?Sized,
     {
-        let (metadata, slot) =
-            receive_firmware_update(io, &mut self.flash)
-                .await
-                .map_err(|error| {
-                    log_firmware_update_error(&error);
-                    firmware_update_error_text(&error)
-                })?;
+        let (metadata, slot) = receive_firmware_update(io, telnet, &mut self.flash)
+            .await
+            .map_err(|error| {
+                log_firmware_update_error(&error);
+                firmware_update_error_text(&error)
+            })?;
 
         let version = metadata.version().unwrap_or("invalid");
         let project = metadata.project_name().unwrap_or("invalid");

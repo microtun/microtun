@@ -84,16 +84,33 @@ impl<T, const LINE: usize, const HISTORY: usize, const FMT: usize, const COMPLET
     Session<T, LINE, HISTORY, FMT, COMPLETIONS>
 {
     pub const fn new(io: T, config: Config) -> Self {
+        Self::with_telnet(io, config, Telnet::new())
+    }
+
+    /// Create a shell session with TELNET state carried over from an earlier mode on the same
+    /// connection. This is useful for shell -> binary transfer -> shell handoffs where RFC 1143
+    /// option state must remain connection-scoped.
+    pub const fn with_telnet(io: T, config: Config, telnet: Telnet<64, 32>) -> Self {
         Self {
             io,
             config,
             editor: Editor::new(),
-            telnet: Telnet::new(),
+            telnet,
         }
     }
 
     pub fn into_inner(self) -> T {
         self.io
+    }
+
+    /// Recover both the transport and its connection-level TELNET state.
+    pub fn into_parts(self) -> (T, Telnet<64, 32>) {
+        (self.io, self.telnet)
+    }
+
+    /// Recover the connection-level TELNET state after the line-oriented session ends.
+    pub fn into_telnet(self) -> Telnet<64, 32> {
+        self.telnet
     }
 
     pub fn terminal_type(&self) -> Option<&str> {
@@ -549,7 +566,11 @@ where
         }
         self.print_prompt().await?;
 
-        let mut rx = [0u8; 64];
+        // Read exactly one wire byte at a time. A command handler can deliberately end this
+        // line-oriented session and hand the same transport to a binary protocol. Avoiding
+        // read-ahead ensures bytes following that command are still in the transport for the next
+        // mode instead of being stranded in this stack frame.
+        let mut rx = [0u8; 1];
         loop {
             let count = self.io.read(&mut rx).await.map_err(Error::io)?;
             if count == 0 {
@@ -566,6 +587,13 @@ where
                 let Some(event) = event else {
                     continue;
                 };
+
+                // NVT encodes a carriage return as CR LF or CR NUL. If a CR submits a command
+                // that deliberately hands this same connection to a binary protocol, the
+                // continuation byte has not been read yet because this loop intentionally avoids
+                // read-ahead. Remember that fact in the connection-level TELNET state so the
+                // binary adapter can consume the continuation without mistaking it for payload.
+                let submit_was_cr = matches!(event, TelnetEvent::Data(b'\r'));
 
                 let editor_event = match event {
                     TelnetEvent::Data(byte) => self.editor.feed(byte),
@@ -609,7 +637,14 @@ where
                             self.redraw().await?;
                         }
                     }
-                    EditorEvent::Submit => self.submit::<P, C>(context).await?,
+                    EditorEvent::Submit => {
+                        if let Err(error) = self.submit::<P, C>(context).await {
+                            if submit_was_cr && matches!(error, Error::Disconnected) {
+                                self.telnet.expect_binary_handoff_cr_continuation();
+                            }
+                            return Err(error);
+                        }
+                    }
                     EditorEvent::Complete => self.handle_completion(&P::ROOT).await?,
                     EditorEvent::Interrupt => {
                         self.editor.clear();

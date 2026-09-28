@@ -4,6 +4,7 @@ use embassy_net::Stack;
 use embassy_time::{Duration, Timer, with_timeout};
 use embedded_io_async::{ErrorKind, ErrorType, Read, Write};
 use microtun_mcuboot::{FeedError, PayloadSink, StreamingVerifier};
+pub use microtun_telnet::BinaryTelnet;
 use microtun_telnet::{BinaryMode, BinaryModeError};
 use microtun_ymodem::{Config as YmodemConfig, Error as YmodemError};
 
@@ -61,17 +62,18 @@ fn negotiation_error<E>(error: BinaryModeError<E>) -> TransferError {
     }
 }
 
-struct YmodemTransport<'a, T: ?Sized> {
-    binary: BinaryMode<'a, T>,
+struct YmodemTransport<'a, T: ?Sized, C: ?Sized> {
+    binary: BinaryMode<'a, T, &'a mut C>,
     started: bool,
 }
 
-impl<'a, T> YmodemTransport<'a, T>
+impl<'a, T, C> YmodemTransport<'a, T, C>
 where
     T: Read + Write + ?Sized,
+    C: BinaryTelnet + ?Sized,
 {
-    async fn start(io: &'a mut T) -> Result<Self, TransferError> {
-        let mut binary = BinaryMode::new(io);
+    async fn start(io: &'a mut T, telnet: &'a mut C) -> Result<Self, TransferError> {
+        let mut binary = BinaryMode::with_telnet(io, telnet);
         match with_timeout(BINARY_NEGOTIATION_TIMEOUT, binary.negotiate()).await {
             Ok(Ok(())) => Ok(Self {
                 binary,
@@ -94,16 +96,18 @@ where
     }
 }
 
-impl<T> ErrorType for YmodemTransport<'_, T>
+impl<T, C> ErrorType for YmodemTransport<'_, T, C>
 where
     T: Read + Write + ?Sized,
+    C: BinaryTelnet + ?Sized,
 {
     type Error = ErrorKind;
 }
 
-impl<T> Read for YmodemTransport<'_, T>
+impl<T, C> Read for YmodemTransport<'_, T, C>
 where
     T: Read + Write + ?Sized,
+    C: BinaryTelnet + ?Sized,
 {
     async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
         if buffer.is_empty() {
@@ -126,9 +130,10 @@ where
     }
 }
 
-impl<T> Write for YmodemTransport<'_, T>
+impl<T, C> Write for YmodemTransport<'_, T, C>
 where
     T: Read + Write + ?Sized,
+    C: BinaryTelnet + ?Sized,
 {
     async fn write(&mut self, bytes: &[u8]) -> Result<usize, Self::Error> {
         self.binary
@@ -152,11 +157,16 @@ fn ymodem_error<I, W, M>(error: YmodemError<I, W, M>) -> TransferError {
     }
 }
 
-pub async fn receive_ymodem_buffer<T>(io: &mut T, output: &mut [u8]) -> Result<usize, TransferError>
+pub async fn receive_ymodem_buffer<T, C>(
+    io: &mut T,
+    telnet: &mut C,
+    output: &mut [u8],
+) -> Result<usize, TransferError>
 where
     T: Read + Write + ?Sized,
+    C: BinaryTelnet + ?Sized,
 {
-    let mut transport = YmodemTransport::start(io).await?;
+    let mut transport = YmodemTransport::start(io, telnet).await?;
     let mut output = output;
     let result = microtun_ymodem::receive(&mut transport, &mut output, YmodemConfig::default())
         .await
@@ -191,16 +201,18 @@ impl<S: PayloadSink> Write for VerifiedSink<'_, S> {
     }
 }
 
-pub async fn receive_signed_image<T, S>(
+pub async fn receive_signed_image<T, C, S>(
     io: &mut T,
+    telnet: &mut C,
     verifier: &mut StreamingVerifier,
     sink: &mut S,
 ) -> Result<(), ImageTransferError<S::Error>>
 where
     T: Read + Write + ?Sized,
+    C: BinaryTelnet + ?Sized,
     S: PayloadSink,
 {
-    let mut transport = YmodemTransport::start(io).await?;
+    let mut transport = YmodemTransport::start(io, telnet).await?;
     let mut output = VerifiedSink {
         verifier,
         sink,

@@ -8,7 +8,10 @@ pub mod client;
 pub mod serial;
 pub mod server;
 
-pub use binary::{BinaryMode, BinaryModeError, write_data, write_data_unflushed};
+pub use binary::{
+    BinaryMode, BinaryModeError, BinaryTelnet, StandaloneBinaryTelnet, write_data,
+    write_data_unflushed,
+};
 
 pub const IAC: u8 = 255;
 pub const DONT: u8 = 254;

@@ -163,7 +163,7 @@ fn help_uses_value_docs_visible_aliases_and_required_metadata() {
 
 struct MockIo {
     input: std::vec::Vec<u8>,
-    read: bool,
+    read_at: usize,
     output: std::string::String,
 }
 
@@ -171,7 +171,7 @@ impl MockIo {
     fn new(input: &str) -> Self {
         Self {
             input: input.as_bytes().to_vec(),
-            read: false,
+            read_at: 0,
             output: std::string::String::new(),
         }
     }
@@ -183,12 +183,15 @@ impl ErrorType for MockIo {
 
 impl Read for MockIo {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        if self.read {
+        let remaining = self.input.len().saturating_sub(self.read_at);
+        if remaining == 0 {
             return Ok(0);
         }
-        self.read = true;
-        let count = self.input.len().min(buf.len());
-        buf[..count].copy_from_slice(&self.input[..count]);
+
+        let count = remaining.min(buf.len());
+        buf[..count].copy_from_slice(&self.input[self.read_at..self.read_at + count]);
+        self.read_at += count;
+
         Ok(count)
     }
 }

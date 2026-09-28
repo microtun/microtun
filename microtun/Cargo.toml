@@ -1,0 +1,67 @@
+[package]
+name = "microtun"
+description = "Unified host tools for microtun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+microtun-std = { workspace = true }
+microtun-core = { workspace = true, features = ["alloc"] }
+microtun-api = { workspace = true, features = ["tokio"] }
+microtun-ws = { workspace = true, features = ["tokio"] }
+microtun-ymodem = { workspace = true }
+microtun-telnet = { workspace = true }
+toml_parser = { workspace = true }
+embedded-io = { workspace = true, features = ["std"] }
+embedded-io-async = { workspace = true, features = ["std"] }
+embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
+heapless = { workspace = true }
+rand = { workspace = true, features = ["std", "std_rng", "getrandom"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+tokio = { version = "~1.53", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+smoltcp = { version = "0.13.1", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "auto-icmp-echo-reply",
+    "iface-max-addr-count-4",
+] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util = "=0.3.31"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache", "underline-color"] }
+tui-term = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bitflags = "2"
+libc = "0.2"
+nix = { version = "0.30.1", features = ["fs", "term"] }
+socket2 = { version = "0.5", features = ["all"] }
+tun-rs = { version = "2.8", features = ["async_tokio"] }
+zeroize = { workspace = true, features = ["alloc"] }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[dev-dependencies]
+serde = { workspace = true, features = ["std"] }
+serde_json = "1"
+
+[[bin]]
+name = "microtun"
+path = "src/main.rs"

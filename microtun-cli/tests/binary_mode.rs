@@ -70,21 +70,26 @@ fn telnet_requests_and_tracks_binary_mode() {
 }
 
 #[test]
-fn binary_mode_preserves_buffered_payload_and_unescapes_iac() {
-    let script = [
-        IAC, DO, OPT_BINARY, IAC, WILL, OPT_BINARY, 0x01, IAC, IAC, 0x02,
-    ];
-    let mut io = Loopback::new(&script);
+fn shared_binary_mode_reuses_shell_telnet_state() {
+    let mut telnet = Telnet::<64, 32>::new();
+    let mut request = Vec::<u8, 6>::new();
+    telnet.request_binary_mode(&mut request);
+    let mut reply = Vec::<u8, 32>::new();
+    for byte in [IAC, DO, OPT_BINARY, IAC, WILL, OPT_BINARY] {
+        telnet.feed(byte, &mut reply);
+    }
 
+    let mut io = Loopback::new(&[0x01, IAC, IAC, 0x02]);
     block_on(async {
-        let mut binary = BinaryMode::new(&mut io);
+        let mut binary = BinaryMode::with_telnet(&mut io, &mut telnet);
         binary.negotiate().await.unwrap();
         assert_eq!(binary.read_byte().await.unwrap(), 0x01);
         assert_eq!(binary.read_byte().await.unwrap(), IAC);
         assert_eq!(binary.read_byte().await.unwrap(), 0x02);
     });
 
-    assert_eq!(io.output, [IAC, WILL, OPT_BINARY, IAC, DO, OPT_BINARY]);
+    // Already-enabled BINARY must not be requested again.
+    assert!(io.output.is_empty());
 }
 
 #[test]
@@ -99,14 +104,15 @@ fn binary_mode_rejects_explicit_refusal() {
 }
 
 #[test]
-fn binary_mode_rejects_payload_before_agreement() {
-    let mut io = Loopback::new(b"x");
-    let error = block_on(async {
+fn binary_mode_preserves_payload_during_negotiation() {
+    let script = [IAC, WILL, OPT_BINARY, b'x', IAC, DO, OPT_BINARY];
+    let mut io = Loopback::new(&script);
+
+    block_on(async {
         let mut binary = BinaryMode::new(&mut io);
-        binary.negotiate().await
-    })
-    .unwrap_err();
-    assert_eq!(error, BinaryModeError::UnexpectedData);
+        binary.negotiate().await.unwrap();
+        assert_eq!(binary.read_byte().await.unwrap(), b'x');
+    });
 }
 
 #[test]
@@ -131,7 +137,7 @@ fn binary_mode_escapes_iac_and_can_leave_binary_mode() {
 }
 
 #[test]
-fn binary_mode_abort_resets_partial_negotiation() {
+fn binary_mode_abort_uses_q_method_state() {
     let mut io = Loopback::new(&[IAC, DONT, OPT_BINARY]);
 
     block_on(async {
@@ -140,11 +146,5 @@ fn binary_mode_abort_resets_partial_negotiation() {
         binary.abort().await.unwrap();
     });
 
-    assert_eq!(
-        io.output,
-        [
-            IAC, WILL, OPT_BINARY, IAC, DO, OPT_BINARY, IAC, WONT, OPT_BINARY, IAC, DONT,
-            OPT_BINARY,
-        ]
-    );
+    assert_eq!(io.output, [IAC, WILL, OPT_BINARY, IAC, DO, OPT_BINARY]);
 }
