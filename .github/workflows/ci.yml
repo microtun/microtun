@@ -187,16 +187,16 @@ jobs:
           - name: stm32h753zi
             directory: firmware/stm32h753zi/app
             package: microtun-stm32h753zi
-            target: thumbv7em-none-eabi
+            target: thumbv7em-none-eabihf
 
           - name: stm32h753zi-bootloader
             directory: firmware/stm32h753zi/bootloader
             package: microtun-stm32h753zi-bootloader
-            target: thumbv7em-none-eabi
+            target: thumbv7em-none-eabihf
 
-          - name: esp32-c3
-            directory: firmware/esp32-c3/app
-            package: microtun-esp32-c3
+          - name: esp32-c3-dongle
+            directory: firmware/esp32-c3-dongle/app
+            package: esp32-c3-dongle
             # Must match [build] target in the firmware target's .cargo/config.toml.
             target: riscv32imc-unknown-none-elf
 
