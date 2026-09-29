@@ -20,9 +20,9 @@ endif
 override_dh_auto_install:
 	install -D -m 0755 target/release/microtun \
 		debian/microtun/usr/bin/microtun
-	install -D -m 0640 microtun/tracker.example.toml \
+	install -D -m 0640 microtun/examples/tracker.toml \
 		debian/microtun/etc/microtun/tracker.toml
-	install -D -m 0644 microtun/device.example.toml \
+	install -D -m 0644 microtun/examples/device.toml \
 		debian/microtun/usr/share/doc/microtun/examples/device.toml
 	install -D -m 0644 debian/microtun-tracker.service \
 		debian/microtun/usr/lib/systemd/system/microtun-tracker.service
