@@ -496,6 +496,7 @@ async fn wait_for_xon(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn uart_write_all(
     socket: &mut TcpSocket<'_>,
     session: &Rfc2217Session,
@@ -552,14 +553,14 @@ async fn uart_write_all(
         // control is active, drain each short burst before checking CTS or
         // XON/XOFF again. This bounds the amount of data sent after a peer
         // requests a stop to at most one burst instead of an entire UART FIFO.
-        if state.software_outbound_flow() || state.hardware_outbound_flow() {
-            if let Err(error) = uart.flush_async().await {
-                warn!(
-                    "RFC2217 UART flush during flow-controlled TX failed: {:?}",
-                    error
-                );
-                return false;
-            }
+        if (state.software_outbound_flow() || state.hardware_outbound_flow())
+            && let Err(error) = uart.flush_async().await
+        {
+            warn!(
+                "RFC2217 UART flush during flow-controlled TX failed: {:?}",
+                error
+            );
+            return false;
         }
     }
     true
@@ -669,6 +670,7 @@ async fn notify_modem_change(
     send_control(socket, &out).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_serial_request(
     socket: &mut TcpSocket<'_>,
     session: &mut Rfc2217Session,
@@ -908,6 +910,7 @@ async fn handle_serial_request(
     ok && send_control(socket, &out).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_pending(
     socket: &mut TcpSocket<'_>,
     session: &Rfc2217Session,
@@ -940,6 +943,7 @@ async fn flush_pending(
     ok
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_network_chunk(
     socket: &mut TcpSocket<'_>,
     uart: &mut Rs232Uart,
@@ -1131,11 +1135,11 @@ async fn run_session(
                     }
                 }
                 Either::First(Either::Second(Ok(read))) => {
-                    if read != 0 && session.serial_active() {
-                        if !capture_serial_rx(state, &mut flow, &mut deferred, &serial_buf[..read])
-                        {
-                            break;
-                        }
+                    if read != 0
+                        && session.serial_active()
+                        && !capture_serial_rx(state, &mut flow, &mut deferred, &serial_buf[..read])
+                    {
+                        break;
                     }
                 }
                 Either::First(Either::Second(Err(error))) => {
