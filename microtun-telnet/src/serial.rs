@@ -28,12 +28,14 @@ pub const PURGE_DATA: u8 = 12;
 const SERVER_OFFSET: u8 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Origin {
     Client,
     Server,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Command {
     Signature,
     SetBaudRate,
@@ -80,6 +82,7 @@ impl Command {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DecodeError {
     Empty,
     UnknownCommand(u8),

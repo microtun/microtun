@@ -186,6 +186,7 @@ pub enum SerialRequest<'a> {
 
 /// A semantically invalid serial request whose Telnet framing was otherwise valid.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SerialRequestError {
     /// A server-origin confirmation/notification was received on the server endpoint.
     InvalidOrigin(serial::Origin),
@@ -464,6 +465,7 @@ pub enum ServerEvent<'a> {
 
 /// Failure to encode a server-side protocol action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ServerEncodeError {
     /// The caller-provided output buffer cannot hold the complete action.
     BufferFull,
